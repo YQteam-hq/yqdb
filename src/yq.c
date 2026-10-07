@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <errno.h>
 
 extern int yq_recover(yq_wal *wal, yq_memtable *mt);
 

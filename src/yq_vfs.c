@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_FILE_OFFSET_BITS)
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include "yq_vfs.h"
 #include <stdlib.h>
 #include <string.h>
@@ -174,6 +178,8 @@ int yq_file_munmap(void *ptr, size_t len) {
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/file.h>
 
 struct yq_file {
     int fd;
@@ -228,7 +234,7 @@ int yq_file_sync(yq_file *f) {
 }
 
 int yq_file_truncate(yq_file *f, uint64_t size) {
-    if (ftruncate64(f->fd, (off64_t)size) < 0) {
+    if (ftruncate(f->fd, (off_t)size) < 0) {
         return YQ_ERR_IO;
     }
     return YQ_OK;

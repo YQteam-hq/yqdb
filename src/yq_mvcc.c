@@ -11,6 +11,7 @@
 #define barrier() _ReadWriteBarrier()
 #else
 #include <stdatomic.h>
+#include <unistd.h>
 #define barrier() __asm__ __volatile__("" ::: "memory")
 #endif
 
