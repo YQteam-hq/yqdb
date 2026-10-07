@@ -315,7 +315,7 @@ for later releases.
 Released under the [Apache License 2.0](LICENSE).
 
 ```
-Copyright 2026 YQTeam
+Copyright 2026 yq-tuandui.xyz (YQteam)
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

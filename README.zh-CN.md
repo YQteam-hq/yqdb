@@ -295,7 +295,7 @@ gcc -std=c11 -Iinclude src/yq_test_integration.c src/*.o -o yq_test_integration
 以 [Apache License 2.0](LICENSE) 发布。
 
 ```
-Copyright 2026 YQTeam
+Copyright 2026 yq-tuandui.xyz (YQteam)
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
