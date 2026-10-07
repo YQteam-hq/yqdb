@@ -1,0 +1,45 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+permissions:
+  contents: read
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu / gcc
+            os: ubuntu-latest
+            configure: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc
+          - name: ubuntu / clang
+            os: ubuntu-latest
+            configure: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+          - name: windows / msvc
+            os: windows-latest
+            configure: cmake -S . -B build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: ${{ matrix.configure }}
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+  build-benchmarks:
+    name: build benchmarks / ubuntu gcc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build benchmark harness
+        run: |
+          CORE="src/yq.c src/yq_btree.c src/yq_enc.c src/yq_memblk.c src/yq_memtable.c src/yq_mvcc.c src/yq_recover.c src/yq_slice.c src/yq_vfs.c src/yq_wal.c"
+          gcc -O2 -std=c11 -Wall -Wextra -I include -DENGINE_YQ bench/bench_kv.c $CORE -o bench_yq
+          gcc -O2 -std=c11 -Wall -Wextra -I bench/third_party -DENGINE_SQLITE bench/bench_kv.c bench/third_party/sqlite3.c -o bench_sqlite
+          gcc -O2 -std=c11 -Wall -Wextra -I bench/third_party -DENGINE_LMDB bench/bench_kv.c bench/third_party/mdb.c bench/third_party/midl.c -lpthread -o bench_lmdb
+          ls -l bench_yq bench_sqlite bench_lmdb
