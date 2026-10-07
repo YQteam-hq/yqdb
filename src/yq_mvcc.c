@@ -46,6 +46,7 @@ typedef struct {
     uint64_t slot_count;
     uint8_t  reserved[40];
 } shm_header;
+#pragma pack(pop)
 
 typedef struct {
     uint32_t pid;
@@ -57,6 +58,7 @@ typedef struct {
     uint8_t  reserved[32];
 } shm_slot;
 
+#pragma pack(push, 1)
 typedef struct {
     uint64_t magic;
     uint32_t format_version;
