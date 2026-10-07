@@ -1,3 +1,12 @@
+#if !defined(_WIN32)
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "yq_mvcc.h"
 #include "yq_vfs.h"
 #include "yq_enc.h"
@@ -9,10 +18,14 @@
 #if defined(_WIN32)
 #include <windows.h>
 #define barrier() _ReadWriteBarrier()
+static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)GetCurrentProcessId(); }
+static uint32_t yq_mvcc_current_tid(void) { return (uint32_t)GetCurrentThreadId(); }
 #else
 #include <stdatomic.h>
 #include <unistd.h>
 #define barrier() __asm__ __volatile__("" ::: "memory")
+static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)getpid(); }
+static uint32_t yq_mvcc_current_tid(void) { return 0; }
 #endif
 
 #define YQ_SHM_MAGIC 0x59514853U
@@ -150,8 +163,8 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
         if (old == expected)
 #endif
         {
-            slots[i].pid = (uint32_t)GetCurrentProcessId();
-            slots[i].tid = (uint32_t)GetCurrentThreadId();
+            slots[i].pid = yq_mvcc_current_pid();
+            slots[i].tid = yq_mvcc_current_tid();
             slots[i].snapshot_txn = txn_id;
             slots[i].snapshot_root_page = root_page;
             slots[i].slot_epoch = (uint32_t)hdr->shm_epoch;
