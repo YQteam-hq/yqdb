@@ -325,7 +325,15 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     txn->slot_idx = -1;
     txn->first_write = (flags & YQ_TXN_READWRITE) ? 1 : 0;
 
-    if (flags & YQ_TXN_READONLY) {
+    /*
+     * YQ_TXN_READONLY is 0x0000, so `flags & YQ_TXN_READONLY` is always 0 and
+     * can never be used to select this branch. Read-only is the default and
+     * must be recognised as "no YQ_TXN_READWRITE bit": otherwise a read-only
+     * transaction silently ends up with no MVCC snapshot at all (slot_idx
+     * stays -1), so it is never registered as a reader and is invisible to
+     * yq_mvcc_reclaim_watermark().
+     */
+    if (!(flags & YQ_TXN_READWRITE)) {
         uint64_t txn_id = 0, root = 0;
         yq_mvcc_meta_read(db->mvcc, &txn_id, &root, NULL, NULL, NULL);
         int rc = yq_mvcc_acquire_snapshot(db->mvcc, txn_id, root, &txn->snapshot_txn, &txn->snapshot_root, &txn->slot_idx);
@@ -416,7 +424,8 @@ int yq_txn_abort(yq_txn *txn) {
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    if (txn->flags & YQ_TXN_READONLY) return YQ_ERR_READONLY;
+    /* YQ_TXN_READONLY is 0, so test for the absence of YQ_TXN_READWRITE. */
+    if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
 
@@ -448,7 +457,8 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 int yq_del(yq_txn *txn, yq_slice key) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    if (txn->flags & YQ_TXN_READONLY) return YQ_ERR_READONLY;
+    /* YQ_TXN_READONLY is 0, so test for the absence of YQ_TXN_READWRITE. */
+    if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;

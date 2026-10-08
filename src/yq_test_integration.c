@@ -495,6 +495,78 @@ static void test_reader_slots(void) {
     printf("OK\n");
 }
 
+/*
+ * Read-only transactions must still register an MVCC reader slot.
+ *
+ * Regression guard for the YQ_TXN_READONLY flag test: the constant is 0, so
+ * `flags & YQ_TXN_READONLY` is always false. Written that way, a read-only
+ * transaction took neither branch in yq_txn_begin() and ended up with no
+ * snapshot at all — invisible to yq_mvcc_reclaim_watermark().
+ */
+static void test_readonly_snapshot(void) {
+    printf("test_readonly_snapshot... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+    opts.max_readers = 2;
+
+    yq_db *db = NULL;
+    assert(yq_open(TEST_DB, &opts, &db) == YQ_OK);
+
+    /* Seed one key with a write transaction. */
+    yq_txn *w = NULL;
+    assert(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
+    yq_slice k = {"rk", 2};
+    yq_slice v = {"rv", 2};
+    assert(yq_put(w, k, v, YQ_PUT_UPSERT) == YQ_OK);
+    assert(yq_txn_commit(w) == YQ_OK);
+
+    yq_stat st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+
+    /* Each read-only transaction must claim exactly one reader slot. */
+    yq_txn *a = NULL, *b = NULL, *c = NULL;
+    assert(yq_txn_begin(db, YQ_TXN_READONLY, &a) == YQ_OK);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 1);
+
+    assert(yq_txn_begin(db, YQ_TXN_READONLY, &b) == YQ_OK);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 2);
+
+    /* Slots exhausted: the next reader is rejected rather than going
+     * unregistered, which is what makes the reclaim watermark correct. */
+    int rc = yq_txn_begin(db, YQ_TXN_READONLY, &c);
+    assert(rc == YQ_ERR_READER_FULL);
+    assert(c == NULL);
+
+    /* A read-only snapshot sees committed data, and cannot write. */
+    yq_slice out = {0};
+    assert(yq_get(a, k, &out) == YQ_OK);
+    assert(out.size == 2 && memcmp(out.data, "rv", 2) == 0);
+    assert(yq_put(a, k, v, YQ_PUT_UPSERT) == YQ_ERR_READONLY);
+    assert(yq_del(a, k) == YQ_ERR_READONLY);
+
+    assert(yq_txn_commit(a) == YQ_OK);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 1);
+
+    assert(yq_txn_begin(db, YQ_TXN_READONLY, &c) == YQ_OK);
+    assert(yq_txn_commit(b) == YQ_OK);
+    assert(yq_txn_abort(c) == YQ_OK);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 0);
+
+    assert(yq_close(db) == YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -511,6 +583,7 @@ int main(void) {
     test_batch();
     test_stat();
     test_reader_slots();
+    test_readonly_snapshot();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

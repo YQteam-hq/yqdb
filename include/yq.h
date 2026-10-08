@@ -186,7 +186,11 @@ int yq_last_io_error(void);
  * 事务
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* txn_begin 的 flags */
+/* txn_begin 的 flags
+ *
+ * 注意：YQ_TXN_READONLY 的值就是 0，因此不能写作 `if (flags & YQ_TXN_READONLY)`
+ * ——该表达式恒为 0。只读是默认行为，判定必须写成"没有 YQ_TXN_READWRITE 位"。
+ */
 #define YQ_TXN_READONLY  0x0000u /* 只读事务，获取 MVCC 快照，绝不阻塞写者 */
 #define YQ_TXN_READWRITE 0x0001u /* 读写事务，需要写锁；拿不到返回 YQ_ERR_BUSY */
 
