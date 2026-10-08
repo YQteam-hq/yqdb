@@ -161,8 +161,15 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
         LONG old = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, (LONG)expected);
         if (old == (LONG)expected)
 #else
-        uint32_t old = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1);
-        if (old == expected)
+        /*
+         * 注意不要写 old = atomic_compare_exchange_strong(..., &expected, 1);
+         * 再比较 old == expected。C11 的 CAS 成功时会把 expected 覆盖为
+         * 交换后的值（即 desired），失败时才写回实际读取值，所以成功路径上
+         * old(0) 恒不等于 expected(1)，该判断永远为假，导致所有槽位都
+         * 被视为“已被占用”，任何事务都无法开始（yq_txn_begin 恒返回
+         * YQ_ERR_READER_FULL）。以返回的 _Bool 结果为准。
+         */
+        if (atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1))
 #endif
         {
             slots[i].pid = yq_mvcc_current_pid();

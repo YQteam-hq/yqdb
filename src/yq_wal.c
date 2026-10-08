@@ -2,6 +2,7 @@
 #include "yq_enc.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #define YQ_WAL_HEADER_SIZE 29
 
@@ -138,27 +139,61 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
     return append_record(wal, txn_id, WAL_TYPE_BEGIN, NULL, 0);
 }
 
-int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
-    uint8_t enc_buf[2048];
-    size_t pos = 0;
+/*
+ * PUT 记录 payload = varint(key_len) + key + varint(val_len) + val。
+ *
+ * key 上限 1024 字节、val 上限 1 GiB（见 yq_put），所以 payload 不适合放在
+ * 栈上定长数组里：旧实现用 uint8_t enc_buf[2048] 且 memcpy 前不做边界检查，
+ * 任何 > ~2KB 的 value 都会写爆栈（ASan: stack-buffer-overflow @ yq_wal.c）。
+ * 这里改为按需小缓冲：小 payload 走栈上的 2 KiB 缓冲避免堆分配，
+ * 大 payload 回退到堆缓冲，两条路径都不再有溢出可能。
+ */
+#define YQ_WAL_SMALL_PAYLOAD 2048
 
-    size_t nk;
-    if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
+int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
+    if (!wal) return YQ_ERR_INVAL;
+
+    size_t nk = 0, nv = 0;
+    if (yq_varint_encode(key.size, NULL, &nk) != YQ_OK) return YQ_ERR_INVAL;
+    if (yq_varint_encode(val.size, NULL, &nv) != YQ_OK) return YQ_ERR_INVAL;
+
+    /* 先算长度再校验，避免 size_t 相加回绕 */
+    size_t pos = 0;
+    if (nk > SIZE_MAX - key.size) return YQ_ERR_TOOBIG;
+    pos = nk + key.size;
+    if (nv > SIZE_MAX - val.size) return YQ_ERR_TOOBIG;
+    if (pos > SIZE_MAX - (nv + val.size)) return YQ_ERR_TOOBIG;
+    size_t total = pos + nv + val.size;
+
+    uint8_t stack_buf[YQ_WAL_SMALL_PAYLOAD];
+    uint8_t *enc_buf = stack_buf;
+    if (total > sizeof(stack_buf)) {
+        enc_buf = (uint8_t *)malloc(total);
+        if (!enc_buf) return YQ_ERR_NOMEM;
+    }
+
+    yq_varint_encode(key.size, enc_buf, &nk);
     memcpy(enc_buf + nk, key.data, key.size);
     pos = nk + key.size;
 
-    size_t nv;
-    if (yq_varint_encode(val.size, enc_buf + pos, &nv) != YQ_OK) return YQ_ERR_INVAL;
+    yq_varint_encode(val.size, enc_buf + pos, &nv);
     memcpy(enc_buf + pos + nv, val.data, val.size);
     pos += nv + val.size;
 
-    return append_record(wal, txn_id, WAL_TYPE_PUT, enc_buf, pos);
+    int rc = append_record(wal, txn_id, WAL_TYPE_PUT, enc_buf, total);
+
+    if (enc_buf != stack_buf) free(enc_buf);
+    return rc;
 }
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
+    if (!wal) return YQ_ERR_INVAL;
+
+    /* key 的上限由 yq_del 保证为 1024，varint 至多 2 字节，固定 1032 足够 */
     uint8_t enc_buf[1032];
     size_t nk;
     if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
+    if (key.size > sizeof(enc_buf) - nk) return YQ_ERR_TOOBIG;
     memcpy(enc_buf + nk, key.data, key.size);
 
     return append_record(wal, txn_id, WAL_TYPE_DEL, enc_buf, nk + key.size);

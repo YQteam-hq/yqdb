@@ -204,8 +204,64 @@ static void test_cross_block_records(void) {
     cleanup_files();
 }
 
-/* ── CRC truncation: a corrupt tail record stops the scan ─────────────── */
+/* ── payload > 64 KiB: exercises the exact-read path in yq_wal_scan ───── */
 
+static void test_large_payload(void) {
+    printf("test_large_payload\n");
+    cleanup_files();
+
+    /* 96 KiB > YQ_WAL_SCAN_BLOCK(64 KiB)，确保走"大 payload 精确读"分支 */
+    enum { VLEN = 96 * 1024 };
+    char *big = (char *)malloc(VLEN);
+    check(big != NULL, "malloc big value");
+    if (!big) return;
+    for (int i = 0; i < VLEN; i++) big[i] = (char)('a' + (i % 26));
+
+    yq_wal *wal = NULL;
+    yq_wal_open(&wal, DB_PATH, 4096);
+    if (!wal) { check(0, "open wal"); free(big); return; }
+
+    yq_slice k, v;
+    sset(&k, "bigkey");
+    v.data = big;
+    v.size = VLEN;
+
+    /* 写入侧曾经因 enc_buf[2048] 溢出而崩溃，这里顺带回归它 */
+    check(yq_wal_append_begin(wal, 1) == YQ_OK, "append begin");
+    check(yq_wal_append_put(wal, 1, k, v) == YQ_OK, "append 96 KiB put");
+    check(yq_wal_append_commit(wal, 1) == YQ_OK, "append commit");
+    check(yq_wal_flush(wal) == YQ_OK, "flush");
+    yq_wal_close(wal);
+
+    yq_wal_open(&wal, DB_PATH, 4096);
+    if (!wal) { check(0, "reopen wal"); free(big); return; }
+
+    /* 扫描必须把这 96 KiB payload 完整交给 visitor */
+    scan_probe probe = { 0, 0, 1 };
+    check(yq_wal_scan(wal, 0, probe_visit, &probe) == YQ_OK, "scan large wal");
+    check(probe.count == 3, "large wal has 3 records");
+
+    yq_memtable *mt = yq_memtable_create(1u << 24);
+    check(mt != NULL, "create memtable");
+    check(yq_recover(wal, mt) == YQ_OK, "recover large payload");
+    yq_wal_close(wal);
+
+    yq_slice out;
+    sset(&k, "bigkey");
+    int ok = (yq_memtable_get(mt, k, &out) == YQ_OK);
+    check(ok, "bigkey present after replay");
+    if (ok) {
+        check(out.size == VLEN, "bigkey size preserved");
+        check(out.size == VLEN && memcmp(out.data, big, VLEN) == 0,
+              "bigkey bytes preserved byte-for-byte");
+    }
+
+    yq_memtable_destroy(mt);
+    free(big);
+    cleanup_files();
+}
+
+/* ── CRC truncation: a corrupt tail record stops the scan ─────────────── */
 static void test_crc_truncation(void) {
     printf("test_crc_truncation\n");
     cleanup_files();
@@ -254,6 +310,7 @@ int main(void) {
     test_scan_from_lsn();
     test_replay_committed_only();
     test_cross_block_records();
+    test_large_payload();
     test_crc_truncation();
 
     if (g_failures == 0) {

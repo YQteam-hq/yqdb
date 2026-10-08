@@ -6,6 +6,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# 没有 enable_testing() 时 add_test() 不会生成 CTestTestfile.cmake，
+# ctest 会报 "No test configuration file found!" 而一个测试都不跑。
+enable_testing()
+
 set(SOURCES
     src/yq_enc.c
     src/yq_memblk.c
@@ -37,3 +41,7 @@ add_test(NAME integration_test COMMAND yq_test_integration)
 add_executable(yq_test_seek src/yq_test_seek.c)
 target_link_libraries(yq_test_seek yqdb)
 add_test(NAME seek_test COMMAND yq_test_seek)
+
+add_executable(yq_test_p4 src/yq_test_p4.c)
+target_link_libraries(yq_test_p4 yqdb)
+add_test(NAME p4_recovery_test COMMAND yq_test_p4)
