@@ -85,12 +85,12 @@ clean: CMakeFiles/yq_test_integration.dir/clean
 CMakeFiles/yqdb.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 "Built target yqdb"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27 "Built target yqdb"
 .PHONY : CMakeFiles/yqdb.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/yqdb.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 19
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 23
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/yqdb.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 0
 .PHONY : CMakeFiles/yqdb.dir/rule
@@ -116,7 +116,7 @@ CMakeFiles/yq_test_basic.dir/all: CMakeFiles/yqdb.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/yq_test_basic.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 21
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 25
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/yq_test_basic.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 0
 .PHONY : CMakeFiles/yq_test_basic.dir/rule
@@ -142,7 +142,7 @@ CMakeFiles/yq_test_integration.dir/all: CMakeFiles/yqdb.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/yq_test_integration.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 21
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 25
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/yq_test_integration.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /workspace/yqdb/CMakeFiles 0
 .PHONY : CMakeFiles/yq_test_integration.dir/rule

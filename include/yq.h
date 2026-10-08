@@ -66,6 +66,18 @@ extern "C" {
 #include "yq_backup.h"
 #endif
 
+#if YQ_ENABLE_CLUSTER
+#include "yq_cluster.h"
+#endif
+
+#if YQ_ENABLE_CACHE
+#include "yq_cache.h"
+#endif
+
+#if YQ_ENABLE_WEB
+#include "yq_web.h"
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════
  * 版本
  * ═══════════════════════════════════════════════════════════════════════ */

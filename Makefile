@@ -251,6 +251,54 @@ src/yq_btree.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_btree.c.s
 .PHONY : src/yq_btree.c.s
 
+src/yq_cache.o: src/yq_cache.c.o
+.PHONY : src/yq_cache.o
+
+# target to build an object file
+src/yq_cache.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_cache.c.o
+.PHONY : src/yq_cache.c.o
+
+src/yq_cache.i: src/yq_cache.c.i
+.PHONY : src/yq_cache.i
+
+# target to preprocess a source file
+src/yq_cache.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_cache.c.i
+.PHONY : src/yq_cache.c.i
+
+src/yq_cache.s: src/yq_cache.c.s
+.PHONY : src/yq_cache.s
+
+# target to generate assembly for a file
+src/yq_cache.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_cache.c.s
+.PHONY : src/yq_cache.c.s
+
+src/yq_cluster.o: src/yq_cluster.c.o
+.PHONY : src/yq_cluster.o
+
+# target to build an object file
+src/yq_cluster.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_cluster.c.o
+.PHONY : src/yq_cluster.c.o
+
+src/yq_cluster.i: src/yq_cluster.c.i
+.PHONY : src/yq_cluster.i
+
+# target to preprocess a source file
+src/yq_cluster.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_cluster.c.i
+.PHONY : src/yq_cluster.c.i
+
+src/yq_cluster.s: src/yq_cluster.c.s
+.PHONY : src/yq_cluster.s
+
+# target to generate assembly for a file
+src/yq_cluster.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_cluster.c.s
+.PHONY : src/yq_cluster.c.s
+
 src/yq_compress.o: src/yq_compress.c.o
 .PHONY : src/yq_compress.o
 
@@ -635,6 +683,54 @@ src/yq_wal.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_wal.c.s
 .PHONY : src/yq_wal.c.s
 
+src/yq_web.o: src/yq_web.c.o
+.PHONY : src/yq_web.o
+
+# target to build an object file
+src/yq_web.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_web.c.o
+.PHONY : src/yq_web.c.o
+
+src/yq_web.i: src/yq_web.c.i
+.PHONY : src/yq_web.i
+
+# target to preprocess a source file
+src/yq_web.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_web.c.i
+.PHONY : src/yq_web.c.i
+
+src/yq_web.s: src/yq_web.c.s
+.PHONY : src/yq_web.s
+
+# target to generate assembly for a file
+src/yq_web.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_web.c.s
+.PHONY : src/yq_web.c.s
+
+src/yq_web_missing_functions.o: src/yq_web_missing_functions.c.o
+.PHONY : src/yq_web_missing_functions.o
+
+# target to build an object file
+src/yq_web_missing_functions.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o
+.PHONY : src/yq_web_missing_functions.c.o
+
+src/yq_web_missing_functions.i: src/yq_web_missing_functions.c.i
+.PHONY : src/yq_web_missing_functions.i
+
+# target to preprocess a source file
+src/yq_web_missing_functions.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.i
+.PHONY : src/yq_web_missing_functions.c.i
+
+src/yq_web_missing_functions.s: src/yq_web_missing_functions.c.s
+.PHONY : src/yq_web_missing_functions.s
+
+# target to generate assembly for a file
+src/yq_web_missing_functions.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yqdb.dir/build.make CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.s
+.PHONY : src/yq_web_missing_functions.c.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -658,6 +754,12 @@ help:
 	@echo "... src/yq_btree.o"
 	@echo "... src/yq_btree.i"
 	@echo "... src/yq_btree.s"
+	@echo "... src/yq_cache.o"
+	@echo "... src/yq_cache.i"
+	@echo "... src/yq_cache.s"
+	@echo "... src/yq_cluster.o"
+	@echo "... src/yq_cluster.i"
+	@echo "... src/yq_cluster.s"
 	@echo "... src/yq_compress.o"
 	@echo "... src/yq_compress.i"
 	@echo "... src/yq_compress.s"
@@ -706,6 +808,12 @@ help:
 	@echo "... src/yq_wal.o"
 	@echo "... src/yq_wal.i"
 	@echo "... src/yq_wal.s"
+	@echo "... src/yq_web.o"
+	@echo "... src/yq_web.i"
+	@echo "... src/yq_web.s"
+	@echo "... src/yq_web_missing_functions.o"
+	@echo "... src/yq_web_missing_functions.i"
+	@echo "... src/yq_web_missing_functions.s"
 .PHONY : help
 
 

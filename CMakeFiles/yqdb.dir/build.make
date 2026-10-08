@@ -321,6 +321,62 @@ CMakeFiles/yqdb.dir/src/yq_backup.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/yqdb.dir/src/yq_backup.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /workspace/yqdb/src/yq_backup.c -o CMakeFiles/yqdb.dir/src/yq_backup.c.s
 
+CMakeFiles/yqdb.dir/src/yq_cluster.c.o: CMakeFiles/yqdb.dir/flags.make
+CMakeFiles/yqdb.dir/src/yq_cluster.c.o: src/yq_cluster.c
+CMakeFiles/yqdb.dir/src/yq_cluster.c.o: CMakeFiles/yqdb.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=$(CMAKE_PROGRESS_19) "Building C object CMakeFiles/yqdb.dir/src/yq_cluster.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/yqdb.dir/src/yq_cluster.c.o -MF CMakeFiles/yqdb.dir/src/yq_cluster.c.o.d -o CMakeFiles/yqdb.dir/src/yq_cluster.c.o -c /workspace/yqdb/src/yq_cluster.c
+
+CMakeFiles/yqdb.dir/src/yq_cluster.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/yqdb.dir/src/yq_cluster.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /workspace/yqdb/src/yq_cluster.c > CMakeFiles/yqdb.dir/src/yq_cluster.c.i
+
+CMakeFiles/yqdb.dir/src/yq_cluster.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/yqdb.dir/src/yq_cluster.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /workspace/yqdb/src/yq_cluster.c -o CMakeFiles/yqdb.dir/src/yq_cluster.c.s
+
+CMakeFiles/yqdb.dir/src/yq_cache.c.o: CMakeFiles/yqdb.dir/flags.make
+CMakeFiles/yqdb.dir/src/yq_cache.c.o: src/yq_cache.c
+CMakeFiles/yqdb.dir/src/yq_cache.c.o: CMakeFiles/yqdb.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=$(CMAKE_PROGRESS_20) "Building C object CMakeFiles/yqdb.dir/src/yq_cache.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/yqdb.dir/src/yq_cache.c.o -MF CMakeFiles/yqdb.dir/src/yq_cache.c.o.d -o CMakeFiles/yqdb.dir/src/yq_cache.c.o -c /workspace/yqdb/src/yq_cache.c
+
+CMakeFiles/yqdb.dir/src/yq_cache.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/yqdb.dir/src/yq_cache.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /workspace/yqdb/src/yq_cache.c > CMakeFiles/yqdb.dir/src/yq_cache.c.i
+
+CMakeFiles/yqdb.dir/src/yq_cache.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/yqdb.dir/src/yq_cache.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /workspace/yqdb/src/yq_cache.c -o CMakeFiles/yqdb.dir/src/yq_cache.c.s
+
+CMakeFiles/yqdb.dir/src/yq_web.c.o: CMakeFiles/yqdb.dir/flags.make
+CMakeFiles/yqdb.dir/src/yq_web.c.o: src/yq_web.c
+CMakeFiles/yqdb.dir/src/yq_web.c.o: CMakeFiles/yqdb.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=$(CMAKE_PROGRESS_21) "Building C object CMakeFiles/yqdb.dir/src/yq_web.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/yqdb.dir/src/yq_web.c.o -MF CMakeFiles/yqdb.dir/src/yq_web.c.o.d -o CMakeFiles/yqdb.dir/src/yq_web.c.o -c /workspace/yqdb/src/yq_web.c
+
+CMakeFiles/yqdb.dir/src/yq_web.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/yqdb.dir/src/yq_web.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /workspace/yqdb/src/yq_web.c > CMakeFiles/yqdb.dir/src/yq_web.c.i
+
+CMakeFiles/yqdb.dir/src/yq_web.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/yqdb.dir/src/yq_web.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /workspace/yqdb/src/yq_web.c -o CMakeFiles/yqdb.dir/src/yq_web.c.s
+
+CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o: CMakeFiles/yqdb.dir/flags.make
+CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o: src/yq_web_missing_functions.c
+CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o: CMakeFiles/yqdb.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=$(CMAKE_PROGRESS_22) "Building C object CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o -MF CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o.d -o CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o -c /workspace/yqdb/src/yq_web_missing_functions.c
+
+CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /workspace/yqdb/src/yq_web_missing_functions.c > CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.i
+
+CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /workspace/yqdb/src/yq_web_missing_functions.c -o CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.s
+
 # Object files for target yqdb
 yqdb_OBJECTS = \
 "CMakeFiles/yqdb.dir/src/yq_enc.c.o" \
@@ -340,7 +396,11 @@ yqdb_OBJECTS = \
 "CMakeFiles/yqdb.dir/src/yq_compress.c.o" \
 "CMakeFiles/yqdb.dir/src/yq_crypto.c.o" \
 "CMakeFiles/yqdb.dir/src/yq_pubsub.c.o" \
-"CMakeFiles/yqdb.dir/src/yq_backup.c.o"
+"CMakeFiles/yqdb.dir/src/yq_backup.c.o" \
+"CMakeFiles/yqdb.dir/src/yq_cluster.c.o" \
+"CMakeFiles/yqdb.dir/src/yq_cache.c.o" \
+"CMakeFiles/yqdb.dir/src/yq_web.c.o" \
+"CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o"
 
 # External object files for target yqdb
 yqdb_EXTERNAL_OBJECTS =
@@ -363,9 +423,13 @@ libyqdb.a: CMakeFiles/yqdb.dir/src/yq_compress.c.o
 libyqdb.a: CMakeFiles/yqdb.dir/src/yq_crypto.c.o
 libyqdb.a: CMakeFiles/yqdb.dir/src/yq_pubsub.c.o
 libyqdb.a: CMakeFiles/yqdb.dir/src/yq_backup.c.o
+libyqdb.a: CMakeFiles/yqdb.dir/src/yq_cluster.c.o
+libyqdb.a: CMakeFiles/yqdb.dir/src/yq_cache.c.o
+libyqdb.a: CMakeFiles/yqdb.dir/src/yq_web.c.o
+libyqdb.a: CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o
 libyqdb.a: CMakeFiles/yqdb.dir/build.make
 libyqdb.a: CMakeFiles/yqdb.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=$(CMAKE_PROGRESS_19) "Linking C static library libyqdb.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/workspace/yqdb/CMakeFiles --progress-num=$(CMAKE_PROGRESS_23) "Linking C static library libyqdb.a"
 	$(CMAKE_COMMAND) -P CMakeFiles/yqdb.dir/cmake_clean_target.cmake
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/yqdb.dir/link.txt --verbose=$(VERBOSE)
 

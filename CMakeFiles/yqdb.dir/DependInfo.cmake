@@ -12,6 +12,8 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/workspace/yqdb/src/yq_backup.c" "CMakeFiles/yqdb.dir/src/yq_backup.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_backup.c.o.d"
   "/workspace/yqdb/src/yq_batch.c" "CMakeFiles/yqdb.dir/src/yq_batch.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_batch.c.o.d"
   "/workspace/yqdb/src/yq_btree.c" "CMakeFiles/yqdb.dir/src/yq_btree.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_btree.c.o.d"
+  "/workspace/yqdb/src/yq_cache.c" "CMakeFiles/yqdb.dir/src/yq_cache.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_cache.c.o.d"
+  "/workspace/yqdb/src/yq_cluster.c" "CMakeFiles/yqdb.dir/src/yq_cluster.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_cluster.c.o.d"
   "/workspace/yqdb/src/yq_compress.c" "CMakeFiles/yqdb.dir/src/yq_compress.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_compress.c.o.d"
   "/workspace/yqdb/src/yq_crypto.c" "CMakeFiles/yqdb.dir/src/yq_crypto.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_crypto.c.o.d"
   "/workspace/yqdb/src/yq_enc.c" "CMakeFiles/yqdb.dir/src/yq_enc.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_enc.c.o.d"
@@ -26,6 +28,8 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/workspace/yqdb/src/yq_ttl.c" "CMakeFiles/yqdb.dir/src/yq_ttl.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_ttl.c.o.d"
   "/workspace/yqdb/src/yq_vfs.c" "CMakeFiles/yqdb.dir/src/yq_vfs.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_vfs.c.o.d"
   "/workspace/yqdb/src/yq_wal.c" "CMakeFiles/yqdb.dir/src/yq_wal.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_wal.c.o.d"
+  "/workspace/yqdb/src/yq_web.c" "CMakeFiles/yqdb.dir/src/yq_web.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_web.c.o.d"
+  "/workspace/yqdb/src/yq_web_missing_functions.c" "CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o" "gcc" "CMakeFiles/yqdb.dir/src/yq_web_missing_functions.c.o.d"
   )
 
 # Targets to which this target links which contain Fortran sources.
