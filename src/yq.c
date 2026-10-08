@@ -17,7 +17,7 @@ static _Thread_local int g_last_io_err = 0;
 
 struct yq_db {
     yq_opts opts;
-    char path[1024];
+    char path[YQ_MAX_PATH];
     yq_file *db_file;
     yq_file *wal_file;
     yq_file *shm_file;
@@ -152,9 +152,15 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     db->opts = def;
     db->write_enabled = !(def.flags & YQ_OPEN_READONLY);
 
-    char db_path_buf[1024];
+    /*
+     * Reject paths that cannot hold the longest auxiliary suffix. The limit is
+     * checked here once so every derived path below can be built by memcpy
+     * (snprintf would trip -Wformat-truncation, and silently truncating a
+     * .lock / .shm name would break cross-process locking).
+     */
+    char db_path_buf[YQ_MAX_PATH];
     size_t plen = strlen(path);
-    if (plen >= sizeof(db_path_buf)) { free(db); return YQ_ERR_INVAL; }
+    if (plen + YQ_MAX_SUFFIX > sizeof(db_path_buf)) { free(db); return YQ_ERR_INVAL; }
     memcpy(db_path_buf, path, plen + 1);
     memcpy(db->path, path, plen + 1);
 
@@ -165,13 +171,15 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
 
     uint64_t fsize = yq_file_size(db->db_file);
 
-    char shm_path[1024];
-    snprintf(shm_path, sizeof(shm_path), "%s.shm", db_path_buf);
+    char shm_path[YQ_MAX_PATH];
+    memcpy(shm_path, db_path_buf, plen);
+    memcpy(shm_path + plen, ".shm", 5);
     db->shm_file = yq_file_open(shm_path, 1, 1);
     if (!db->shm_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
 
-    char lock_path[1024];
-    snprintf(lock_path, sizeof(lock_path), "%s.lock", db_path_buf);
+    char lock_path[YQ_MAX_PATH];
+    memcpy(lock_path, db_path_buf, plen);
+    memcpy(lock_path + plen, ".lock", 6);
     db->lock_file = yq_file_open(lock_path, 1, 1);
     if (!db->lock_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
 
@@ -743,13 +751,14 @@ int yq_cur_close(yq_cur *c) {
  * from the memtable alone. Callers must check that before calling.
  */
 static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
-    char tmp_db[1024 + 32];
-    char tmp_log[1024 + 32];
-    char cur_log[1024 + 32];
+    char tmp_db[YQ_MAX_PATH + 32];
+    char tmp_log[YQ_MAX_PATH + 32];
+    char cur_log[YQ_MAX_PATH + 32];
 
-    if (snprintf(tmp_db, sizeof(tmp_db), "%s.ckpt-tmp", db->path) >= (int)sizeof(tmp_db)) {
-        return YQ_ERR_INVAL;
-    }
+    size_t plen = strlen(db->path);
+    if (plen + 10 > sizeof(tmp_db)) return YQ_ERR_INVAL;   /* ".ckpt-tmp" + NUL */
+    memcpy(tmp_db, db->path, plen);
+    memcpy(tmp_db + plen, ".ckpt-tmp", 10);
 
     yq_wal *tmp = NULL;
     int rc = yq_wal_open(&tmp, tmp_db, db->opts.page_size);
@@ -777,14 +786,17 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
 
     yq_wal_close(tmp);
 
+    size_t tmp_len = strlen(tmp_db);
+    memcpy(tmp_log, tmp_db, tmp_len);
+    memcpy(tmp_log + tmp_len, ".log", 5);
+
     if (rc != YQ_OK) {
-        snprintf(tmp_log, sizeof(tmp_log), "%s.log", tmp_db);
         remove(tmp_log);
         return rc;
     }
 
-    snprintf(tmp_log, sizeof(tmp_log), "%s.log", tmp_db);
-    snprintf(cur_log, sizeof(cur_log), "%s.log", db->path);
+    memcpy(cur_log, db->path, plen);
+    memcpy(cur_log + plen, ".log", 5);
 
     rc = yq_file_rename(tmp_log, cur_log);
     if (rc != YQ_OK) {

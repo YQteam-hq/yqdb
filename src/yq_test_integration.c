@@ -5,6 +5,11 @@
 #include <time.h>
 #include "yq.h"
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 static const char *TEST_DB = "yqtest_integration.yqdb";
 
 static void remove_db(void) {
@@ -716,6 +721,91 @@ static void test_writer_lock_contention(void) {
     printf("OK\n");
 }
 
+#if !defined(_WIN32)
+/*
+ * Long database paths.
+ *
+ * Regression guard for the derived-path buffers: yq_open() used to accept a
+ * path only up to 1023 bytes and then snprintf() "%s.shm" / "%s.lock" into a
+ * 1024-byte buffer (truncating them), while yq_wal_open() rejected anything
+ * longer than 507 bytes outright. Both limits were below what yq_open()
+ * advertised, so a long path either failed with YQ_ERR_INVAL or silently used
+ * truncated auxiliary names.
+ */
+static void test_long_db_path(void) {
+    printf("test_long_db_path... ");
+
+    enum { LEVELS = 6, SEG = 200 };
+    char seg[SEG + 1];
+    memset(seg, 'd', SEG);
+    seg[SEG] = '\0';
+
+    char prefix[LEVELS * (SEG + 1) + 1];
+    char levels[LEVELS][LEVELS * (SEG + 1) + 1];
+    size_t plen = 0;
+    prefix[0] = '\0';
+
+    for (int i = 0; i < LEVELS; i++) {
+        memcpy(levels[i], prefix, plen);
+        memcpy(levels[i] + plen, seg, SEG);
+        memcpy(levels[i] + plen + SEG, "/", 2);
+        plen += SEG + 1;
+        mkdir(levels[i], 0755);
+        memcpy(prefix, levels[i], plen + 1);
+    }
+
+    char path[sizeof(prefix) + 32];
+    memcpy(path, prefix, plen);
+    memcpy(path + plen, "long.yqdb", 10);
+    plen += 9;
+    CHECK(plen > 1024);   /* past the old buffers */
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(path, &opts, &db), YQ_OK);
+
+    yq_txn *t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+    yq_slice k = {"k", 1};
+    yq_slice v = {"v", 1};
+    CHECK_EQ(yq_put(t, k, v, YQ_PUT_UPSERT), YQ_OK);
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    /* The auxiliary files must sit next to the database, not at a truncated
+     * path — and the data must survive a reopen. */
+    char aux[sizeof(path) + 8];
+    memcpy(aux, path, plen);
+    memcpy(aux + plen, ".shm", 5);
+    CHECK(fopen(aux, "rb") != NULL);
+    memcpy(aux + plen, ".lock", 6);
+    CHECK(fopen(aux, "rb") != NULL);
+
+    db = NULL;
+    CHECK_EQ(yq_open(path, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+    yq_slice out = {0};
+    CHECK_EQ(yq_get(t, k, &out), YQ_OK);
+    CHECK(out.size == 1);
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    memcpy(aux + plen, ".log", 5);  remove(aux);
+    memcpy(aux + plen, ".shm", 5);  remove(aux);
+    memcpy(aux + plen, ".lock", 6); remove(aux);
+    remove(path);
+    for (int i = LEVELS - 1; i >= 0; i--) rmdir(levels[i]);
+
+    printf("OK\n");
+}
+#endif /* !_WIN32 */
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -735,6 +825,9 @@ int main(void) {
     test_readonly_snapshot();
     test_checkpoint_compaction();
     test_writer_lock_contention();
+#if !defined(_WIN32)
+    test_long_db_path();
+#endif
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;
