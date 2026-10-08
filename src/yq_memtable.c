@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 /*
  * P3：把 memtable 的单次插入从 O(n) 元素搬移降到 O(log n)。
@@ -87,10 +88,12 @@ static mt_skip_node *node_alloc(yq_memtable *mt, int level) {
 /*
  * 层数采样用本表自带状态的 xorshift64。
  *
- * 不用 srand()/rand()：那两者持全局状态，既非线程安全，又会让同一秒内创建的
- * 两张表拿到完全相同的层数序列（seed 都是 time(NULL)）。这里把状态放进
- * yq_memtable，表与表之间互相独立，也不碰进程级全局状态。
- * 种子派生自表指针与一个递增计数器，重复创建也不会得到相同初值。
+ * 不用 srand()/rand()：那两者持有进程级全局状态，既非线程安全，又会让同一秒
+ * 内创建的两张表拿到完全相同的层数序列（seed 都是 time(NULL)）。
+ *
+ * 这里状态存于 yq_memtable（skip_rng），采样过程不碰任何全局状态；仅"首次
+ * 取种子"时用一个 atomic 计数器保证各表初值互异，该计数器是进程级但访问
+ * 为原子读改写，无 data race（见 yq_memtable_create 处的说明）。
  */
 static uint64_t skip_rng_next(yq_memtable *mt) {
     uint64_t x = mt->skip_rng;
@@ -233,11 +236,17 @@ yq_memtable *yq_memtable_create(size_t max_bytes) {
     mt->used_bytes = 0;
     mt->gen = 1;
     /*
-     * xorshift64 要求状态非零。用表指针与进程内单调计数器混合，
+     * xorshift64 要求状态非零，且要求各表种子互异：状态相同的两张表会
+     * 采出完全相同的层数序列。这里用「表指针 ^ 进程内单调计数器」混合，
      * 保证同一秒内创建的多张表也拿到不同种子（srand(time(NULL)) 做不到）。
+     *
+     * 计数器用 atomic_fetch_add 而非 static uint64_t ++：后者本身也是
+     * 进程级全局状态且读改写非原子，多线程并发 create 属 C11 data race，
+     * 极端下两张表会拿到同一个序数。原子读改写消除了这个竞态。
      */
-    static uint64_t seq = 0;
-    uint64_t salt = (uint64_t)(uintptr_t)mt ^ (++seq * 0x9E3779B97F4A7C15ULL);
+    static atomic_uint_fast64_t seed_seq = 0;
+    uint64_t ordinal = (uint64_t)atomic_fetch_add(&seed_seq, 1);
+    uint64_t salt = (uint64_t)(uintptr_t)mt ^ ((ordinal + 1) * 0x9E3779B97F4A7C15ULL);
     mt->skip_rng = salt ? salt : 0x2545F4914F6CDD1DULL;
 
     mt->header = node_alloc(mt, MAX_SKIP_LEVEL - 1);
@@ -442,22 +451,25 @@ int yq_memtable_reset(yq_memtable *mt) {
     if (!mt) return YQ_OK;
 
     /*
-     * 先建好新的 header 再回卷 arena：node_alloc 会在当前 arena 上分配，
-     * 若分配失败则直接返回错误、保持原状，避免留下 header=NULL 让后续
-     * 任何插入/查找都空指针解引用（create 路径原本就有判空，reset 漏了）。
+     * 顺序说明：必须先回卷 arena，再在（已回卷的）arena 上分配新 header。
+     * node_alloc 从 arena 顶部取空间，若反过来先分配再回卷，刚建好的 header
+     * 会被 reset 抹掉；因此这里不存在"失败则保持原状"的可能——回卷一旦
+     * 发生，旧节点就失去归属了。
+     *
+     * 失败路径（新 header 分配不出来）下，表被显式置空并把 gen 递增，
+     * 使所有既有迭代器失效，避免它们继续读到已随 arena 回卷而失效的旧节点。
+     * create 路径原本就对 header 判空，reset 之前漏了这一步。
      */
     yq_memblk_reset(mt->arena);
 
     mt_skip_node *new_header = node_alloc(mt, MAX_SKIP_LEVEL - 1);
     if (!new_header) {
         /*
-         * arena 已回卷但 header 未建立：此时旧节点内存仍在（reset 只回卷
-         * used），但旧 header 指针指向的位置已被新分配逻辑覆盖。为安全起见
-         * 把表置为"空且不可用"之外，更好的做法是保持旧 header —— 但旧
-         * 节点数据已随 used 回卷而失去归属。
+         * arena 已回卷但 header 建不出来：旧节点内存虽仍在（reset 只回卷
+         * used），却已失去归属。这里把表置为"空且不可用"，并递增 gen 让
+         * 既有迭代器全部失效，而不是留下 header=NULL 之外的中间态。
          * 实践中 reset 仅在 flush 后调用且 max_bytes 远大于 header 大小，
-         * 分配失败不可达；这里选择返回错误码并保留 gen 递增，让既有
-         * 迭代器全部失效，避免读到已丢弃数据。
+         * 分配失败不可达。
          */
         mt->header = NULL;
         mt->level = 0;
