@@ -1,6 +1,14 @@
+/*
+ * _GNU_SOURCE must be defined before any libc header for mallinfo2().
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 #include "yq_test_check.h"
 #include <time.h>
 #include "yq.h"
@@ -8,6 +16,15 @@
 #if !defined(_WIN32)
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+/*
+ * mallinfo2() is glibc >= 2.33. When it is available the suite can assert
+ * that yq_close() really hands memory back, instead of only looking for
+ * wrong values.
+ */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+#define YQ_TEST_CAN_MEASURE_HEAP 1
 #endif
 
 static const char *TEST_DB = "yqtest_integration.yqdb";
@@ -811,6 +828,91 @@ static void test_large_value(void) {
     printf("OK\n");
 }
 
+#if defined(YQ_TEST_CAN_MEASURE_HEAP)
+/*
+ * Bytes currently handed out by malloc(). hblkhd is included because glibc
+ * serves large requests (the 64 MiB arena below) from mmap() rather than the
+ * main heap, and those would otherwise not show up.
+ */
+static size_t heap_in_use(void) {
+    struct mallinfo2 m = mallinfo2();
+    return m.uordblks + m.hblkhd;
+}
+
+/*
+ * yq_close() must release everything yq_open() allocated.
+ *
+ * free_db() had an empty `if (db->btree) { }` block, so the yq_btree handle
+ * malloc()'d by yq_btree_open()/yq_btree_create() was never freed. Worse,
+ * when the database file is empty yq_open() cannot mmap() it and falls back
+ * to a heap arena of opts.map_size bytes — 1 GiB by default — which was
+ * leaked as well, once per open.
+ */
+static void test_close_releases_resources(void) {
+    printf("test_close_releases_resources... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    /* Warm up: the first open pulls in stdio/allocator state that would
+     * otherwise be counted as growth. */
+    for (int i = 0; i < 3; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+
+    /* (1) the b-tree handle: 96 bytes per cycle, so it takes a few thousand
+     *     cycles to show up above allocator noise. */
+    size_t heap_before = heap_in_use();
+    for (int i = 0; i < 2000; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+    size_t heap_growth = heap_in_use() - heap_before;
+    printf("(heap +%zu B) ", heap_growth);
+    CHECK(heap_growth < 64 * 1024);   /* leaking: ~220 KB for 2000 cycles */
+
+    /* (2) the heap arena fallback: a zero-length database file cannot be
+     *     mmap()ed, so yq_open() malloc()s opts.map_size bytes for the arena.
+     *     64 MiB keeps the test cheap; the default is 1 GiB. */
+    remove_db();
+    FILE *f = fopen(TEST_DB, "wb");
+    CHECK(f != NULL);
+    fclose(f);
+
+    yq_opts zopts;
+    memset(&zopts, 0, sizeof(zopts));
+    zopts.struct_size = sizeof(zopts);
+    zopts.page_size = 4096;
+    zopts.map_size = 64ULL * 1024 * 1024;
+
+    for (int i = 0; i < 2; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &zopts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+
+    size_t arena_before = heap_in_use();
+    for (int i = 0; i < 4; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &zopts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+    size_t arena_growth = heap_in_use() - arena_before;
+    printf("(arena +%zu B) ", arena_growth);
+    CHECK(arena_growth < 4ULL * 1024 * 1024);   /* leaking: ~256 MiB here */
+
+    remove_db();
+    printf("OK\n");
+}
+#endif /* YQ_TEST_CAN_MEASURE_HEAP */
+
 #if !defined(_WIN32)
 /*
  * Long database paths.
@@ -916,6 +1018,9 @@ int main(void) {
     test_checkpoint_compaction();
     test_writer_lock_contention();
     test_large_value();
+#if defined(YQ_TEST_CAN_MEASURE_HEAP)
+    test_close_releases_resources();
+#endif
 #if !defined(_WIN32)
     test_long_db_path();
 #endif
