@@ -2,8 +2,12 @@
 #include "yq_enc.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #define YQ_WAL_HEADER_SIZE 29
+#define YQ_WAL_MAX_KEY_SIZE 1024
+#define YQ_WAL_VARINT_MAX   10
+#define YQ_WAL_STACK_ENC    512
 
 #define WAL_TYPE_BEGIN   1
 #define WAL_TYPE_PUT     2
@@ -139,24 +143,55 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
 }
 
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
-    uint8_t enc_buf[2048];
+    if (!wal) return YQ_ERR_INVAL;
+    if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
+    if (!key.data) return YQ_ERR_INVAL;
+    if (val.size > 0 && !val.data) return YQ_ERR_INVAL;
+
+    /*
+     * Payload layout is varint(key_len) key varint(val_len) val. Values are
+     * bounded only by the engine limit (1 GiB), so a fixed stack buffer would
+     * overflow as soon as a value exceeds it. Encode into a stack buffer when
+     * the record is small -- the overwhelmingly common case -- and fall back
+     * to the heap for anything larger.
+     */
+    uint8_t klen_buf[YQ_WAL_VARINT_MAX];
+    uint8_t vlen_buf[YQ_WAL_VARINT_MAX];
+    size_t nk = 0, nv = 0;
+
+    if (yq_varint_encode(key.size, klen_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
+    if (yq_varint_encode(val.size, vlen_buf, &nv) != YQ_OK) return YQ_ERR_INVAL;
+
+    if (val.size > SIZE_MAX - (nk + key.size + nv)) return YQ_ERR_TOOBIG;
+    size_t total = nk + key.size + nv + val.size;
+
+    uint8_t stack_buf[YQ_WAL_STACK_ENC];
+    uint8_t *enc = stack_buf;
+    if (total > sizeof(stack_buf)) {
+        enc = (uint8_t *)malloc(total);
+        if (!enc) return YQ_ERR_NOMEM;
+    }
+
     size_t pos = 0;
+    memcpy(enc + pos, klen_buf, nk);
+    pos += nk;
+    memcpy(enc + pos, key.data, key.size);
+    pos += key.size;
+    memcpy(enc + pos, vlen_buf, nv);
+    pos += nv;
+    if (val.size) memcpy(enc + pos, val.data, val.size);
 
-    size_t nk;
-    if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + nk, key.data, key.size);
-    pos = nk + key.size;
-
-    size_t nv;
-    if (yq_varint_encode(val.size, enc_buf + pos, &nv) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + pos + nv, val.data, val.size);
-    pos += nv + val.size;
-
-    return append_record(wal, txn_id, WAL_TYPE_PUT, enc_buf, pos);
+    int rc = append_record(wal, txn_id, WAL_TYPE_PUT, enc, total);
+    if (enc != stack_buf) free(enc);
+    return rc;
 }
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
-    uint8_t enc_buf[1032];
+    if (!wal) return YQ_ERR_INVAL;
+    if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
+    if (!key.data) return YQ_ERR_INVAL;
+
+    uint8_t enc_buf[YQ_WAL_MAX_KEY_SIZE + YQ_WAL_VARINT_MAX];
     size_t nk;
     if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
     memcpy(enc_buf + nk, key.data, key.size);

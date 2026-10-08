@@ -34,6 +34,10 @@ add_executable(yq_test_integration src/yq_test_integration.c)
 target_link_libraries(yq_test_integration yqdb)
 add_test(NAME integration_test COMMAND yq_test_integration)
 
+add_executable(yq_test_wal src/yq_test_wal.c)
+target_link_libraries(yq_test_wal yqdb)
+add_test(NAME wal_test COMMAND yq_test_wal)
+
 add_executable(yq_test_seek src/yq_test_seek.c)
 target_link_libraries(yq_test_seek yqdb)
 add_test(NAME seek_test COMMAND yq_test_seek)
