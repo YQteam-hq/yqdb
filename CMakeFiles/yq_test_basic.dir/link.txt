@@ -1,0 +1,1 @@
+/usr/bin/cc CMakeFiles/yq_test_basic.dir/src/yq_test_basic.c.o -o yq_test_basic  libyqdb.a 

@@ -24,6 +24,7 @@ set(SOURCES
     src/yq_compress.c
     src/yq_crypto.c
     src/yq_pubsub.c
+    src/yq_backup.c
 )
 
 add_library(yqdb STATIC ${SOURCES})
