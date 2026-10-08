@@ -9,6 +9,7 @@ This document describes the new features added to yq-DB in this release.
 - [Secondary Indexes](#secondary-indexes)
 - [Time-To-Live (TTL)](#time-to-live-ttl)
 - [Compression](#compression)
+- [Encryption](#encryption)
 - [Usage Examples](#usage-examples)
 - [Building with New Features](#building-with-new-features)
 
@@ -724,6 +725,116 @@ if (rc != YQ_OK) {
 
 ---
 
+## Encryption
+
+yq-DB now includes optional encryption functionality for secure storage of sensitive data.
+
+### Enabling Encryption
+
+To enable encryption functionality, define `YQ_ENABLE_CRYPTO` before including `yq.h`:
+
+```c
+#define YQ_ENABLE_CRYPTO 1
+#include "yq.h"
+```
+
+Or compile with the `-DYQ_ENABLE_CRYPTO` flag:
+
+```bash
+gcc -DYQ_ENABLE_CRYPTO -std=c11 -Iinclude src/your_app.c src/*.o -o your_app
+```
+
+### Basic Usage
+
+```c
+// Configure encryption (AES-256, CBC mode, min 1KB)
+yq_crypto_opts opts = {
+    .struct_size = sizeof(yq_crypto_opts),
+    .algorithm = YQ_CRYPTO_AES256,
+    .mode = YQ_CRYPTO_MODE_CBC,
+    .key_size = 32,  // 256-bit key
+    .iv_size = 16,   // 128-bit IV
+    .min_size = 1024, // Only encrypt values > 1KB
+    .reserved = {0}
+};
+yq_crypto_configure(db, &opts);
+
+// Store sensitive data (will be automatically encrypted)
+yq_slice key = {"user_password", 13};
+yq_slice value = {password_ptr, password_size};
+yq_put(txn, key, value, YQ_PUT_UPSERT);
+
+// Check if data is encrypted
+int is_encrypted = yq_crypto_is_encrypted(txn, &key);
+printf("Data is %sencrypted\n", is_encrypted ? "" : "not ");
+
+// Get encryption statistics
+int64_t encrypted_count = yq_crypto_stats(db);
+int64_t key_count = yq_crypto_key_count(db);
+printf("Encrypted %ld items with %ld keys\n", encrypted_count, key_count);
+```
+
+### Encryption Algorithms
+
+| Algorithm | Security | Speed | Memory Usage | Best For |
+|-----------|----------|-------|--------------|----------|
+| **AES-256** | Very High | Good | Medium | General purpose, high security |
+| **ChaCha20** | High | Excellent | Low | Performance-critical applications |
+| **XOR** | Low (demo) | Very Fast | Low | Educational purposes |
+
+### Key Management
+
+```c
+// Generate random key
+uint8_t *key = yq_crypto_generate_key(32);  // 256-bit key
+free(key);
+
+// Derive key from password
+uint8_t *salt = yq_crypto_generate_salt(16);
+uint8_t *derived_key = yq_crypto_derive_key("user_password", 32, salt, 16, 10000);
+free(salt);
+free(derived_key);
+
+// Generate random IV
+uint8_t *iv = yq_crypto_generate_iv(16);
+free(iv);
+```
+
+### Data Integrity
+
+```c
+// Generate hash for data integrity
+uint8_t *data_hash = yq_crypto_hash(sensitive_data, data_size, "SHA256");
+
+// Verify data integrity
+int is_valid = yq_crypto_verify(retrieved_data, data_size, data_hash, "SHA256");
+free(data_hash);
+```
+
+### Configuration Options
+
+- `algorithm`: Encryption algorithm selection
+- `mode`: Encryption mode (ECB, CBC, GCM)
+- `key_size`: Key size in bytes
+- `iv_size`: Initialization vector size
+- `min_size`: Minimum size for encryption (avoid overhead for small data)
+
+### Use Cases
+
+- **Sensitive Data**: Store passwords, API keys, personal information
+- **Compliance**: Meet regulatory requirements for data protection
+- **Privacy**: Ensure user data remains confidential
+- **Secure Storage**: Encrypt data at rest in the database
+
+### Performance Considerations
+
+- **CPU Usage**: Encryption consumes CPU cycles
+- **Memory Overhead**: Additional memory for encryption buffers
+- **Latency**: Increased latency for write operations
+- **Security**: Stronger algorithms provide better security but may be slower
+
+---
+
 ## Building with New Features
 
 ### CMake Build
@@ -731,14 +842,14 @@ if (rc != YQ_OK) {
 To build yq-DB with all new features enabled:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DYQ_ENABLE_JSON=ON -DYQ_ENABLE_BATCH=ON -DYQ_ENABLE_INDEX=ON -DYQ_ENABLE_TTL=ON -DYQ_ENABLE_COMPRESS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DYQ_ENABLE_JSON=ON -DYQ_ENABLE_BATCH=ON -DYQ_ENABLE_INDEX=ON -DYQ_ENABLE_TTL=ON -DYQ_ENABLE_COMPRESS=ON -DYQ_ENABLE_CRYPTO=ON
 cmake --build build
 ```
 
 ### Direct GCC Build
 
 ```bash
-gcc -DYQ_ENABLE_JSON=1 -DYQ_ENABLE_BATCH=1 -DYQ_ENABLE_INDEX=1 -DYQ_ENABLE_TTL=1 -DYQ_ENABLE_COMPRESS=1 -std=c11 -Wall -Wextra -Iinclude -O2 -c src/*.c
+gcc -DYQ_ENABLE_JSON=1 -DYQ_ENABLE_BATCH=1 -DYQ_ENABLE_INDEX=1 -DYQ_ENABLE_TTL=1 -DYQ_ENABLE_COMPRESS=1 -DYQ_ENABLE_CRYPTO=1 -std=c11 -Wall -Wextra -Iinclude -O2 -c src/*.c
 ar rcs libyqdb.a *.o
 ```
 
