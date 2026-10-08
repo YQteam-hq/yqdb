@@ -156,15 +156,27 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     shm_header *hdr = (shm_header *)mvcc->shm_base;
 
     for (uint32_t i = 0; i < mvcc->max_readers; i++) {
-        uint32_t expected = 0;
+        /*
+         * Claim a slot by CAS-ing active from 0 to 1.
+         *
+         * The two platforms disagree on the return value: Win32's
+         * InterlockedCompareExchange returns the *previous* value, while C11's
+         * atomic_compare_exchange_strong returns a *bool* telling whether the
+         * exchange happened (and writes the previous value into `expected`).
+         * Normalise both into a single `claimed` flag — comparing the bool
+         * against `expected` can never succeed, which silently turned every
+         * snapshot acquisition into YQ_ERR_READER_FULL.
+         */
+        int claimed = 0;
 #if defined(_WIN32)
-        LONG old = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, (LONG)expected);
-        if (old == (LONG)expected)
+        LONG expected = 0;
+        LONG old = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, expected);
+        claimed = (old == expected);
 #else
-        uint32_t old = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1);
-        if (old == expected)
+        uint32_t expected = 0;
+        claimed = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1);
 #endif
-        {
+        if (claimed) {
             slots[i].pid = yq_mvcc_current_pid();
             slots[i].tid = yq_mvcc_current_tid();
             slots[i].snapshot_txn = txn_id;

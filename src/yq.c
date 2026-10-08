@@ -761,5 +761,6 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
     out->npages = npages;
     out->free_pages = free_head;
     out->log_bytes = yq_wal_size(db->wal);
+    out->active_readers = yq_mvcc_active_readers(db->mvcc);
     return YQ_OK;
 }
