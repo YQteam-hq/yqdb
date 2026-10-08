@@ -27,6 +27,8 @@ struct yq_db {
     yq_memtable *memtable;
     void *mmap_base;
     size_t mmap_len;
+    void *btree_arena;       /* set only when yq_open malloc'd it */
+    int btree_arena_owned;
     int write_enabled;
     int closed;
 };
@@ -125,8 +127,13 @@ static void free_db(yq_db *db) {
         yq_file_munmap(db->mmap_base, db->mmap_len);
     }
     if (db->memtable) yq_memtable_destroy(db->memtable);
-    if (db->btree) {
-    }
+    /*
+     * The handle goes first: it only borrows the arena, which is released
+     * below when yq_open allocated it (otherwise it is the mmap window
+     * unmapped above).
+     */
+    if (db->btree) yq_btree_destroy(db->btree);
+    if (db->btree_arena_owned) free(db->btree_arena);
     if (db->wal) yq_wal_close(db->wal);
     if (db->mvcc) yq_mvcc_close(db->mvcc);
     if (db->lock_file) yq_file_close(db->lock_file);
@@ -215,10 +222,16 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
         yq_btree_set_root(db->btree, root_page);
     } else {
         void *arena = db->mmap_base;
-        if (!arena) arena = malloc(def.map_size);
-        if (!arena) { free_db(db); return YQ_ERR_NOMEM; }
+        if (!arena) {
+            /* No file contents to map: the tree lives in a heap arena that
+             * free_db() must release, since nothing else owns it. */
+            arena = malloc(def.map_size);
+            if (!arena) { free_db(db); return YQ_ERR_NOMEM; }
+            db->btree_arena = arena;
+            db->btree_arena_owned = 1;
+        }
         db->btree = yq_btree_create(arena, def.page_size);
-        if (!db->btree) { if (!db->mmap_base) free(arena); free_db(db); return YQ_ERR_NOMEM; }
+        if (!db->btree) { free_db(db); return YQ_ERR_NOMEM; }
     }
 
     db->memtable = yq_memtable_create((size_t)def.memtable_bytes);

@@ -30,6 +30,10 @@ add_executable(yq_test_basic src/yq_test_basic.c)
 target_link_libraries(yq_test_basic yqdb)
 add_test(NAME basic_test COMMAND yq_test_basic)
 
+add_executable(yq_test_lifecycle src/yq_test_lifecycle.c)
+target_link_libraries(yq_test_lifecycle yqdb)
+add_test(NAME lifecycle_test COMMAND yq_test_lifecycle)
+
 add_executable(yq_test_integration src/yq_test_integration.c)
 target_link_libraries(yq_test_integration yqdb)
 add_test(NAME integration_test COMMAND yq_test_integration)
