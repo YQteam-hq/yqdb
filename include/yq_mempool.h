@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "yq.h"   /* YQ_OK / YQ_ERR_* 错误码 */
 
 #ifdef __cplusplus
 extern "C" {

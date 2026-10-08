@@ -7,6 +7,7 @@
 #include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -724,6 +725,13 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
  * transaction, so the batch becomes visible atomically on commit.
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/*
+ * 统计口径（评审要求保证自洽）：
+ *   entries_ok + entries_failed == entries_total 恒成立。
+ * 校验阶段失败时整批不落盘，此时把这批全部计为 failed（而不是只 failed++ 
+ * 却把 total 固定成 count），否则调用方会从 "total=5, ok=0, failed=1" 
+ * 误以为另外 4 条成功了。
+ */
 static void yq_batch_result_init(yq_batch_result *result, uint32_t total, int first_error) {
     if (!result) return;
     result->struct_size = sizeof(yq_batch_result);
@@ -736,7 +744,8 @@ static void yq_batch_result_init(yq_batch_result *result, uint32_t total, int fi
 
 int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
                  yq_batch_result *result) {
-    if (!txn || !entries || count == 0 || !result) {
+    /* result 可选：不传就不上报统计（与头文件契约一致） */
+    if (!txn || !entries || count == 0) {
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
     }
@@ -748,46 +757,71 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
         yq_batch_result_init(result, 0, YQ_ERR_READONLY);
         return YQ_ERR_READONLY;
     }
+    /* count 超过 uint32 时统计字段无法表达，提前拒绝而不是静默截断 */
+    if (count > 0xFFFFFFFFu) {
+        yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
+        return YQ_ERR_TOOBIG;
+    }
 
-    yq_batch_result_init(result, (uint32_t)count, YQ_OK);
+    uint32_t total = (uint32_t)count;
+    yq_batch_result_init(result, total, YQ_OK);
 
-    /* First pass: validate every entry so the whole batch is rejected
-     * before any mutation is applied. */
+    /* 第一遍：先校验全部 entry，避免半批写入 */
+    int bad = 0;
     for (size_t i = 0; i < count; i++) {
         const yq_batch_entry *e = &entries[i];
-        int bad = 0;
+        int entry_bad = 0;
         if (e->key.data == NULL || e->key.size == 0 || e->key.size > 1024) {
-            bad = 1;
+            entry_bad = 1;
         } else if (e->op == 0 && e->val.data == NULL && e->val.size != 0) {
-            bad = 1;
+            entry_bad = 1;
         }
-        if (bad) {
-            if (result->first_error == YQ_OK) result->first_error = YQ_ERR_INVAL;
-            result->entries_failed++;
-        }
+        if (entry_bad) bad = 1;
     }
-    if (result->entries_failed > 0) return result->first_error;
 
-    /* Second pass: apply the operations. Errors are recorded per entry. */
+    if (bad) {
+        /* 整批拒绝（未做任何变更）：全部计入 failed，保持 total == ok + failed */
+        if (result) {
+            result->first_error = YQ_ERR_INVAL;
+            result->entries_ok = 0;
+            result->entries_failed = total;
+        }
+        return YQ_ERR_INVAL;
+    }
+
+    /* 第二遍：执行。逐条记录结果，不做提前返回，保证计数完整。 */
+    int first_error = YQ_OK;
+    uint32_t ok = 0, failed = 0;
     for (size_t i = 0; i < count; i++) {
         const yq_batch_entry *e = &entries[i];
         int rc = (e->op == 0) ? yq_put(txn, e->key, e->val, e->flags)
                               : yq_del(txn, e->key);
         if (rc == YQ_OK) {
-            result->entries_ok++;
+            ok++;
         } else {
-            if (result->first_error == YQ_OK) result->first_error = rc;
-            result->entries_failed++;
+            failed++;
+            if (first_error == YQ_OK) first_error = rc;
         }
     }
-    return result->first_error;
+
+    if (result) {
+        result->entries_ok = ok;
+        result->entries_failed = failed;
+        result->first_error = first_error;
+    }
+    return first_error;
 }
 
 int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
                  yq_batch_result *result) {
-    if (!txn || !keys || count == 0 || !result) {
+    if (!txn || !keys || count == 0) {
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
+    }
+    /* count * sizeof(*entries) 为 size_t 运算，先挡回绕再分配 */
+    if (count > SIZE_MAX / sizeof(yq_batch_entry)) {
+        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
+        return YQ_ERR_NOMEM;
     }
 
     yq_batch_entry *entries = malloc(count * sizeof(*entries));

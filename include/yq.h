@@ -333,14 +333,18 @@ typedef struct yq_batch_result {
 } yq_batch_result;
 
 /*
- * Run a batch of PUT/DELETE operations. Returns YQ_ERR_INVAL when any argument
- * is NULL or count is 0. A read-only transaction returns YQ_ERR_READONLY and a
- * finished transaction returns YQ_ERR_TXN_CLOSED.
+ * Run a batch of PUT/DELETE operations. Returns YQ_ERR_INVAL when a required
+ * argument is NULL or count is 0. A read-only transaction returns
+ * YQ_ERR_READONLY and a finished transaction returns YQ_ERR_TXN_CLOSED.
  *
- * To avoid partial writes, the implementation validates every entry first; if
- * any entry is invalid the whole batch is left untouched and result->first_error
- * is set to YQ_ERR_INVAL. Entries are applied only after validation passes.
- * result may be NULL (statistics are then not reported).
+ * result is optional: pass NULL if you do not need the per-entry statistics.
+ *
+ * Validation happens before any mutation, so a batch is all-or-nothing: if any
+ * entry is invalid, nothing is applied and the return value is YQ_ERR_INVAL.
+ *
+ * Counters are always self-consistent — entries_ok + entries_failed equals
+ * entries_total, including on the rejected-before-apply path, where every
+ * entry is counted as failed rather than silently omitted.
  */
 int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
                  yq_batch_result *result);

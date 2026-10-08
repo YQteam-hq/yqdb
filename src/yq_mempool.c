@@ -175,7 +175,9 @@ void yq_mempool_free(yq_mempool *pool, void *ptr) {
 }
 
 int yq_mempool_stats_get(yq_mempool *pool, yq_mempool_stats *stats) {
-    if (!pool || !stats) return -1;
+    /* 与全项目统一：错误码用 YQ_ERR_*，不返回裸 -1 */
+    if (!pool || !stats) return YQ_ERR_INVAL;
+    if (stats->struct_size != sizeof(yq_mempool_stats)) return YQ_ERR_INVAL;
     
     stats->struct_size = sizeof(yq_mempool_stats);
     stats->chunks_allocated = pool->chunks_count;
@@ -185,7 +187,7 @@ int yq_mempool_stats_get(yq_mempool *pool, yq_mempool_stats *stats) {
     stats->memory_used = (uint64_t)pool->chunks_count * YQ_MEMPOOL_CHUNK_SIZE;
     stats->memory_allocated = (uint64_t)pool->chunks_count * YQ_MEMPOOL_CHUNK_SIZE;
     
-    return 0;
+    return YQ_OK;
 }
 
 void yq_mempool_reset(yq_mempool *pool) {
