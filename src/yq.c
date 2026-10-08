@@ -65,9 +65,9 @@ struct yq_cur {
 #define YQ_TXN_STATE_ABORTED   2
 
 int yq_version(int *major, int *minor, int *patch) {
-    if (major) *major = 1;
-    if (minor) *minor = 0;
-    if (patch) *patch = 0;
+    if (major) *major = YQ_VERSION_MAJOR;
+    if (minor) *minor = YQ_VERSION_MINOR;
+    if (patch) *patch = YQ_VERSION_PATCH;
     return YQ_OK;
 }
 
