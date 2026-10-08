@@ -7,6 +7,7 @@ This document describes the new features added to yq-DB in this release.
 - [JSON Support](#json-support)
 - [Batch Operations](#batch-operations)
 - [Secondary Indexes](#secondary-indexes)
+- [Time-To-Live (TTL)](#time-to-live-ttl)
 - [Usage Examples](#usage-examples)
 - [Building with New Features](#building-with-new-features)
 
@@ -500,21 +501,138 @@ int main(void) {
 
 ---
 
+## Time-To-Live (TTL)
+
+yq-DB now includes optional Time-To-Live (TTL) functionality for automatic key expiration.
+
+### Enabling TTL
+
+To enable TTL functionality, define `YQ_ENABLE_TTL` before including `yq.h`:
+
+```c
+#define YQ_ENABLE_TTL 1
+#include "yq.h"
+```
+
+Or compile with the `-DYQ_ENABLE_TTL` flag:
+
+```bash
+gcc -DYQ_ENABLE_TTL -std=c11 -Iinclude src/your_app.c src/*.o -o your_app
+```
+
+### Basic Usage
+
+```c
+// Configure TTL (automatic cleanup every 60 seconds)
+yq_ttl_opts opts = {sizeof(yq_ttl_opts), 60, 1000, {0}};
+yq_ttl_configure(db, &opts);
+
+// Set TTL for a key (30 seconds)
+yq_slice key = {"session_123", 11};
+yq_ttl_set(txn, &key, 30);
+
+// Check remaining TTL
+int32_t remaining = yq_ttl_get(txn, &key);
+if (remaining > 0) {
+    printf("Key expires in %d seconds\n", remaining);
+} else {
+    printf("Key has expired\n");
+}
+
+// Remove TTL
+yq_ttl_unset(txn, &key);
+```
+
+### Cleanup Operations
+
+```c
+// Manual cleanup
+yq_ttl_result *result = NULL;
+yq_ttl_cleanup(db, 0, &result);
+printf("Cleaned %d keys\n", result->cleaned_count);
+yq_ttl_result_free(result);
+
+// Find expiring keys
+yq_slice **expiring = NULL;
+int count = 0;
+expiring = yq_ttl_find_expiring(txn, 60, &count);
+for (int i = 0; i < count; i++) {
+    printf("Key %.*s will expire soon\n", 
+           (int)expiring[i]->size, (const char *)expiring[i]->data);
+}
+yq_ttl_query_result_free(expiring, count);
+
+// Find expired keys
+yq_slice **expired = NULL;
+expired = yq_ttl_find_expired(txn, &count);
+for (int i = 0; i < count; i++) {
+    printf("Key %.*s has expired\n", 
+           (int)expired[i]->size, (const char *)expired[i]->data);
+    yq_delete(txn, *expired[i]);
+}
+yq_ttl_query_result_free(expired, count);
+```
+
+### Statistics and Monitoring
+
+```c
+// Get expired key count
+int64_t expired_count = yq_ttl_expired_count(db);
+printf("Expired keys: %ld\n", expired_count);
+
+// Get memory usage
+int64_t memory = yq_ttl_memory_usage(db);
+printf("Memory usage: %ld bytes\n", memory);
+
+// Get current time
+time_t now = yq_ttl_now();
+printf("Current time: %ld\n", now);
+
+// Format time
+char *time_str = yq_ttl_format_time(now);
+printf("Formatted time: %s\n", time_str);
+free(time_str);
+```
+
+### Use Cases
+
+- **Session Management**: Automatically expire user sessions
+- **Caching**: Set expiration times for cached data
+- **Temporary Storage**: Automatically clean up temporary files
+- **Rate Limiting**: Expire rate limit counters after time window
+- **Analytics**: Track data freshness and expiration patterns
+
+### Configuration Options
+
+- `cleanup_interval`: Automatic cleanup interval in seconds (0 = manual)
+- `max_expired`: Maximum keys to clean per interval (0 = unlimited)
+
+### Error Handling
+
+```c
+int rc = yq_ttl_set(txn, &key, ttl);
+if (rc != YQ_OK) {
+    printf("Error: %s\n", yq_ttl_strerror(rc));
+}
+```
+
+---
+
 ## Building with New Features
 
 ### CMake Build
 
-To build yq-DB with JSON and batch support enabled:
+To build yq-DB with all new features enabled:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DYQ_ENABLE_JSON=ON -DYQ_ENABLE_BATCH=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DYQ_ENABLE_JSON=ON -DYQ_ENABLE_BATCH=ON -DYQ_ENABLE_INDEX=ON -DYQ_ENABLE_TTL=ON
 cmake --build build
 ```
 
 ### Direct GCC Build
 
 ```bash
-gcc -DYQ_ENABLE_JSON=1 -DYQ_ENABLE_BATCH=1 -std=c11 -Wall -Wextra -Iinclude -O2 -c src/*.c
+gcc -DYQ_ENABLE_JSON=1 -DYQ_ENABLE_BATCH=1 -DYQ_ENABLE_INDEX=1 -DYQ_ENABLE_TTL=1 -std=c11 -Wall -Wextra -Iinclude -O2 -c src/*.c
 ar rcs libyqdb.a *.o
 ```
 
