@@ -145,6 +145,13 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     int rc = apply_defaults(&def);
     if (rc != YQ_OK) return rc;
 
+    /* YQ_OPEN_NOSYNC is documented as "equivalent to YQ_SYNC_OFF, for
+     * discardable data": honour it by forcing the strongest no-sync mode.
+     * This takes precedence over any explicit sync_mode the caller passed. */
+    if (def.flags & YQ_OPEN_NOSYNC) {
+        def.sync_mode = YQ_SYNC_OFF;
+    }
+
     yq_db *db = calloc(1, sizeof(yq_db));
     if (!db) return YQ_ERR_NOMEM;
 
