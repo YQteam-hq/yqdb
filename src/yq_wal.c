@@ -2,8 +2,15 @@
 #include "yq_enc.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #define YQ_WAL_HEADER_SIZE 29
+
+/*
+ * yq_wal_append_put() 的栈缓冲上限：payload 小于它就走栈，否则走堆。
+ * 取 2 KiB 是为了覆盖"小 key + 小 value"这一热路径，同时不至于把栈压大。
+ */
+#define YQ_WAL_SMALL_PAYLOAD 2048
 
 #define WAL_TYPE_BEGIN   1
 #define WAL_TYPE_PUT     2
@@ -139,20 +146,55 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
 }
 
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
-    uint8_t enc_buf[2048];
-    size_t pos = 0;
+    if (!wal) return YQ_ERR_INVAL;
 
-    size_t nk;
-    if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + nk, key.data, key.size);
-    pos = nk + key.size;
+    /*
+     * 编码缓冲必须按实际 payload 定尺。
+     *
+     * 历史实现用固定的 uint8_t enc_buf[2048] 再 memcpy：key 上限 1024 加上
+     * varint 开销后，value 只要超过约 1017 字节就会写穿这块栈缓冲，而
+     * yq_put() 允许 value 到 1 GiB。调用方不止 yq_put——checkpoint 的
+     * wal_compact_from_memtable() 会把 memtable 里任意大小的 value 送进来，
+     * 于是"任何含 >1KB value 的库，调一次 yq_checkpoint() 就崩"。
+     *
+     * 这里先算出精确长度：小 payload 走栈缓冲（避免热路径 malloc），
+     * 大 payload 走堆。
+     */
+    size_t nk = 0, nv = 0;
+    if (yq_varint_encode(key.size, NULL, &nk) != YQ_OK) return YQ_ERR_INVAL;
+    if (yq_varint_encode(val.size, NULL, &nv) != YQ_OK) return YQ_ERR_INVAL;
 
-    size_t nv;
-    if (yq_varint_encode(val.size, enc_buf + pos, &nv) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + pos + nv, val.data, val.size);
-    pos += nv + val.size;
+    /* 先做溢出检查，再用无溢出的 total 决定分配方式。 */
+    if (nk > SIZE_MAX - key.size) return YQ_ERR_TOOBIG;
+    size_t pos = nk + key.size;
+    if (nv > SIZE_MAX - val.size) return YQ_ERR_TOOBIG;
+    if (pos > SIZE_MAX - (nv + val.size)) return YQ_ERR_TOOBIG;
+    size_t total = pos + nv + val.size;
 
-    return append_record(wal, txn_id, WAL_TYPE_PUT, enc_buf, pos);
+    uint8_t stack_buf[YQ_WAL_SMALL_PAYLOAD];
+    uint8_t *enc_buf = stack_buf;
+    if (total > sizeof(stack_buf)) {
+        enc_buf = (uint8_t *)malloc(total);
+        if (!enc_buf) return YQ_ERR_NOMEM;
+    }
+
+    size_t nk2 = 0;
+    if (yq_varint_encode(key.size, enc_buf, &nk2) != YQ_OK) {
+        if (enc_buf != stack_buf) free(enc_buf);
+        return YQ_ERR_INVAL;
+    }
+    memcpy(enc_buf + nk2, key.data, key.size);
+
+    size_t nv2 = 0;
+    if (yq_varint_encode(val.size, enc_buf + pos, &nv2) != YQ_OK) {
+        if (enc_buf != stack_buf) free(enc_buf);
+        return YQ_ERR_INVAL;
+    }
+    memcpy(enc_buf + pos + nv2, val.data, val.size);
+
+    int rc = append_record(wal, txn_id, WAL_TYPE_PUT, enc_buf, total);
+    if (enc_buf != stack_buf) free(enc_buf);
+    return rc;
 }
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {

@@ -13,6 +13,17 @@
 
 extern int yq_recover(yq_wal *wal, yq_memtable *mt);
 
+/*
+ * checkpoint 临时路径缓冲上限。
+ *
+ * db->path 最长 1023，但 yq_wal 内部的 log_path 只有 512 字节，且
+ * make_log_path() 要求 base_len + 5 <= 512（即 base 最长 507）。也就是说
+ * 无论这里的缓冲开多大，db->path 一旦超过 498 字符，后缀文件就打不开了。
+ * 因此这里的意义是"容纳得下最长合法路径 + 后缀"，超出由显式长度检查拒绝，
+ * 而不是靠 snprintf 静默截断出错误的文件名。
+ */
+#define YQ_CKPT_PATH_CAP 1088
+
 static _Thread_local int g_last_io_err = 0;
 
 struct yq_db {
@@ -743,9 +754,19 @@ int yq_cur_close(yq_cur *c) {
  * from the memtable alone. Callers must check that before calling.
  */
 static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
-    char tmp_db[1024 + 32];
-    char tmp_log[1024 + 32];
-    char cur_log[1024 + 32];
+    /*
+     * 路径缓冲与 make_log_path() 的能力对齐：yq_wal 内部 log_path 只有 512 字节，
+     * 且要求 base_len + 5 <= 512，所以 db->path 超过 498 字符时其后缀文件根本
+     * 打不开。这里比那个上限再多留一点余量以便 snprintf 判定，超出则明确
+     * 返回错误，而不是静默截断成错误的文件名。
+     */
+    char tmp_db[YQ_CKPT_PATH_CAP];
+    char tmp_log[YQ_CKPT_PATH_CAP];
+    char cur_log[YQ_CKPT_PATH_CAP];
+
+    if (strlen(db->path) + sizeof(".ckpt-tmp.log") > sizeof(tmp_log)) {
+        return YQ_ERR_INVAL;
+    }
 
     if (snprintf(tmp_db, sizeof(tmp_db), "%s.ckpt-tmp", db->path) >= (int)sizeof(tmp_db)) {
         return YQ_ERR_INVAL;
@@ -786,28 +807,67 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
     snprintf(tmp_log, sizeof(tmp_log), "%s.log", tmp_db);
     snprintf(cur_log, sizeof(cur_log), "%s.log", db->path);
 
+    /*
+     * 先释放旧句柄再 rename。Win32 上 MoveFileExA(MOVEFILE_REPLACE_EXISTING)
+     * 需要先删除目标文件，任何仍持有 <db>.log 的句柄都会挡住这一步（除非它
+     * 共享了 FILE_SHARE_DELETE）。yq_file_open 现在已带 FILE_SHARE_DELETE，
+     * 但先关闭更稳妥，也顺带避免"旧句柄指向被替换掉的 inode"的语义歧义。
+     *
+     * 注意：压实后的数据此刻已持久化在新 <db>.log 中，所以从这里往下即使
+     * 出错，磁盘上也不缺数据；要保证的只是别把 db 留在不可用状态。
+     */
+    yq_wal *old_wal = db->wal;
+    db->wal = NULL;
+
     rc = yq_file_rename(tmp_log, cur_log);
     if (rc != YQ_OK) {
         remove(tmp_log);
+        /*
+         * 重命名失败：新日志没顶上，但旧日志文件仍在原位且内容完好，
+         * 于是把旧句柄恢复回去继续用，而不是让 db->wal 停在 NULL ——
+         * yq_wal_append_put() 不做空指针检查，NULL 会在下一个写事务里崩。
+         */
+        db->wal = old_wal;
         return rc;
     }
 
-    /* Reopen the handle so it reads the replacement log's size and LSNs. */
-    yq_wal_close(db->wal);
-    db->wal = NULL;
-    return yq_wal_open(&db->wal, db->path, db->opts.page_size);
+    /*
+     * rename 成功：旧句柄现在指向已从目录中消失的文件，必须关掉。
+     * 先把新句柄开进局部变量，确认成功后再交给 db->wal，避免"落盘已成功
+     * 却把库搞成不可用"——reopen 失败时明确报错而不是留下悬空 NULL。
+     */
+    yq_wal_close(old_wal);
+
+    yq_wal *new_wal = NULL;
+    rc = yq_wal_open(&new_wal, db->path, db->opts.page_size);
+    if (rc != YQ_OK) {
+        /*
+         * 数据已安全落在 <db>.log 上，只是这次没能在进程内重新打开它。
+         * 把 db 标成需要重开（write_enabled=0 会让后续写事务被拒绝，
+         * 而不是踩到 NULL），并返回错误让调用方知晓。
+         */
+        db->write_enabled = 0;
+        return rc;
+    }
+
+    db->wal = new_wal;
+    return YQ_OK;
 }
 
 int yq_checkpoint(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
     if (!db->write_enabled) return YQ_ERR_CORRUPT;
 
-    uint64_t wal_sz = yq_wal_size(db->wal);
-    if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
-
-    /* Make sure everything committed so far is on disk before rewriting. */
+    /*
+     * 先 flush 再取 wal_sz：yq_wal_size() 读的是文件实际长度，尚未 flush 的
+     * 缓冲字节不计入。若在 flush 前取值，下面 `wal_sz > 0` 这个门限就会
+     * 漏掉"已提交但还在写缓冲里"的日志，语义含混。
+     */
     int rc = yq_wal_flush(db->wal);
     if (rc != YQ_OK) return rc;
+
+    uint64_t wal_sz = yq_wal_size(db->wal);
+    if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
 
     uint64_t new_txn_id = 0;
     yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
