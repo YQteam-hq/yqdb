@@ -8,6 +8,7 @@ This document describes the new features added to yq-DB in this release.
 - [Batch Operations](#batch-operations)
 - [Secondary Indexes](#secondary-indexes)
 - [Time-To-Live (TTL)](#time-to-live-ttl)
+- [Compression](#compression)
 - [Usage Examples](#usage-examples)
 - [Building with New Features](#building-with-new-features)
 
@@ -618,6 +619,111 @@ if (rc != YQ_OK) {
 
 ---
 
+## Compression
+
+yq-DB now includes optional compression functionality for automatic value compression, reducing storage space and improving I/O performance.
+
+### Enabling Compression
+
+To enable compression functionality, define `YQ_ENABLE_COMPRESS` before including `yq.h`:
+
+```c
+#define YQ_ENABLE_COMPRESS 1
+#include "yq.h"
+```
+
+Or compile with the `-DYQ_ENABLE_COMPRESS` flag:
+
+```bash
+gcc -DYQ_ENABLE_COMPRESS -std=c11 -Iinclude src/your_app.c src/*.o -o your_app
+```
+
+### Basic Usage
+
+```c
+// Configure compression (LZ4, normal level, min 1KB)
+yq_compress_opts opts = {
+    .struct_size = sizeof(yq_compress_opts),
+    .algorithm = YQ_COMPRESS_LZ4,
+    .level = YQ_COMPRESS_LEVEL_NORMAL,
+    .min_size = 1024,  // Only compress values > 1KB
+    .reserved = {0}
+};
+yq_compress_configure(db, &opts);
+
+// Store large data (will be automatically compressed)
+yq_slice key = {"large_data", 10};
+yq_slice value = {large_data_ptr, large_data_size};
+yq_put(txn, key, value, YQ_PUT_UPSERT);
+
+// Check if data is compressed
+int is_compressed = yq_compress_is_compressed(txn, &key);
+printf("Data is %scompressed\n", is_compressed ? "" : "not ");
+
+// Get compression statistics
+int64_t compressed_count = yq_compress_stats(db);
+int64_t saved_space = yq_compress_saved_space(db);
+printf("Compressed %ld items, saved %ld bytes\n", compressed_count, saved_space);
+```
+
+### Compression Algorithms
+
+| Algorithm | Speed | Compression Ratio | Memory Usage | Best For |
+|-----------|-------|------------------|--------------|----------|
+| **Snappy** | Very Fast | Low (60-80%) | Low | Real-time applications |
+| **LZ4** | Fast | Medium (50-70%) | Low | General purpose |
+| **Zstd** | Good | High (40-60%) | Medium | Storage optimization |
+| **Zlib** | Medium | Medium (50-70%) | Medium | Compatibility |
+
+### Configuration Options
+
+- `algorithm`: Compression algorithm selection
+- `level`: Compression level (Fast, Normal, Max)
+- `min_size`: Minimum size for compression (avoid overhead for small data)
+
+### Monitoring and Statistics
+
+```c
+// Monitor compression effectiveness
+int64_t compressed_count = yq_compress_stats(db);
+int64_t saved_space = yq_compress_saved_space(db);
+int64_t memory_usage = yq_compress_memory_usage(db);
+
+printf("Compression Statistics:\n");
+printf("  Compressed items: %ld\n", compressed_count);
+printf("  Space saved: %ld bytes\n", saved_space);
+printf("  Memory usage: %ld bytes\n", memory_usage);
+
+// Estimate compression for new data
+size_t estimated_size = yq_compress_estimate_size(new_data, new_size, YQ_COMPRESS_ZSTD);
+printf("Estimated compressed size: %zu bytes\n", estimated_size);
+```
+
+### Use Cases
+
+- **Large Text Storage**: Compress documents and logs
+- **Binary Data**: Reduce storage for images and files
+- **Network Transfer**: Minimize data transfer for remote databases
+- **Memory Efficiency**: Lower memory usage for cached data
+
+### Error Handling
+
+```c
+int rc = yq_compress_data(data, size, level, &result);
+if (rc != YQ_OK) {
+    printf("Error: %s\n", yq_compress_strerror(rc));
+}
+```
+
+### Performance Considerations
+
+- **CPU Usage**: Compression consumes CPU cycles
+- **Memory Overhead**: Additional memory for compression buffers
+- **Latency**: Increased latency for write operations
+- **Storage Efficiency**: Large values benefit most from compression
+
+---
+
 ## Building with New Features
 
 ### CMake Build
@@ -625,14 +731,14 @@ if (rc != YQ_OK) {
 To build yq-DB with all new features enabled:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DYQ_ENABLE_JSON=ON -DYQ_ENABLE_BATCH=ON -DYQ_ENABLE_INDEX=ON -DYQ_ENABLE_TTL=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DYQ_ENABLE_JSON=ON -DYQ_ENABLE_BATCH=ON -DYQ_ENABLE_INDEX=ON -DYQ_ENABLE_TTL=ON -DYQ_ENABLE_COMPRESS=ON
 cmake --build build
 ```
 
 ### Direct GCC Build
 
 ```bash
-gcc -DYQ_ENABLE_JSON=1 -DYQ_ENABLE_BATCH=1 -DYQ_ENABLE_INDEX=1 -DYQ_ENABLE_TTL=1 -std=c11 -Wall -Wextra -Iinclude -O2 -c src/*.c
+gcc -DYQ_ENABLE_JSON=1 -DYQ_ENABLE_BATCH=1 -DYQ_ENABLE_INDEX=1 -DYQ_ENABLE_TTL=1 -DYQ_ENABLE_COMPRESS=1 -std=c11 -Wall -Wextra -Iinclude -O2 -c src/*.c
 ar rcs libyqdb.a *.o
 ```
 
