@@ -139,28 +139,75 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
     return append_record(wal, txn_id, WAL_TYPE_BEGIN, NULL, 0);
 }
 
+/*
+ * Longest encoding of a 64-bit varint: 7 payload bits per byte, so
+ * ceil(64 / 7) = 10 bytes.
+ */
+#define YQ_VARINT_MAX_LEN 10
+
+/*
+ * Payloads up to this size are encoded on the stack; anything larger is
+ * heap-allocated.
+ *
+ * yq_put() caps the key at 1024 bytes but the value at 1 GiB, so the encoded
+ * payload has no usable upper bound. The previous version memcpy()'d the
+ * whole value into a 2048-byte stack buffer, which smashed the stack for any
+ * value larger than ~2 KB.
+ */
+#define YQ_WAL_ENC_STACK_MAX 2048
+
+static size_t varint_len(uint64_t v) {
+    size_t n = 1;
+    while (v >= 0x80) { n++; v >>= 7; }
+    return n;
+}
+
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
-    uint8_t enc_buf[2048];
+    if (!wal) return YQ_ERR_INVAL;
+    if (key.size && !key.data) return YQ_ERR_INVAL;
+    if (val.size && !val.data) return YQ_ERR_INVAL;
+
+    size_t need = varint_len(key.size) + key.size + varint_len(val.size) + val.size;
+
+    uint8_t stack_buf[YQ_WAL_ENC_STACK_MAX];
+    uint8_t *enc = stack_buf;
+    if (need > sizeof(stack_buf)) {
+        enc = malloc(need);
+        if (!enc) return YQ_ERR_NOMEM;
+    }
+
+    int rc;
     size_t pos = 0;
+    size_t n = 0;
 
-    size_t nk;
-    if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + nk, key.data, key.size);
-    pos = nk + key.size;
+    if (yq_varint_encode(key.size, enc + pos, &n) != YQ_OK) { rc = YQ_ERR_INVAL; goto done; }
+    pos += n;
+    if (key.size) memcpy(enc + pos, key.data, key.size);
+    pos += key.size;
 
-    size_t nv;
-    if (yq_varint_encode(val.size, enc_buf + pos, &nv) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + pos + nv, val.data, val.size);
-    pos += nv + val.size;
+    if (yq_varint_encode(val.size, enc + pos, &n) != YQ_OK) { rc = YQ_ERR_INVAL; goto done; }
+    pos += n;
+    if (val.size) memcpy(enc + pos, val.data, val.size);
+    pos += val.size;
 
-    return append_record(wal, txn_id, WAL_TYPE_PUT, enc_buf, pos);
+    rc = append_record(wal, txn_id, WAL_TYPE_PUT, enc, pos);
+
+done:
+    if (enc != stack_buf) free(enc);
+    return rc;
 }
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
-    uint8_t enc_buf[1032];
+    if (!wal) return YQ_ERR_INVAL;
+    if (key.size && !key.data) return YQ_ERR_INVAL;
+
+    /* Sized for the largest key yq_del() accepts (1024) plus its varint. */
+    uint8_t enc_buf[1024 + YQ_VARINT_MAX_LEN];
+    if (varint_len(key.size) + key.size > sizeof(enc_buf)) return YQ_ERR_INVAL;
+
     size_t nk;
     if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
-    memcpy(enc_buf + nk, key.data, key.size);
+    if (key.size) memcpy(enc_buf + nk, key.data, key.size);
 
     return append_record(wal, txn_id, WAL_TYPE_DEL, enc_buf, nk + key.size);
 }

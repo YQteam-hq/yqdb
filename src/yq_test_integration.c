@@ -721,6 +721,96 @@ static void test_writer_lock_contention(void) {
     printf("OK\n");
 }
 
+/*
+ * Values that do not fit in the WAL encode buffer.
+ *
+ * Regression guard for a stack buffer overflow: yq_wal_append_put() encoded
+ * the whole record into a 2048-byte stack buffer and memcpy()'d the value
+ * into it unchecked. yq_put() documents values of up to 1 GiB, so anything
+ * over ~2 KB wrote past the end of the frame. Sizes are chosen to sit on both
+ * sides of the old 2048-byte buffer.
+ */
+static void test_large_value(void) {
+    printf("test_large_value... ");
+    remove_db();
+
+    /* 2044 is the largest value that still fits next to a 1-byte key. */
+    const size_t sizes[] = { 2044, 2048, 8192, 65536 };
+    const int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+
+    uint8_t **vals = malloc(nsizes * sizeof(uint8_t *));
+    CHECK(vals != NULL);
+    for (int i = 0; i < nsizes; i++) {
+        vals[i] = malloc(sizes[i]);
+        CHECK(vals[i] != NULL);
+        memset(vals[i], 'a' + i, sizes[i]);
+    }
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    yq_txn *t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+    for (int i = 0; i < nsizes; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "big-%d", i);
+        yq_slice key = { k, strlen(k) };
+        yq_slice val = { vals[i], sizes[i] };
+        CHECK_EQ(yq_put(t, key, val, YQ_PUT_UPSERT), YQ_OK);
+    }
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    /* Reopen: the values must come back out of the WAL intact. */
+    db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+    for (int i = 0; i < nsizes; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "big-%d", i);
+        yq_slice key = { k, strlen(k) };
+        yq_slice out = {0};
+        CHECK_EQ(yq_get(t, key, &out), YQ_OK);
+        CHECK_EQ((int64_t)out.size, (int64_t)sizes[i]);
+        CHECK(memcmp(out.data, vals[i], sizes[i]) == 0);
+    }
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+
+    /* A checkpoint rewrites the log from the memtable; it must not lose or
+     * garble the large records either. */
+    CHECK_EQ(yq_checkpoint(db), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+    for (int i = 0; i < nsizes; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "big-%d", i);
+        yq_slice key = { k, strlen(k) };
+        yq_slice out = {0};
+        CHECK_EQ(yq_get(t, key, &out), YQ_OK);
+        CHECK_EQ((int64_t)out.size, (int64_t)sizes[i]);
+        CHECK(memcmp(out.data, vals[i], sizes[i]) == 0);
+    }
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    for (int i = 0; i < nsizes; i++) free(vals[i]);
+    free(vals);
+    remove_db();
+
+    printf("OK\n");
+}
+
 #if !defined(_WIN32)
 /*
  * Long database paths.
@@ -825,6 +915,7 @@ int main(void) {
     test_readonly_snapshot();
     test_checkpoint_compaction();
     test_writer_lock_contention();
+    test_large_value();
 #if !defined(_WIN32)
     test_long_db_path();
 #endif
