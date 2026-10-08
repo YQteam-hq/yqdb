@@ -19,6 +19,11 @@ set(SOURCES
     src/yq.c
     src/yq_json.c
     src/yq_batch.c
+    src/yq_index.c
+    src/yq_ttl.c
+    src/yq_compress.c
+    src/yq_crypto.c
+    src/yq_pubsub.c
 )
 
 add_library(yqdb STATIC ${SOURCES})

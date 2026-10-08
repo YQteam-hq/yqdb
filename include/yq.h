@@ -42,6 +42,26 @@ extern "C" {
 #include "yq_batch.h"
 #endif
 
+#if YQ_ENABLE_INDEX
+#include "yq_index.h"
+#endif
+
+#if YQ_ENABLE_TTL
+#include "yq_ttl.h"
+#endif
+
+#if YQ_ENABLE_COMPRESS
+#include "yq_compress.h"
+#endif
+
+#if YQ_ENABLE_CRYPTO
+#include "yq_crypto.h"
+#endif
+
+#if YQ_ENABLE_PUBSUB
+#include "yq_pubsub.h"
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════
  * 版本
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -109,6 +129,10 @@ typedef struct yq_slice {
 typedef struct yq_db  yq_db;
 typedef struct yq_txn yq_txn;
 typedef struct yq_cur yq_cur;
+
+#if YQ_ENABLE_PUBSUB
+#include "yq_pubsub.h"
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 打开参数
