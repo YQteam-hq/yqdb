@@ -920,6 +920,98 @@ int yq_btree_cursor_val(yq_btree_cursor *c, yq_slice *out) {
     return YQ_OK;
 }
 
+/*
+ * Position the cursor at the first key >= target ("lower bound").
+ *
+ * Descends from the root using find_slot (binary search on each page) and
+ * lands on the leaf slot holding the first key >= target. If such a slot does
+ * not exist in the current leaf (slot == nkeys), the target is greater than
+ * every key of this leaf, so we advance along right_sibling and retry there;
+ * with no right sibling the whole tree is exhausted and the cursor is set
+ * invalid. On success the cursor state matches yq_btree_cursor_first:
+ * valid=1, leaf_page/slot_idx/slot_count updated.
+ */
+int yq_btree_cursor_seek(yq_btree_cursor *c, yq_slice key) {
+    yq_btree *bt = c->bt;
+    if (bt->root_page == 0) {
+        c->valid = 0;
+        return YQ_ERR_NOTFOUND;
+    }
+
+    uint64_t cur_page = bt->root_page;
+    uint32_t ps = bt->page_size;
+
+    while (1) {
+        uint8_t *page = get_page_data(bt, cur_page);
+        if (!page) return YQ_ERR_IO;
+        if (!check_page_crc(page, ps)) return YQ_ERR_CORRUPT;
+
+        yq_page_header hdr;
+        read_page_header(page, &hdr);
+
+        int slot = find_slot(page, (const uint8_t *)key.data, key.size, hdr.nkeys, ps);
+        if (slot < 0) return YQ_ERR_CORRUPT;
+
+        if (hdr.page_type == YQ_PAGE_TYPE_LEAF) {
+            if (slot >= (int)hdr.nkeys) {
+                if (hdr.right_sibling == 0) {
+                    c->valid = 0;
+                    return YQ_ERR_NOTFOUND;
+                }
+                cur_page = hdr.right_sibling;
+                continue;
+            }
+            c->leaf_page = cur_page;
+            c->slot_idx = (uint16_t)slot;
+            c->slot_count = hdr.nkeys;
+            c->valid = 1;
+            return YQ_OK;
+        }
+
+        /* Internal page: follow the same descent rule as yq_btree_lookup. */
+        uint64_t child;
+        if (slot >= (int)hdr.nkeys) {
+            child = *(uint64_t *)(page + ps - 8);
+        } else {
+            uint16_t offset = get_slot(page, (uint16_t)slot);
+            uint8_t *cell = page + offset;
+            size_t n = 0;
+            uint64_t klen;
+            if (yq_varint_decode(cell, ps - offset, &klen, &n) != 0) return YQ_ERR_CORRUPT;
+            child = *(uint64_t *)(cell + n + klen);
+        }
+        cur_page = child;
+    }
+}
+
+/*
+ * Position the cursor at the last key <= target ("floor").
+ *
+ * Starts from yq_btree_cursor_seek (first key >= target):
+ *   - if the located key equals the target, that is the answer;
+ *   - otherwise step back once to obtain the last key < target;
+ *   - if seek found no key >= target (target greater than every key), fall
+ *     back to yq_btree_cursor_last;
+ *   - if seek landed on the very first key (all keys > target), stepping back
+ *     leaves the tree and yields YQ_ERR_NOTFOUND, i.e. no key <= target.
+ */
+int yq_btree_cursor_seek_le(yq_btree_cursor *c, yq_slice key) {
+    int rc = yq_btree_cursor_seek(c, key);
+    if (rc == YQ_OK) {
+        yq_slice k;
+        if (yq_btree_cursor_key(c, &k) == YQ_OK &&
+            compare_key((const uint8_t *)k.data, k.size,
+                        (const uint8_t *)key.data, key.size) == 0) {
+            return YQ_OK;
+        }
+        return yq_btree_cursor_prev(c);
+    }
+    if (rc == YQ_ERR_NOTFOUND) {
+        return yq_btree_cursor_last(c);
+    }
+    return rc;
+}
+
 int yq_btree_cursor_valid(yq_btree_cursor *c) {
     return c->valid;
 }
