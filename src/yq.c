@@ -316,6 +316,12 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     *out = NULL;
     if (db->closed) return YQ_ERR_CORRUPT;
 
+    /* A handle opened with YQ_OPEN_READONLY must not hand out write
+     * transactions: yq_put()/yq_del() guard on the transaction flag, but
+     * nothing stopped yq_txn_begin(YQ_TXN_READWRITE) on such a handle, and
+     * the commit path then writes the meta pages and the log regardless. */
+    if ((flags & YQ_TXN_READWRITE) && !db->write_enabled) return YQ_ERR_READONLY;
+
     yq_txn *txn = calloc(1, sizeof(yq_txn));
     if (!txn) return YQ_ERR_NOMEM;
 
@@ -714,7 +720,10 @@ int yq_cur_close(yq_cur *c) {
 
 int yq_checkpoint(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
-    if (!db->write_enabled) return YQ_ERR_CORRUPT;
+    /* ERRORS.md: YQ_ERR_READONLY is "a read-only handle ... attempts to
+     * write". YQ_ERR_CORRUPT means a CRC/format failure instead, and
+     * reporting corruption for a healthy read-only open is misleading. */
+    if (!db->write_enabled) return YQ_ERR_READONLY;
 
     uint64_t wal_sz = yq_wal_size(db->wal);
     if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
@@ -741,7 +750,8 @@ int yq_checkpoint(yq_db *db) {
 
 int yq_sync(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
-    if (!db->write_enabled) return YQ_ERR_CORRUPT;
+    /* See the note in yq_checkpoint(). */
+    if (!db->write_enabled) return YQ_ERR_READONLY;
     yq_wal_flush(db->wal);
     if (db->db_file) yq_file_sync(db->db_file);
     return YQ_OK;
