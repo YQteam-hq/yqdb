@@ -661,6 +661,61 @@ static void test_checkpoint_compaction(void) {
     printf("OK\n");
 }
 
+/*
+ * Write-lock contention must honour lock_timeout_ms.
+ *
+ * Regression guard for the writer election: it used a blocking flock(), so a
+ * second writer hung in the kernel forever instead of returning YQ_ERR_BUSY
+ * (lock_timeout_ms == 0) or YQ_ERR_TIMEOUT (budget exhausted).
+ */
+static void test_writer_lock_contention(void) {
+    printf("test_writer_lock_contention... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+    opts.lock_timeout_ms = 0;
+
+    yq_db *a = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &a), YQ_OK);
+
+    yq_txn *ta = NULL;
+    CHECK_EQ(yq_txn_begin(a, YQ_TXN_READWRITE, &ta), YQ_OK);  /* holds the lock */
+
+    /* A second writer that does not wait must be rejected immediately. */
+    yq_db *b = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &b), YQ_OK);
+    yq_txn *tb = NULL;
+    CHECK_EQ(yq_txn_begin(b, YQ_TXN_READWRITE, &tb), YQ_ERR_BUSY);
+    CHECK_EQ(yq_close(b), YQ_OK);
+
+    /* With a budget it must give up with YQ_ERR_TIMEOUT, not hang. */
+    yq_opts waiting = opts;
+    waiting.lock_timeout_ms = 30;
+    yq_db *c = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &waiting, &c), YQ_OK);
+    yq_txn *tc = NULL;
+    CHECK_EQ(yq_txn_begin(c, YQ_TXN_READWRITE, &tc), YQ_ERR_TIMEOUT);
+
+    /* Readers are never blocked by the writer. */
+    yq_txn *ro = NULL;
+    CHECK_EQ(yq_txn_begin(c, YQ_TXN_READONLY, &ro), YQ_OK);
+    CHECK_EQ(yq_txn_commit(ro), YQ_OK);
+
+    /* Once the writer commits, the waiting handle can take the lock. */
+    CHECK_EQ(yq_txn_commit(ta), YQ_OK);
+    CHECK_EQ(yq_txn_begin(c, YQ_TXN_READWRITE, &tc), YQ_OK);
+    CHECK_EQ(yq_txn_commit(tc), YQ_OK);
+
+    CHECK_EQ(yq_close(c), YQ_OK);
+    CHECK_EQ(yq_close(a), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -679,6 +734,7 @@ int main(void) {
     test_reader_slots();
     test_readonly_snapshot();
     test_checkpoint_compaction();
+    test_writer_lock_contention();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

@@ -143,6 +143,16 @@ int yq_file_lock(yq_file *f, int exclusive) {
     return YQ_OK;
 }
 
+int yq_file_lock_nb(yq_file *f, int exclusive) {
+    DWORD flags = LOCKFILE_FAIL_IMMEDIATELY;
+    if (exclusive) flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    OVERLAPPED ov = {0};
+    if (!LockFileEx(f->handle, flags, 0, 1, 0, &ov)) {
+        return win32_error();
+    }
+    return YQ_OK;
+}
+
 int yq_file_unlock(yq_file *f) {
     OVERLAPPED ov = {0};
     if (!UnlockFileEx(f->handle, 0, 1, 0, &ov)) {
@@ -274,6 +284,17 @@ uint64_t yq_file_size(yq_file *f) {
 int yq_file_lock(yq_file *f, int exclusive) {
     int type = exclusive ? LOCK_EX : LOCK_SH;
     if (flock(f->fd, type) < 0) {
+        return YQ_ERR_IO;
+    }
+    return YQ_OK;
+}
+
+int yq_file_lock_nb(yq_file *f, int exclusive) {
+    int type = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
+    if (flock(f->fd, type) < 0) {
+        if (errno == EWOULDBLOCK || errno == EINTR || errno == EAGAIN) {
+            return YQ_ERR_BUSY;
+        }
         return YQ_ERR_IO;
     }
     return YQ_OK;

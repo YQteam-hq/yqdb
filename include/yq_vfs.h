@@ -28,6 +28,14 @@ uint64_t yq_file_size(yq_file *f);
  */
 int yq_file_rename(const char *from, const char *to);
 int yq_file_lock(yq_file *f, int exclusive);
+/*
+ * Non-blocking variant of yq_file_lock().
+ *
+ * Returns YQ_OK when the lock was taken, YQ_ERR_BUSY when another holder has
+ * it, YQ_ERR_IO on a real failure. yq_file_lock() blocks until the lock is
+ * available, which makes it impossible to honour a lock timeout on top of it.
+ */
+int yq_file_lock_nb(yq_file *f, int exclusive);
 int yq_file_unlock(yq_file *f);
 void *yq_file_mmap(yq_file *f, uint64_t offset, size_t len);
 int yq_file_munmap(void *ptr, size_t len);
