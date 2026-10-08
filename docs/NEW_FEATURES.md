@@ -6,6 +6,7 @@ This document describes the new features added to yq-DB in this release.
 
 - [JSON Support](#json-support)
 - [Batch Operations](#batch-operations)
+- [Secondary Indexes](#secondary-indexes)
 - [Usage Examples](#usage-examples)
 - [Building with New Features](#building-with-new-features)
 
@@ -291,6 +292,138 @@ switch (rc) {
     case YQ_BATCH_LIMIT:
         // Batch operation limit exceeded
         break;
+}
+```}
+
+---
+
+## Secondary Indexes
+
+yq-DB now includes optional secondary indexes for advanced querying capabilities.
+
+### Enabling Secondary Indexes
+
+To enable secondary indexes functionality, define `YQ_ENABLE_INDEX` before including `yq.h`:
+
+```c
+#define YQ_ENABLE_INDEX 1
+#include "yq.h"
+```
+
+Or compile with the `-DYQ_ENABLE_INDEX` flag:
+
+```bash
+gcc -DYQ_ENABLE_INDEX -std=c11 -Iinclude src/your_app.c src/*.o -o your_app
+```
+
+### Index Types
+
+yq-DB supports four types of secondary indexes:
+
+- **String Index**: For text data, supports exact matches, prefix searches, and range queries
+- **Int64 Index**: For 64-bit integers, supports exact matches and range queries
+- **Double Index**: For double-precision floats, supports exact matches and range queries  
+- **Binary Index**: For binary data, supports exact matches only
+
+### Creating Indexes
+
+```c
+// Create a string index
+yq_index_opts opts = {sizeof(yq_index_opts), YQ_INDEX_STRING, 0, {0}};
+yq_index_create(db, "email_index", &opts);
+
+// Create a unique integer index
+yq_index_opts unique_opts = {sizeof(yq_index_opts), YQ_INDEX_INT64, YQ_INDEX_UNIQUE, {0}};
+yq_index_create(db, "user_id_index", &unique_opts);
+
+// Create a descending double index
+yq_index_opts desc_opts = {sizeof(yq_index_opts), YQ_INDEX_DOUBLE, YQ_INDEX_DESCENDING, {0}};
+yq_index_create(db, "price_index", &desc_opts);
+```
+
+### Querying Indexes
+
+```c
+// Exact match
+yq_slice email = {"john@example.com", 16};
+yq_index_result *result = NULL;
+yq_index_find_exact(txn, "email_index", &email, &result);
+
+// Range query
+int64_t min_age = 25;
+int64_t max_age = 35;
+yq_slice min_age_slice = {&min_age, sizeof(min_age)};
+yq_slice max_age_slice = {&max_age, sizeof(max_age)};
+yq_index_find_range(txn, "age_index", &min_age_slice, &max_age_slice, &result);
+
+// Prefix search (string indexes only)
+yq_slice prefix = {"john", 4};
+yq_index_find_prefix(txn, "name_index", &prefix, &result);
+
+// Greater than query
+double min_price = 100.0;
+yq_slice min_price_slice = {&min_price, sizeof(min_price)};
+yq_index_find_gt(txn, "price_index", &min_price_slice, &result);
+
+// Process results
+if (result && result->count > 0) {
+    for (int i = 0; i < result->count; i++) {
+        printf("Found key: %.*s\n", 
+               (int)result->keys[i].size, (const char *)result->keys[i].data);
+    }
+}
+
+// Clean up
+yq_index_result_free(result);
+```
+
+### Index Management
+
+```c
+// Check if index exists
+if (yq_index_exists(db, "email_index")) {
+    printf("Email index exists\n");
+}
+
+// Get index statistics
+int64_t size = yq_index_size(db, "email_index");
+int64_t memory = yq_index_memory_usage(db, "email_index");
+printf("Index size: %ld, Memory: %ld bytes\n", size, memory);
+
+// Drop index
+yq_index_drop(db, "unused_index");
+
+// List all indexes
+int count = 0;
+char **indexes = yq_index_list(db, &count);
+for (int i = 0; i < count; i++) {
+    printf("Index: %s\n", indexes[i]);
+    free(indexes[i]);
+}
+free(indexes);
+```
+
+### Index Flags
+
+- `YQ_INDEX_UNIQUE`: Enforce unique values
+- `YQ_INDEX_CASE_SENSITIVE`: Case-sensitive string comparison
+- `YQ_INDEX_DESCENDING`: Return results in descending order
+- `YQ_INDEX_NULLS_FIRST`: Place NULL values first in sorted results
+
+### Performance Considerations
+
+- Indexes are automatically maintained during data operations
+- Large indexes consume additional memory
+- Use appropriate index types for your data
+- Drop unused indexes to free memory
+- Monitor index size and memory usage
+
+### Error Handling
+
+```c
+int rc = yq_index_create(db, "my_index", &opts);
+if (rc != YQ_OK) {
+    printf("Error creating index: %s\n", yq_index_strerror(rc));
 }
 ```
 
