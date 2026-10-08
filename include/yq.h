@@ -362,24 +362,6 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
 int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
                  yq_slice *values, size_t *found_count);
 
-/* ═══════════════════════════════════════════════════════════════════════
- * Memory pool
- *
- * The database handle keeps a small-object memory pool that callers may reuse
- * to cut malloc/free overhead (see include/yq_mempool.h). The pool lifetime is
- * bound to the db handle.
- * ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct yq_mempool yq_mempool;
-
-/* Get the pool owned by this handle. The pool is owned by the library and must
- * not be destroyed by the caller. */
-int yq_mempool_get(yq_db *db, yq_mempool **out);
-
-/* Release the pool. The pool stays owned by the handle; this is a no-op kept
- * only for API symmetry. */
-void yq_mempool_put(yq_db *db, yq_mempool *pool);
-
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

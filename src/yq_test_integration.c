@@ -445,13 +445,13 @@ static void test_batch_api(void) {
     assert(yq_get(txn, del_keys[0], &out) == YQ_ERR_NOTFOUND);
     yq_txn_commit(txn);
 
-    /* The per-handle memory pool is available and functional. */
-    yq_mempool *pool = NULL;
-    assert(yq_mempool_get(db, &pool) == YQ_OK);
+    /* The small-object memory pool is functional. */
+    yq_mempool *pool = yq_mempool_create();
     assert(pool != NULL);
     void *p = yq_mempool_alloc(pool, 64);
     assert(p != NULL);
     yq_mempool_free(pool, p);
+    yq_mempool_destroy(pool);
 
     yq_close(db);
     remove_db();

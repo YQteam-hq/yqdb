@@ -5,7 +5,6 @@
 #include "yq_memtable.h"
 #include "yq_mvcc.h"
 #include "yq_slice.h"
-#include "yq_mempool.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -30,7 +29,6 @@ struct yq_db {
     size_t mmap_len;
     int write_enabled;
     int closed;
-    yq_mempool *mempool;  /* Optional small-object pool owned by this handle */
 };
 
 typedef struct pending_op {
@@ -127,7 +125,6 @@ static void free_db(yq_db *db) {
         yq_file_munmap(db->mmap_base, db->mmap_len);
     }
     if (db->memtable) yq_memtable_destroy(db->memtable);
-    if (db->mempool) yq_mempool_destroy(db->mempool);
     if (db->btree) {
     }
     if (db->wal) yq_wal_close(db->wal);
@@ -226,9 +223,6 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
 
     db->memtable = yq_memtable_create((size_t)def.memtable_bytes);
     if (!db->memtable) { free_db(db); return YQ_ERR_NOMEM; }
-
-    db->mempool = yq_mempool_create();
-    if (!db->mempool) { free_db(db); return YQ_ERR_NOMEM; }
 
     if (db->write_enabled) {
         rc = yq_recover(db->wal, db->memtable);
@@ -830,24 +824,4 @@ int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
     }
     *found_count = found;
     return YQ_OK;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- * Memory pool access
- * ═══════════════════════════════════════════════════════════════════════ */
-
-int yq_mempool_get(yq_db *db, yq_mempool **out) {
-    if (!db || !out) return YQ_ERR_INVAL;
-    if (!db->mempool) {
-        db->mempool = yq_mempool_create();
-        if (!db->mempool) return YQ_ERR_NOMEM;
-    }
-    *out = db->mempool;
-    return YQ_OK;
-}
-
-void yq_mempool_put(yq_db *db, yq_mempool *pool) {
-    /* The pool is owned by the database handle; releasing it is a no-op. */
-    (void)db;
-    (void)pool;
 }
