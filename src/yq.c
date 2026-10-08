@@ -190,7 +190,8 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     db->lock_file = yq_file_open(lock_path, 1, 1);
     if (!db->lock_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
 
-    rc = yq_mvcc_open(&db->mvcc, db->db_file, db->shm_file, db->lock_file, def.max_readers);
+    rc = yq_mvcc_open(&db->mvcc, db->db_file, db->shm_file, db->lock_file,
+                      def.max_readers, def.page_size);
     if (rc != YQ_OK) { free_db(db); return rc; }
 
     uint64_t txn_id = 0, root_page = 0, free_head = 0, npages = 0, ckpt_lsn = 0;

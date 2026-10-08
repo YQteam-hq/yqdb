@@ -7,7 +7,14 @@
 
 typedef struct yq_mvcc yq_mvcc;
 
-int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file, uint32_t max_readers);
+/*
+ * page_size is the database page size from yq_opts. The two meta blocks live
+ * in page 0 and page 1 of the database file, so their offsets depend on it;
+ * passing a hardcoded 4096 put meta block 1 in the middle of page 0 for every
+ * other page size.
+ */
+int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file,
+                 uint32_t max_readers, uint32_t page_size);
 int yq_mvcc_close(yq_mvcc *mvcc);
 int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     uint64_t *snapshot_txn, uint64_t *snapshot_root, int *slot_idx);

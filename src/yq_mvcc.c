@@ -87,19 +87,37 @@ struct yq_mvcc {
     uint32_t max_readers;
     uint32_t page_size;
     volatile uint32_t meta_seq;
-    uint8_t meta_buf[4096];
+    /*
+     * Page-sized scratch buffers. yq_opts allows page_size up to 65536, so a
+     * fixed 4096-byte buffer cannot hold meta block 1 of a database that uses
+     * a larger page size.
+     */
+    uint8_t *meta_buf;   /* staging area built by yq_mvcc_meta_write() */
+    uint8_t *io_buf;     /* staging area for reads and for stamping the CRC */
 };
 
-int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file, uint32_t max_readers) {
+int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file,
+                 uint32_t max_readers, uint32_t page_size) {
     yq_mvcc *mvcc = calloc(1, sizeof(yq_mvcc));
     if (!mvcc) return YQ_ERR_NOMEM;
+
+    if (page_size == 0) page_size = 4096;
 
     mvcc->db_file = db_file;
     mvcc->shm_file = shm_file;
     mvcc->lock_file = lock_file;
     mvcc->max_readers = max_readers;
-    mvcc->page_size = 4096;
+    mvcc->page_size = page_size;
     mvcc->meta_seq = 0;
+
+    mvcc->meta_buf = calloc(1, page_size);
+    mvcc->io_buf = calloc(1, page_size);
+    if (!mvcc->meta_buf || !mvcc->io_buf) {
+        free(mvcc->meta_buf);
+        free(mvcc->io_buf);
+        free(mvcc);
+        return YQ_ERR_NOMEM;
+    }
 
     size_t shm_size = YQ_SHM_HEADER_SIZE + (size_t)max_readers * YQ_SLOT_SIZE;
     uint64_t fsize = yq_file_size(shm_file);
@@ -146,6 +164,8 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
 int yq_mvcc_close(yq_mvcc *mvcc) {
     if (!mvcc) return YQ_OK;
     if (mvcc->shm_base) yq_file_munmap(mvcc->shm_base, mvcc->shm_size);
+    free(mvcc->meta_buf);
+    free(mvcc->io_buf);
     free(mvcc);
     return YQ_OK;
 }
@@ -262,8 +282,11 @@ int yq_mvcc_increment_txn_id(yq_mvcc *mvcc, uint64_t *out) {
     return YQ_OK;
 }
 
+/* Bytes of a meta page covered by header_crc32c. */
+#define YQ_META_CRC_LEN 96
+
 static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
-    uint8_t buf[4096];
+    uint8_t *buf = mvcc->io_buf;
     uint64_t off = (uint64_t)page_idx * mvcc->page_size;
 
     if (yq_file_pread(mvcc->db_file, buf, mvcc->page_size, off) != YQ_OK) {
@@ -274,7 +297,7 @@ static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
 
     uint32_t stored_crc = mb->header_crc32c;
     mb->header_crc32c = 0;
-    uint32_t calc_crc = yq_crc32c(buf, 96);
+    uint32_t calc_crc = yq_crc32c(buf, YQ_META_CRC_LEN);
     mb->header_crc32c = stored_crc;
 
     if (calc_crc != stored_crc) {
@@ -325,7 +348,7 @@ int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint
 }
 
 int yq_mvcc_meta_write(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page, uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
-    memset(mvcc->meta_buf, 0, sizeof(mvcc->meta_buf));
+    memset(mvcc->meta_buf, 0, mvcc->page_size);
     meta_block *mb = (meta_block *)mvcc->meta_buf;
     mb->magic = (uint64_t)YQ_MAGIC_0 | ((uint64_t)YQ_MAGIC_1 << 32);
     mb->format_version = 1;
@@ -345,10 +368,10 @@ int yq_mvcc_meta_write(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page, uint6
 }
 
 int yq_mvcc_meta_pwrite(yq_mvcc *mvcc, uint8_t meta_index) {
-    uint8_t buf[4096];
-    memset(buf, 0, sizeof(buf));
+    uint8_t *buf = mvcc->io_buf;
+    memset(buf, 0, mvcc->page_size);
     memcpy(buf, mvcc->meta_buf, mvcc->page_size);
-    uint32_t crc = yq_crc32c(buf, 96);
+    uint32_t crc = yq_crc32c(buf, YQ_META_CRC_LEN);
     ((meta_block*)buf)->header_crc32c = crc;
     uint64_t off = (uint64_t)meta_index * mvcc->page_size;
     if (yq_file_size(mvcc->db_file) < off + mvcc->page_size) {
@@ -381,8 +404,8 @@ int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
                               uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
     int target_idx = select_meta_index(mvcc);
 
-    uint8_t buf[4096];
-    memset(buf, 0, sizeof(buf));
+    uint8_t *buf = mvcc->io_buf;
+    memset(buf, 0, mvcc->page_size);
 
     meta_block *mb = (meta_block *)buf;
     mb->magic = (uint64_t)YQ_MAGIC_0 | ((uint64_t)YQ_MAGIC_1 << 32);
@@ -400,7 +423,7 @@ int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     mb->flags = 0;
     mb->reserved1 = 0;
 
-    uint32_t crc = yq_crc32c(buf, 96);
+    uint32_t crc = yq_crc32c(buf, YQ_META_CRC_LEN);
     mb->header_crc32c = crc;
 
     uint64_t total_size = (uint64_t)mvcc->page_size * 2;

@@ -828,6 +828,78 @@ static void test_large_value(void) {
     printf("OK\n");
 }
 
+/*
+ * Meta block placement.
+ *
+ * The two meta blocks live in page 0 and page 1 of the database file, i.e. at
+ * offsets 0 and opts.page_size. yq_mvcc hard-coded page_size = 4096, so for
+ * any other page size meta block 1 was written into the middle of page 0 and
+ * page 1 — which the format reserves for it — stayed all zeroes:
+ *
+ *   $ hexdump db.yqdb          (page_size = 8192)
+ *   offset     0: 59 51 44 42   <- meta block 0
+ *   offset  4096: 59 51 44 42   <- meta block 1, inside page 0
+ *   offset  8192: 00 00 00 00   <- page 1, should hold meta block 1
+ *
+ * The B+Tree addresses pages by opts.page_size, so page 0 covered both meta
+ * blocks, and yq_open() had already reserved npages = 2 for them.
+ */
+static void test_meta_page_placement(void) {
+    printf("test_meta_page_placement... ");
+
+    /*
+     * What the writer puts on disk: yq_mvcc stores the magic by memcpy()ing a
+     * uint64 into the page, so building the expected bytes the same way keeps
+     * this test endian-independent.
+     */
+    const uint64_t magic = (uint64_t)0x42445159u | ((uint64_t)0x00010A1Au << 32);
+    uint8_t want[8];
+    for (int i = 0; i < 8; i++) want[i] = (uint8_t)(magic >> (8 * i));
+
+    const uint32_t sizes[] = { 4096, 8192, 16384, 65536 };
+
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        const uint32_t ps = sizes[s];
+        remove_db();
+
+        yq_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.struct_size = sizeof(opts);
+        opts.flags = YQ_OPEN_CREATE;
+        opts.page_size = ps;
+
+        yq_db *db = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+        yq_txn *t = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+        yq_slice k = { "k", 1 };
+        yq_slice v = { "v", 1 };
+        CHECK_EQ(yq_put(t, k, v, YQ_PUT_UPSERT), YQ_OK);
+        CHECK_EQ(yq_txn_commit(t), YQ_OK);
+        CHECK_EQ(yq_close(db), YQ_OK);
+
+        FILE *f = fopen(TEST_DB, "rb");
+        CHECK(f != NULL);
+        CHECK(fseek(f, 0, SEEK_END) == 0);
+        CHECK(ftell(f) >= (long)ps * 2);   /* at least the two meta pages */
+
+        uint8_t *page = malloc(ps);
+        CHECK(page != NULL);
+
+        for (int idx = 0; idx < 2; idx++) {
+            CHECK(fseek(f, (long)idx * (long)ps, SEEK_SET) == 0);
+            CHECK_EQ((long)fread(page, 1, ps, f), (long)ps);
+            CHECK(memcmp(page, want, 8) == 0);
+        }
+
+        free(page);
+        fclose(f);
+    }
+
+    remove_db();
+    printf("OK\n");
+}
+
 #if defined(YQ_TEST_CAN_MEASURE_HEAP)
 /*
  * Bytes currently handed out by malloc(). hblkhd is included because glibc
@@ -1018,6 +1090,7 @@ int main(void) {
     test_checkpoint_compaction();
     test_writer_lock_contention();
     test_large_value();
+    test_meta_page_placement();
 #if defined(YQ_TEST_CAN_MEASURE_HEAP)
     test_close_releases_resources();
 #endif
