@@ -5,6 +5,7 @@
 #include "yq_memtable.h"
 #include "yq_mvcc.h"
 #include "yq_slice.h"
+#include "yq_mempool.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@ struct yq_db {
     size_t mmap_len;
     int write_enabled;
     int closed;
+    yq_mempool *mempool;  /* Optional small-object pool owned by this handle */
 };
 
 typedef struct pending_op {
@@ -125,6 +127,7 @@ static void free_db(yq_db *db) {
         yq_file_munmap(db->mmap_base, db->mmap_len);
     }
     if (db->memtable) yq_memtable_destroy(db->memtable);
+    if (db->mempool) yq_mempool_destroy(db->mempool);
     if (db->btree) {
     }
     if (db->wal) yq_wal_close(db->wal);
@@ -223,6 +226,9 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
 
     db->memtable = yq_memtable_create((size_t)def.memtable_bytes);
     if (!db->memtable) { free_db(db); return YQ_ERR_NOMEM; }
+
+    db->mempool = yq_mempool_create();
+    if (!db->mempool) { free_db(db); return YQ_ERR_NOMEM; }
 
     if (db->write_enabled) {
         rc = yq_recover(db->wal, db->memtable);
@@ -713,4 +719,135 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
     out->free_pages = free_head;
     out->log_bytes = yq_wal_size(db->wal);
     return YQ_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Batch operations
+ *
+ * yq_batch_put() applies a heterogeneous list of PUT/DELETE operations in one
+ * call. It validates every entry up front so a malformed batch is rejected
+ * before any mutation reaches the memtable; the caller still owns the single
+ * transaction, so the batch becomes visible atomically on commit.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void yq_batch_result_init(yq_batch_result *result, uint32_t total, int first_error) {
+    if (!result) return;
+    result->struct_size = sizeof(yq_batch_result);
+    result->entries_total = total;
+    result->entries_ok = 0;
+    result->entries_failed = 0;
+    result->first_error = first_error;
+    memset(result->reserved, 0, sizeof(result->reserved));
+}
+
+int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
+                 yq_batch_result *result) {
+    if (!txn || !entries || count == 0 || !result) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+    if (txn->state != YQ_TXN_STATE_ACTIVE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
+        return YQ_ERR_TXN_CLOSED;
+    }
+    if (txn->flags & YQ_TXN_READONLY) {
+        yq_batch_result_init(result, 0, YQ_ERR_READONLY);
+        return YQ_ERR_READONLY;
+    }
+
+    yq_batch_result_init(result, (uint32_t)count, YQ_OK);
+
+    /* First pass: validate every entry so the whole batch is rejected
+     * before any mutation is applied. */
+    for (size_t i = 0; i < count; i++) {
+        const yq_batch_entry *e = &entries[i];
+        int bad = 0;
+        if (e->key.data == NULL || e->key.size == 0 || e->key.size > 1024) {
+            bad = 1;
+        } else if (e->op == 0 && e->val.data == NULL && e->val.size != 0) {
+            bad = 1;
+        }
+        if (bad) {
+            if (result->first_error == YQ_OK) result->first_error = YQ_ERR_INVAL;
+            result->entries_failed++;
+        }
+    }
+    if (result->entries_failed > 0) return result->first_error;
+
+    /* Second pass: apply the operations. Errors are recorded per entry. */
+    for (size_t i = 0; i < count; i++) {
+        const yq_batch_entry *e = &entries[i];
+        int rc = (e->op == 0) ? yq_put(txn, e->key, e->val, e->flags)
+                              : yq_del(txn, e->key);
+        if (rc == YQ_OK) {
+            result->entries_ok++;
+        } else {
+            if (result->first_error == YQ_OK) result->first_error = rc;
+            result->entries_failed++;
+        }
+    }
+    return result->first_error;
+}
+
+int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_batch_result *result) {
+    if (!txn || !keys || count == 0 || !result) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+
+    yq_batch_entry *entries = malloc(count * sizeof(*entries));
+    if (!entries) {
+        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
+        return YQ_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+        entries[i].key = keys[i];
+        entries[i].val = (yq_slice){NULL, 0};
+        entries[i].op = 1; /* DELETE */
+        entries[i].flags = 0;
+    }
+
+    int rc = yq_batch_put(txn, entries, count, result);
+    free(entries);
+    return rc;
+}
+
+int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_slice *values, size_t *found_count) {
+    if (!txn || !keys || count == 0 || !values || !found_count) return YQ_ERR_INVAL;
+    if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+
+    size_t found = 0;
+    for (size_t i = 0; i < count; i++) {
+        int rc = yq_get(txn, keys[i], &values[i]);
+        if (rc == YQ_OK) {
+            found++;
+        } else {
+            values[i].data = NULL;
+            values[i].size = 0;
+        }
+    }
+    *found_count = found;
+    return YQ_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Memory pool access
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+int yq_mempool_get(yq_db *db, yq_mempool **out) {
+    if (!db || !out) return YQ_ERR_INVAL;
+    if (!db->mempool) {
+        db->mempool = yq_mempool_create();
+        if (!db->mempool) return YQ_ERR_NOMEM;
+    }
+    *out = db->mempool;
+    return YQ_OK;
+}
+
+void yq_mempool_put(yq_db *db, yq_mempool *pool) {
+    /* The pool is owned by the database handle; releasing it is a no-op. */
+    (void)db;
+    (void)pool;
 }

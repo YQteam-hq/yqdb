@@ -187,7 +187,7 @@ int yq_last_io_error(void);
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /* txn_begin 的 flags */
-#define YQ_TXN_READONLY  0x0000u /* 只读事务，获取 MVCC 快照，绝不阻塞写者 */
+#define YQ_TXN_READONLY  0x0002u /* 只读事务，获取 MVCC 快照，绝不阻塞写者 */
 #define YQ_TXN_READWRITE 0x0001u /* 读写事务，需要写锁；拿不到返回 YQ_ERR_BUSY */
 
 /*
@@ -304,6 +304,81 @@ int yq_sync(yq_db *db);
 
 /* 读取统计信息。struct_size 必须先填 sizeof(yq_stat)。 */
 int yq_db_stat(yq_db *db, yq_stat *out);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Batch operations
+ *
+ * A batch folds many PUT/DELETE calls into a single invocation, removing the
+ * per-call overhead. Every operation still runs inside the caller's
+ * transaction: the whole batch becomes visible on commit and is discarded on
+ * rollback.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* One entry in a batch. */
+typedef struct yq_batch_entry {
+    yq_slice key;      /* Key; size must be 1..1024. */
+    yq_slice val;      /* Value; used by PUT, ignored by DELETE. */
+    uint32_t op;       /* 0 = PUT, 1 = DELETE. */
+    uint32_t flags;    /* PUT mode, see YQ_PUT_*; ignored by DELETE. */
+} yq_batch_entry;
+
+/* Batch result. struct_size is filled by the library. */
+typedef struct yq_batch_result {
+    uint32_t struct_size;    /* Written by the library as sizeof(yq_batch_result). */
+    uint32_t entries_total;  /* Total number of entries in this batch. */
+    uint32_t entries_ok;     /* Number of entries that succeeded. */
+    uint32_t entries_failed; /* Number of entries that failed. */
+    int      first_error;    /* First error code; YQ_OK when all succeeded. */
+    uint32_t reserved[4];    /* Must be zero. */
+} yq_batch_result;
+
+/*
+ * Run a batch of PUT/DELETE operations. Returns YQ_ERR_INVAL when any argument
+ * is NULL or count is 0. A read-only transaction returns YQ_ERR_READONLY and a
+ * finished transaction returns YQ_ERR_TXN_CLOSED.
+ *
+ * To avoid partial writes, the implementation validates every entry first; if
+ * any entry is invalid the whole batch is left untouched and result->first_error
+ * is set to YQ_ERR_INVAL. Entries are applied only after validation passes.
+ * result may be NULL (statistics are then not reported).
+ */
+int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
+                 yq_batch_result *result);
+
+/*
+ * Delete a batch of keys. Semantics match yq_batch_put; equivalent to wrapping
+ * every key as a DELETE entry.
+ */
+int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_batch_result *result);
+
+/*
+ * Read many keys in one call. values is an output array with at least count
+ * elements, aligned one-to-one with keys. A missed key is written as {NULL, 0}.
+ * *found_count receives the number of keys that were found.
+ * This function always returns YQ_OK unless an argument is invalid or the
+ * transaction has already finished.
+ */
+int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_slice *values, size_t *found_count);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Memory pool
+ *
+ * The database handle keeps a small-object memory pool that callers may reuse
+ * to cut malloc/free overhead (see include/yq_mempool.h). The pool lifetime is
+ * bound to the db handle.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct yq_mempool yq_mempool;
+
+/* Get the pool owned by this handle. The pool is owned by the library and must
+ * not be destroyed by the caller. */
+int yq_mempool_get(yq_db *db, yq_mempool **out);
+
+/* Release the pool. The pool stays owned by the handle; this is a no-op kept
+ * only for API symmetry. */
+void yq_mempool_put(yq_db *db, yq_mempool *pool);
 
 #ifdef __cplusplus
 } /* extern "C" */

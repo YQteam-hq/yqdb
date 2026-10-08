@@ -17,6 +17,7 @@ set(SOURCES
     src/yq_mvcc.c
     src/yq_recover.c
     src/yq.c
+    src/yq_mempool.c
 )
 
 add_library(yqdb STATIC ${SOURCES})

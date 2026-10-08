@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <time.h>
 #include "yq.h"
+#include "yq_mempool.h"
 
 static const char *TEST_DB = "yqtest_integration.yqdb";
 
@@ -347,6 +348,116 @@ static void test_batch(void) {
     printf("OK\n");
 }
 
+static void test_batch_api(void) {
+    printf("test_batch_api... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    int rc = yq_open(TEST_DB, &opts, &db);
+    assert(rc == YQ_OK);
+
+    /* Write a mixed batch of PUT and DELETE operations in one call. */
+    yq_txn *txn = NULL;
+    rc = yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
+    assert(rc == YQ_OK);
+
+    char k0[] = "batch:k0", k1[] = "batch:k1", k2[] = "batch:k2";
+    char k3[] = "batch:k3", k4[] = "batch:k4";
+    char v1[] = "value-1", v2[] = "value-2", v3[] = "value-3";
+
+    yq_batch_entry entries[5];
+    memset(entries, 0, sizeof(entries));
+    entries[0].key = (yq_slice){k0, strlen(k0)}; entries[0].val = (yq_slice){v1, strlen(v1)}; entries[0].op = 0;
+    entries[1].key = (yq_slice){k1, strlen(k1)}; entries[1].val = (yq_slice){v2, strlen(v2)}; entries[1].op = 0;
+    entries[2].key = (yq_slice){k2, strlen(k2)}; entries[2].val = (yq_slice){v3, strlen(v3)}; entries[2].op = 0;
+    entries[3].key = (yq_slice){k3, strlen(k3)}; entries[3].op = 1; /* delete of a missing key is idempotent */
+    entries[4].key = (yq_slice){k4, strlen(k4)}; entries[4].op = 1;
+
+    yq_batch_result result;
+    memset(&result, 0, sizeof(result));
+    rc = yq_batch_put(txn, entries, 5, &result);
+    assert(rc == YQ_OK);
+    assert(result.struct_size == sizeof(yq_batch_result));
+    assert(result.entries_total == 5);
+    assert(result.entries_ok == 5);
+    assert(result.entries_failed == 0);
+    assert(yq_txn_commit(txn) == YQ_OK);
+
+    /* Read several keys back through a single yq_batch_get() call. */
+    rc = yq_txn_begin(db, YQ_TXN_READONLY, &txn);
+    assert(rc == YQ_OK);
+
+    yq_slice keys[4] = {
+        {k0, strlen(k0)}, {k1, strlen(k1)}, {k3, strlen(k3)}, {k2, strlen(k2)}
+    };
+    yq_slice vals[4];
+    size_t found = 0;
+    rc = yq_batch_get(txn, keys, 4, vals, &found);
+    assert(rc == YQ_OK);
+    assert(found == 3);
+    assert(vals[0].size == strlen(v1) && memcmp(vals[0].data, v1, vals[0].size) == 0);
+    assert(vals[1].size == strlen(v2) && memcmp(vals[1].data, v2, vals[1].size) == 0);
+    assert(vals[2].data == NULL && vals[2].size == 0); /* k3 was never written */
+    assert(vals[3].size == strlen(v3) && memcmp(vals[3].data, v3, vals[3].size) == 0);
+
+    /* A read-only transaction must reject batch writes. */
+    yq_batch_result ro;
+    memset(&ro, 0, sizeof(ro));
+    rc = yq_batch_put(txn, entries, 1, &ro);
+    assert(rc == YQ_ERR_READONLY);
+
+    /* The same read-only guard must cover single-key writes. */
+    rc = yq_put(txn, entries[0].key, entries[0].val, 0);
+    assert(rc == YQ_ERR_READONLY);
+    yq_txn_commit(txn);
+
+    /* A malformed entry rejects the whole batch before any mutation. */
+    rc = yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
+    assert(rc == YQ_OK);
+    yq_batch_entry bad;
+    memset(&bad, 0, sizeof(bad)); /* key.data == NULL */
+    yq_batch_result bad_result;
+    memset(&bad_result, 0, sizeof(bad_result));
+    rc = yq_batch_put(txn, &bad, 1, &bad_result);
+    assert(rc == YQ_ERR_INVAL);
+    assert(bad_result.entries_failed == 1);
+    yq_txn_abort(txn);
+
+    /* yq_batch_del removes existing keys. */
+    rc = yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
+    assert(rc == YQ_OK);
+    yq_slice del_keys[2] = {{k0, strlen(k0)}, {k1, strlen(k1)}};
+    yq_batch_result del_result;
+    memset(&del_result, 0, sizeof(del_result));
+    rc = yq_batch_del(txn, del_keys, 2, &del_result);
+    assert(rc == YQ_OK);
+    assert(del_result.entries_ok == 2);
+    assert(yq_txn_commit(txn) == YQ_OK);
+
+    rc = yq_txn_begin(db, YQ_TXN_READONLY, &txn);
+    assert(rc == YQ_OK);
+    yq_slice out = {0};
+    assert(yq_get(txn, del_keys[0], &out) == YQ_ERR_NOTFOUND);
+    yq_txn_commit(txn);
+
+    /* The per-handle memory pool is available and functional. */
+    yq_mempool *pool = NULL;
+    assert(yq_mempool_get(db, &pool) == YQ_OK);
+    assert(pool != NULL);
+    void *p = yq_mempool_alloc(pool, 64);
+    assert(p != NULL);
+    yq_mempool_free(pool, p);
+
+    yq_close(db);
+    remove_db();
+    printf("OK\n");
+}
+
 static void test_concurrent_readers(void) {
     printf("test_concurrent_readers... ");
     remove_db();
@@ -455,6 +566,7 @@ int main(void) {
     test_checkpoint();
     test_concurrent_readers();
     test_batch();
+    test_batch_api();
     test_stat();
 
     printf("\n=== ALL TESTS PASSED ===\n");
