@@ -108,6 +108,41 @@ static void set_io_err(int err) {
     if (err != 0) g_last_io_err = err;
 }
 
+/* Bitwise OR of every YQ_OPEN_* flag defined in yq.h. */
+#define YQ_OPEN_KNOWN_FLAGS 0x0000001Fu
+
+/*
+ * Enforce the contract documented on yq_opts before any file is touched.
+ * Everything rejected here is stated as a hard requirement in yq.h, and all of
+ * it used to be accepted silently: a non power-of-two page_size corrupts page
+ * arithmetic, a too-small map_size leaves the meta pages outside the mapping,
+ * and a non-zero reserved[] breaks forward compatibility (those words are
+ * reserved so a future version can give them meaning).
+ */
+static int validate_opts(const yq_opts *opts) {
+    if (opts->flags & ~YQ_OPEN_KNOWN_FLAGS) return YQ_ERR_INVAL;
+
+    if (opts->page_size != 0) {
+        if (opts->page_size < 4096 || opts->page_size > 65536) return YQ_ERR_INVAL;
+        if ((opts->page_size & (opts->page_size - 1)) != 0) return YQ_ERR_INVAL;
+    }
+
+    if (opts->sync_mode > YQ_SYNC_FULL) return YQ_ERR_INVAL;
+    if (opts->max_readers > 65535u) return YQ_ERR_INVAL;
+
+    /* The two meta pages live at the start of the mapping. */
+    if (opts->map_size != 0) {
+        uint64_t min_map = 2ull * (opts->page_size ? (uint64_t)opts->page_size : 4096ull);
+        if (opts->map_size < min_map) return YQ_ERR_INVAL;
+    }
+
+    for (size_t i = 0; i < sizeof(opts->reserved) / sizeof(opts->reserved[0]); i++) {
+        if (opts->reserved[i] != 0) return YQ_ERR_INVAL;
+    }
+
+    return YQ_OK;
+}
+
 static int apply_defaults(yq_opts *opts) {
     if (opts->page_size == 0) opts->page_size = 4096;
     else if (opts->page_size < 4096 || opts->page_size > 65536) return YQ_ERR_INVAL;
@@ -141,8 +176,11 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     if (!opts || opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
     if (!path || path[0] == '\0') return YQ_ERR_INVAL;
 
+    int rc = validate_opts(opts);
+    if (rc != YQ_OK) return rc;
+
     yq_opts def = *opts;
-    int rc = apply_defaults(&def);
+    rc = apply_defaults(&def);
     if (rc != YQ_OK) return rc;
 
     yq_db *db = calloc(1, sizeof(yq_db));
@@ -162,6 +200,16 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     if (!db->db_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
 
     uint64_t fsize = yq_file_size(db->db_file);
+
+    /*
+     * YQ_OPEN_EXCL: fail if the database already exists. Checked before any
+     * auxiliary file is created so a rejected open leaves nothing behind, and
+     * before recovery runs so an existing database is never modified.
+     */
+    if ((def.flags & YQ_OPEN_EXCL) && fsize > 0) {
+        free_db(db);
+        return YQ_ERR_EXISTS;
+    }
 
     char shm_path[1024];
     snprintf(shm_path, sizeof(shm_path), "%s.shm", db_path_buf);
