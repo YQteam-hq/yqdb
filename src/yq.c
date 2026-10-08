@@ -17,6 +17,7 @@ static _Thread_local int g_last_io_err = 0;
 
 struct yq_db {
     yq_opts opts;
+    char path[1024];
     yq_file *db_file;
     yq_file *wal_file;
     yq_file *shm_file;
@@ -155,6 +156,7 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     size_t plen = strlen(path);
     if (plen >= sizeof(db_path_buf)) { free(db); return YQ_ERR_INVAL; }
     memcpy(db_path_buf, path, plen + 1);
+    memcpy(db->path, path, plen + 1);
 
     int create_file = (def.flags & YQ_OPEN_CREATE) ? 1 : 0;
 
@@ -722,12 +724,90 @@ int yq_cur_close(yq_cur *c) {
     return YQ_OK;
 }
 
+/*
+ * Rewrite the log as a single committed transaction holding exactly the live
+ * memtable contents, then swap it into place atomically.
+ *
+ * The log is the only durable copy of committed data in 1.0 (B+Tree spilling
+ * is not enabled yet), so it cannot simply be truncated: deleting it would
+ * delete the dataset. Compacting it instead drops everything the memtable has
+ * already superseded — overwritten values, deleted keys, rolled-back
+ * transactions — which is what keeps the log from growing without bound.
+ *
+ * Crash safety: the replacement log is fully written and fsync'ed before the
+ * rename, and yq_file_rename() swaps it in one step. A crash therefore leaves
+ * either the old log or the new one, never a partial file.
+ *
+ * Only valid while the persisted B+Tree holds no pages: if spilling is ever
+ * enabled, data may live in the tree and the log can no longer be rewritten
+ * from the memtable alone. Callers must check that before calling.
+ */
+static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
+    char tmp_db[1024 + 32];
+    char tmp_log[1024 + 32];
+    char cur_log[1024 + 32];
+
+    if (snprintf(tmp_db, sizeof(tmp_db), "%s.ckpt-tmp", db->path) >= (int)sizeof(tmp_db)) {
+        return YQ_ERR_INVAL;
+    }
+
+    yq_wal *tmp = NULL;
+    int rc = yq_wal_open(&tmp, tmp_db, db->opts.page_size);
+    if (rc != YQ_OK) return rc;
+
+    rc = yq_wal_append_begin(tmp, txn_id);
+
+    yq_memtable_iter *it = NULL;
+    if (rc == YQ_OK) rc = yq_memtable_iter_open(db->memtable, &it);
+
+    if (rc == YQ_OK) {
+        for (int more = yq_memtable_iter_first(it); more == YQ_OK;
+             more = yq_memtable_iter_next(it)) {
+            yq_slice k = {0}, v = {0};
+            if (yq_memtable_iter_key(it, &k) != YQ_OK) break;
+            if (yq_memtable_iter_val(it, &v) != YQ_OK) break;
+            rc = yq_wal_append_put(tmp, txn_id, k, v);
+            if (rc != YQ_OK) break;
+        }
+        yq_memtable_iter_close(it);
+    }
+
+    if (rc == YQ_OK) rc = yq_wal_append_commit(tmp, txn_id);
+    if (rc == YQ_OK) rc = yq_wal_flush(tmp);
+
+    yq_wal_close(tmp);
+
+    if (rc != YQ_OK) {
+        snprintf(tmp_log, sizeof(tmp_log), "%s.log", tmp_db);
+        remove(tmp_log);
+        return rc;
+    }
+
+    snprintf(tmp_log, sizeof(tmp_log), "%s.log", tmp_db);
+    snprintf(cur_log, sizeof(cur_log), "%s.log", db->path);
+
+    rc = yq_file_rename(tmp_log, cur_log);
+    if (rc != YQ_OK) {
+        remove(tmp_log);
+        return rc;
+    }
+
+    /* Reopen the handle so it reads the replacement log's size and LSNs. */
+    yq_wal_close(db->wal);
+    db->wal = NULL;
+    return yq_wal_open(&db->wal, db->path, db->opts.page_size);
+}
+
 int yq_checkpoint(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
     if (!db->write_enabled) return YQ_ERR_CORRUPT;
 
     uint64_t wal_sz = yq_wal_size(db->wal);
     if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
+
+    /* Make sure everything committed so far is on disk before rewriting. */
+    int rc = yq_wal_flush(db->wal);
+    if (rc != YQ_OK) return rc;
 
     uint64_t new_txn_id = 0;
     yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
@@ -743,7 +823,17 @@ int yq_checkpoint(yq_db *db) {
 
     yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
 
-    if (wal_sz > 0) yq_wal_truncate(db->wal, 0);
+    /*
+     * The log can only be rewritten while it is the sole durable copy of the
+     * dataset, i.e. while the persisted B+Tree has no pages. Once spilling is
+     * implemented this branch needs to merge the memtable into the tree
+     * first; until then we leave the log alone rather than lose data.
+     */
+    if (root_page == 0 && wal_sz > 0) {
+        rc = wal_compact_from_memtable(db, new_txn_id);
+        if (rc != YQ_OK) return rc;
+    }
+
     if (db->db_file) yq_file_sync(db->db_file);
 
     return YQ_OK;

@@ -274,7 +274,9 @@ This is the **first stable 1.0 release**. Please note the following boundaries:
    spilling and log truncation are reserved capabilities that are not yet
    enabled. As a result:
    - Data is recoverable from `path.log` after a close;
-   - `path.log` grows while the process runs without a checkpoint.
+   - `path.log` grows while the process runs without a checkpoint; calling
+     `yq_checkpoint()` rewrites it down to the live dataset (one committed
+     transaction holding the current memtable contents).
 2. **Single writer.** At most one read-write transaction exists at a time,
    enforced across processes by `path.lock`; read-only transactions run
    concurrently up to `max_readers`.

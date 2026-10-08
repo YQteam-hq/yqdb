@@ -567,6 +567,100 @@ static void test_readonly_snapshot(void) {
     printf("OK\n");
 }
 
+/*
+ * Checkpoint must compact the log down to the live dataset, without losing
+ * anything: overwritten values and deleted keys are dropped, live keys
+ * survive a close/reopen cycle.
+ */
+static void test_checkpoint_compaction(void) {
+    printf("test_checkpoint_compaction... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    /* One key rewritten many times: the log grows, the live set does not. */
+    for (int i = 0; i < 100; i++) {
+        char v[32];
+        snprintf(v, sizeof(v), "value-%d", i);
+        yq_txn *t = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+        yq_slice k = {"hot", 3};
+        yq_slice vs = {v, strlen(v)};
+        CHECK_EQ(yq_put(t, k, vs, YQ_PUT_UPSERT), YQ_OK);
+        CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    }
+
+    /* Keys that are written and then deleted must not come back. */
+    for (int i = 0; i < 50; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "gone%03d", i);
+        yq_txn *t = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+        yq_slice ks = {k, strlen(k)};
+        yq_slice vs = {"x", 1};
+        CHECK_EQ(yq_put(t, ks, vs, YQ_PUT_UPSERT), YQ_OK);
+        CHECK_EQ(yq_txn_commit(t), YQ_OK);
+
+        t = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+        CHECK_EQ(yq_del(t, ks), YQ_OK);
+        CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    }
+
+    yq_txn *t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+    yq_slice keep_k = {"keep", 4};
+    yq_slice keep_v = {"yes", 3};
+    CHECK_EQ(yq_put(t, keep_k, keep_v, YQ_PUT_UPSERT), YQ_OK);
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+
+    yq_stat st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+    CHECK_EQ(yq_db_stat(db, &st), YQ_OK);
+    uint64_t before = st.log_bytes;
+    CHECK(before > 4096);
+
+    CHECK_EQ(yq_checkpoint(db), YQ_OK);
+    CHECK_EQ(yq_db_stat(db, &st), YQ_OK);
+    CHECK(st.log_bytes < before / 2);
+
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    /* Everything live must still be there after a full reopen. */
+    db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+
+    yq_slice out = {0};
+    CHECK_EQ(yq_get(t, keep_k, &out), YQ_OK);
+    CHECK(out.size == 3 && memcmp(out.data, "yes", 3) == 0);
+
+    yq_slice hot = {"hot", 3};
+    CHECK_EQ(yq_get(t, hot, &out), YQ_OK);
+    CHECK(out.size == 8 && memcmp(out.data, "value-99", 8) == 0);
+
+    for (int i = 0; i < 50; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "gone%03d", i);
+        yq_slice ks = {k, strlen(k)};
+        CHECK_EQ(yq_get(t, ks, &out), YQ_ERR_NOTFOUND);
+    }
+
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -584,6 +678,7 @@ int main(void) {
     test_stat();
     test_reader_slots();
     test_readonly_snapshot();
+    test_checkpoint_compaction();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

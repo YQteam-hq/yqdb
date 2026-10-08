@@ -127,6 +127,13 @@ uint64_t yq_file_size(yq_file *f) {
     return (uint64_t)sz.QuadPart;
 }
 
+int yq_file_rename(const char *from, const char *to) {
+    if (!MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return YQ_ERR_IO;
+    }
+    return YQ_OK;
+}
+
 int yq_file_lock(yq_file *f, int exclusive) {
     DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
     OVERLAPPED ov = {0};
@@ -185,6 +192,7 @@ int yq_file_munmap(void *ptr, size_t len) {
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -243,6 +251,13 @@ int yq_file_sync(yq_file *f) {
 
 int yq_file_truncate(yq_file *f, uint64_t size) {
     if (ftruncate(f->fd, (off_t)size) < 0) {
+        return YQ_ERR_IO;
+    }
+    return YQ_OK;
+}
+
+int yq_file_rename(const char *from, const char *to) {
+    if (rename(from, to) != 0) {
         return YQ_ERR_IO;
     }
     return YQ_OK;
