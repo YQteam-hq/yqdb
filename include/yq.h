@@ -23,6 +23,26 @@ extern "C" {
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * JSON Support (Optional)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * JSON support is optional. To enable JSON functionality, define YQ_ENABLE_JSON
+ * before including yq.h or compile with -DYQ_ENABLE_JSON.
+ */
+#ifndef YQ_ENABLE_JSON
+#define YQ_ENABLE_JSON 0
+#endif
+
+#if YQ_ENABLE_JSON
+#include "yq_json.h"
+#endif
+
+#if YQ_ENABLE_BATCH
+#include "yq_batch.h"
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════
  * 版本
  * ═══════════════════════════════════════════════════════════════════════ */
 
