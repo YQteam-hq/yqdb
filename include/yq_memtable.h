@@ -24,6 +24,17 @@ int yq_memtable_iter_prev(yq_memtable_iter *it);
 int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out);
 int yq_memtable_iter_val(yq_memtable_iter *it, yq_slice *out);
 int yq_memtable_iter_valid(yq_memtable_iter *it);
-void yq_memtable_reset(yq_memtable *mt);
+
+/*
+ * 清空内存表并复用 arena。
+ *
+ * 返回 YQ_OK 成功；YQ_ERR_NOMEM 表示重建跳表头失败（内存表进入空且不可用
+ * 状态，调用方应放弃该表）。
+ *
+ * 语义变化提示：reset 会使此前打开的所有迭代器失效。失效后的迭代器
+ * first/next/last/prev/key/val 返回 YQ_ERR_CURSOR，iter_valid 返回 0，
+ * 不会读到 reset 之前已丢弃的数据。原因见实现处的 gen 说明。
+ */
+int yq_memtable_reset(yq_memtable *mt);
 
 #endif
