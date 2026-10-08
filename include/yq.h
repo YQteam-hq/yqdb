@@ -23,6 +23,62 @@ extern "C" {
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * JSON Support (Optional)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * JSON support is optional. To enable JSON functionality, define YQ_ENABLE_JSON
+ * before including yq.h or compile with -DYQ_ENABLE_JSON.
+ */
+#ifndef YQ_ENABLE_JSON
+#define YQ_ENABLE_JSON 0
+#endif
+
+#if YQ_ENABLE_JSON
+#include "yq_json.h"
+#endif
+
+#if YQ_ENABLE_BATCH
+#include "yq_batch.h"
+#endif
+
+#if YQ_ENABLE_INDEX
+#include "yq_index.h"
+#endif
+
+#if YQ_ENABLE_TTL
+#include "yq_ttl.h"
+#endif
+
+#if YQ_ENABLE_COMPRESS
+#include "yq_compress.h"
+#endif
+
+#if YQ_ENABLE_CRYPTO
+#include "yq_crypto.h"
+#endif
+
+#if YQ_ENABLE_PUBSUB
+#include "yq_pubsub.h"
+#endif
+
+#if YQ_ENABLE_BACKUP
+#include "yq_backup.h"
+#endif
+
+#if YQ_ENABLE_CLUSTER
+#include "yq_cluster.h"
+#endif
+
+#if YQ_ENABLE_CACHE
+#include "yq_cache.h"
+#endif
+
+#if YQ_ENABLE_WEB
+#include "yq_web.h"
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════
  * 版本
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -89,6 +145,10 @@ typedef struct yq_slice {
 typedef struct yq_db  yq_db;
 typedef struct yq_txn yq_txn;
 typedef struct yq_cur yq_cur;
+
+#if YQ_ENABLE_PUBSUB
+#include "yq_pubsub.h"
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 打开参数

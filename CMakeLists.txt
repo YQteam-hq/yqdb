@@ -17,6 +17,18 @@ set(SOURCES
     src/yq_mvcc.c
     src/yq_recover.c
     src/yq.c
+    src/yq_json.c
+    src/yq_batch.c
+    src/yq_index.c
+    src/yq_ttl.c
+    src/yq_compress.c
+    src/yq_crypto.c
+    src/yq_pubsub.c
+    src/yq_backup.c
+    src/yq_cluster.c
+    src/yq_cache.c
+    src/yq_web.c
+    src/yq_web_missing_functions.c
 )
 
 add_library(yqdb STATIC ${SOURCES})
