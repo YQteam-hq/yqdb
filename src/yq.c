@@ -597,29 +597,74 @@ int yq_cur_prev(yq_cur *c) {
 
 int yq_cur_seek(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
-    int rc = yq_cur_first(c);
-    while (rc == YQ_OK) {
-        yq_slice k;
-        if (yq_cur_key(c, &k) != YQ_OK) break;
-        if (yq_slice_compare(&k, &key) >= 0) return YQ_OK;
-        rc = yq_cur_next(c);
+
+    /* Position the tree cursor at the first key >= target (binary descent). */
+    int tree_found = 0;
+    if (c->bt_cur) {
+        int rc = yq_btree_cursor_seek(c->bt_cur, key);
+        if (rc == YQ_OK) tree_found = 1;
+        else if (rc != YQ_ERR_NOTFOUND) return rc;
     }
-    c->at_end = 1; c->state = 0;
+
+    /* Position the memtable iterator at the first key >= target. */
+    int mt_found = 0;
+    if (c->mt_iter) {
+        int rc = yq_memtable_iter_first(c->mt_iter);
+        while (rc == YQ_OK) {
+            yq_slice k;
+            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
+            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
+            rc = yq_memtable_iter_next(c->mt_iter);
+        }
+    }
+
+    /* Merge order visits the memtable first, then the tree; pick the first
+     * iterator that is positioned at a key >= target. */
+    if (mt_found) { c->state = 1; c->at_end = 0; return YQ_OK; }
+    if (tree_found) { c->state = 2; c->at_end = 0; return YQ_OK; }
+    c->state = 0; c->at_end = 1;
     return YQ_ERR_NOTFOUND;
 }
 
 int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
-    int rc = yq_cur_first(c);
-    while (rc == YQ_OK) {
-        yq_slice k;
-        if (yq_cur_key(c, &k) != YQ_OK) break;
-        int cmp = yq_slice_compare(&k, &key);
-        if (cmp == 0) return YQ_OK;
-        if (cmp > 0) break;
-        rc = yq_cur_next(c);
+
+    /* Position the tree cursor at the first key >= target (binary descent). */
+    int tree_found = 0;
+    if (c->bt_cur) {
+        int rc = yq_btree_cursor_seek(c->bt_cur, key);
+        if (rc == YQ_OK) tree_found = 1;
+        else if (rc != YQ_ERR_NOTFOUND) return rc;
     }
-    c->at_end = 1; c->state = 0;
+
+    /* Position the memtable iterator at the first key >= target. */
+    int mt_found = 0;
+    if (c->mt_iter) {
+        int rc = yq_memtable_iter_first(c->mt_iter);
+        while (rc == YQ_OK) {
+            yq_slice k;
+            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
+            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
+            rc = yq_memtable_iter_next(c->mt_iter);
+        }
+    }
+
+    /* Success requires an exact match on the iterator chosen by merge order
+     * (memtable first, then tree); anything else is a miss. */
+    if (mt_found) {
+        yq_slice k;
+        if (yq_memtable_iter_key(c->mt_iter, &k) == YQ_OK && yq_slice_compare(&k, &key) == 0) {
+            c->state = 1; c->at_end = 0; return YQ_OK;
+        }
+        c->state = 0; c->at_end = 1; return YQ_ERR_NOTFOUND;
+    }
+    if (tree_found) {
+        yq_slice k;
+        if (yq_btree_cursor_key(c->bt_cur, &k) == YQ_OK && yq_slice_compare(&k, &key) == 0) {
+            c->state = 2; c->at_end = 0; return YQ_OK;
+        }
+    }
+    c->state = 0; c->at_end = 1;
     return YQ_ERR_NOTFOUND;
 }
 
@@ -628,9 +673,13 @@ int yq_cur_seek_le(yq_cur *c, yq_slice key) {
     int rc = yq_cur_seek(c, key);
     if (rc == YQ_OK) {
         yq_slice k;
+        /* Exact hit: the located key already satisfies `<= target`. */
         if (yq_cur_key(c, &k) == YQ_OK && yq_slice_compare(&k, &key) == 0) return YQ_OK;
+        /* First key is > target, so step back to the last key < target. */
         return yq_cur_prev(c);
     }
+    /* No key >= target means target is greater than every key: the answer is
+     * the last (largest) key. */
     return yq_cur_last(c);
 }
 

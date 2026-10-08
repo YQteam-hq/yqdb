@@ -26,6 +26,8 @@ int yq_btree_cursor_prev(yq_btree_cursor *c);
 int yq_btree_cursor_key(yq_btree_cursor *c, yq_slice *out);
 int yq_btree_cursor_val(yq_btree_cursor *c, yq_slice *out);
 int yq_btree_cursor_valid(yq_btree_cursor *c);
+int yq_btree_cursor_seek(yq_btree_cursor *c, yq_slice key);
+int yq_btree_cursor_seek_le(yq_btree_cursor *c, yq_slice key);
 
 uint64_t yq_btree_npages(yq_btree *bt);
 void yq_btree_set_page_provider(yq_btree *bt, void *ctx,
