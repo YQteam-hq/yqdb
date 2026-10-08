@@ -327,7 +327,7 @@ int yq_crypto_configure(yq_db *db, const yq_crypto_opts *opts) {
     
     /* 生成主密钥（如果未提供） */
     if (!manager->master_key) {
-        manager->master_key = crypto_generate_key(opts->key_size);
+        manager->master_key = yq_crypto_generate_key(opts->key_size);
         if (!manager->master_key) {
             return YQ_ERR_NOMEM;
         }
@@ -398,7 +398,7 @@ int yq_crypto_encrypt(const void *data, size_t size, const uint8_t *key, const u
         
         /* 生成 IV（如果需要） */
         if (!iv && (YQ_CRYPTO_AES256 == YQ_CRYPTO_AES256 || YQ_CRYPTO_AES256 == YQ_CRYPTO_CHACHA20)) {
-            (*result)->iv = crypto_generate_iv(YQ_CRYPTO_AES256 == YQ_CRYPTO_AES256 ? 16 : 12);
+            (*result)->iv = yq_crypto_generate_iv(YQ_CRYPTO_AES256 == YQ_CRYPTO_AES256 ? 16 : 12);
             (*result)->iv_size = YQ_CRYPTO_AES256 == YQ_CRYPTO_AES256 ? 16 : 12;
         }
         

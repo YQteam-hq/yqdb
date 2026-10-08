@@ -38,15 +38,11 @@ extern "C" {
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Error Code Extensions
+ *
+ * 基础错误码（YQ_OK / YQ_ERR / YQ_ERR_NOMEM / YQ_ERR_INVAL /
+ * YQ_ERR_NOTFOUND / YQ_ERR_EXISTS）统一由 yq.h 的枚举 yq_rc 定义，
+ * 此处不再重复声明，避免宏覆盖枚举后取到错误数值。
  * ═══════════════════════════════════════════════════════════════════════ */
-
-/* Basic error codes (from main yq.h) */
-#define YQ_OK              0   /* Success */
-#define YQ_ERR             1   /* Generic error */
-#define YQ_ERR_NOMEM       2   /* Memory allocation failed */
-#define YQ_ERR_INVAL       3   /* Invalid parameter */
-#define YQ_ERR_NOTFOUND    4   /* Not found */
-#define YQ_ERR_EXISTS      5   /* Already exists */
 
 typedef enum yq_monitor_rc {
     YQ_MONITOR_OK                = 0,   /* Success */

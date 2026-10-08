@@ -157,12 +157,19 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
 
     for (uint32_t i = 0; i < mvcc->max_readers; i++) {
         uint32_t expected = 0;
+        /*
+         * 注意：CAS 的返回值是 _Bool（是否比较成功），不是被替换掉的旧值。
+         * 且比较失败时它会把槽位当前值写回 expected。因此判据必须用返回值。
+         * 旧写法 `old = atomic_compare_exchange_strong(...); if (old == expected)`
+         * 在成功路径上 old=1、expected=0，会把「抢占成功」误判为「失败」，
+         * 而 active 已被置 1，于是每轮循环都白白漏掉一个槽位，
+         * 遍历完 max_readers 后错误地返回 YQ_ERR_READER_FULL。
+         */
 #if defined(_WIN32)
         LONG old = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, (LONG)expected);
         if (old == (LONG)expected)
 #else
-        uint32_t old = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1);
-        if (old == expected)
+        if (atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1))
 #endif
         {
             slots[i].pid = yq_mvcc_current_pid();

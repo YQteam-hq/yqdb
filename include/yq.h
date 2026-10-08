@@ -27,56 +27,90 @@ extern "C" {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * JSON support is optional. To enable JSON functionality, define YQ_ENABLE_JSON
- * before including yq.h or compile with -DYQ_ENABLE_JSON.
+ * JSON support. yq_json.c 无条件被 CMakeLists.txt 编进静态库（该文件没有
+ * 条件编译守卫），因此这里默认取 1，与库内容保持一致。
+ *
+ * 历史上这里默认是 0：结果是 yq.h 隐藏了 yq_json.h 的全部声明，而库里却
+ * 实实在在带着 17 个 yq_json_* 符号——「头里没声明、库里有实现」。
+ * 要真正关闭 JSON，需要同时满足两件事：
+ *   1) 用 -DYQ_ENABLE_JSON=0 编译；
+ *   2) 在 CMakeLists.txt 的源文件列表里去掉 src/yq_json.c。
  */
 #ifndef YQ_ENABLE_JSON
-#define YQ_ENABLE_JSON 0
+#define YQ_ENABLE_JSON 1
 #endif
 
-#if YQ_ENABLE_JSON
-#include "yq_json.h"
+/*
+ * 其余功能开关一律给出显式默认值。
+ *
+ * 这里曾经只定义了 YQ_ENABLE_JSON，其余 11 个宏未定义；而 #if 遇到未定义
+ * 标识符会当作 0，于是这些头文件永远不会被包含，公开 API 默认整体消失，
+ * 与此同时 CMakeLists.txt 却无条件把它们编进静态库——开关语义自相矛盾。
+ *
+ * 默认取 1：因为构建系统无条件编译并链接了这些模块，若这里默认 0，头文件
+ * 与库内容就不一致（库里有符号、头里没声明）。要关闭某个模块，需同时
+ * 用 -DYQ_ENABLE_X=0 编译，并在 CMake 侧一并移除对应源文件。
+ *
+ * 注意：这里给出默认值只是为了「头文件与库内容一致」，并不代表模块被
+ * 完整实现。个别模块（如 backup 的部分接口）仍是占位实现，见各头文件的
+ * 函数级注释。
+ */
+#ifndef YQ_ENABLE_BATCH
+#define YQ_ENABLE_BATCH 1
 #endif
 
-#if YQ_ENABLE_BATCH
-#include "yq_batch.h"
+#ifndef YQ_ENABLE_INDEX
+#define YQ_ENABLE_INDEX 1
 #endif
 
-#if YQ_ENABLE_INDEX
-#include "yq_index.h"
+#ifndef YQ_ENABLE_TTL
+#define YQ_ENABLE_TTL 1
 #endif
 
-#if YQ_ENABLE_TTL
-#include "yq_ttl.h"
+#ifndef YQ_ENABLE_COMPRESS
+#define YQ_ENABLE_COMPRESS 1
 #endif
 
-#if YQ_ENABLE_COMPRESS
-#include "yq_compress.h"
+#ifndef YQ_ENABLE_CRYPTO
+#define YQ_ENABLE_CRYPTO 1
 #endif
 
-#if YQ_ENABLE_CRYPTO
-#include "yq_crypto.h"
+#ifndef YQ_ENABLE_PUBSUB
+#define YQ_ENABLE_PUBSUB 1
 #endif
 
-#if YQ_ENABLE_PUBSUB
-#include "yq_pubsub.h"
+#ifndef YQ_ENABLE_BACKUP
+#define YQ_ENABLE_BACKUP 1
 #endif
 
-#if YQ_ENABLE_BACKUP
-#include "yq_backup.h"
+#ifndef YQ_ENABLE_CLUSTER
+#define YQ_ENABLE_CLUSTER 1
 #endif
 
-#if YQ_ENABLE_CLUSTER
-#include "yq_cluster.h"
+#ifndef YQ_ENABLE_CACHE
+#define YQ_ENABLE_CACHE 1
 #endif
 
-#if YQ_ENABLE_CACHE
-#include "yq_cache.h"
+#ifndef YQ_ENABLE_WEB
+#define YQ_ENABLE_WEB 1
 #endif
 
-#if YQ_ENABLE_WEB
-#include "yq_web.h"
-#endif
+/*
+ * yq_json.h 与其余功能头文件一样，统一放到文件末尾再包含。
+ * 原因同下：它用到 yq_slice / yq_txn 等核心类型，必须等核心类型定义之后。
+ * （这里曾把它放在此处，因 YQ_ENABLE_JSON 默认为 0 而长期未被编译到，
+ *   一旦打开宏就报 unknown type name 'yq_slice'。）
+ */
+
+/*
+ * 其余功能头文件（batch/index/ttl/.../web）统一放到文件末尾再包含。
+ *
+ * 原因：这些头文件都用到 yq_slice / yq_txn / yq_db 等核心类型，而核心类型
+ * 在本文件中定义于更靠后的位置。此前它们在这里被包含，于是只要任一
+ * YQ_ENABLE_X 打开，编译立刻报 "unknown type name 'yq_slice'"，这也正是
+ * 这些宏长期保持"未定义（=0）"的真实原因。把它们移到文件末尾，包含顺序
+ * 才与它们对 yq.h 的依赖一致。
+ */
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 版本
@@ -145,10 +179,6 @@ typedef struct yq_slice {
 typedef struct yq_db  yq_db;
 typedef struct yq_txn yq_txn;
 typedef struct yq_cur yq_cur;
-
-#if YQ_ENABLE_PUBSUB
-#include "yq_pubsub.h"
-#endif
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 打开参数
@@ -364,6 +394,57 @@ int yq_sync(yq_db *db);
 
 /* 读取统计信息。struct_size 必须先填 sizeof(yq_stat)。 */
 int yq_db_stat(yq_db *db, yq_stat *out);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 可选功能头文件
+ *
+ * 必须放在此处——所有核心类型（yq_slice / yq_txn / yq_db / yq_opts 等）
+ * 都已定义完毕，子头文件才能正确引用它们。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#if YQ_ENABLE_BATCH
+#include "yq_batch.h"
+#endif
+
+#if YQ_ENABLE_INDEX
+#include "yq_index.h"
+#endif
+
+#if YQ_ENABLE_TTL
+#include "yq_ttl.h"
+#endif
+
+#if YQ_ENABLE_COMPRESS
+#include "yq_compress.h"
+#endif
+
+#if YQ_ENABLE_CRYPTO
+#include "yq_crypto.h"
+#endif
+
+#if YQ_ENABLE_PUBSUB
+#include "yq_pubsub.h"
+#endif
+
+#if YQ_ENABLE_BACKUP
+#include "yq_backup.h"
+#endif
+
+#if YQ_ENABLE_CLUSTER
+#include "yq_cluster.h"
+#endif
+
+#if YQ_ENABLE_CACHE
+#include "yq_cache.h"
+#endif
+
+#if YQ_ENABLE_WEB
+#include "yq_web.h"
+#endif
+
+#if YQ_ENABLE_JSON
+#include "yq_json.h"
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

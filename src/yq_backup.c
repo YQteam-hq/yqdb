@@ -5,14 +5,25 @@
  * Language   : C11
  */
 
+/*
+ * pthread_timedjoin_np / usleep 属于 POSIX 扩展而非 ISO C，
+ * 在 glibc 下需要显式打开 _GNU_SOURCE，且必须在任何头文件之前定义，
+ * 否则 clang 会以 -Wimplicit-function-declaration 报错。
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "yq_backup.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #if YQ_ENABLE_BACKUP
 
@@ -149,10 +160,15 @@ static int yq_calculate_checksum(const char *filename, char *checksum, size_t si
     
     fclose(file);
     
-    for (int i = 0; i < 32 && i < size; i++) {
+    for (size_t i = 0; i < 32 && i < size; i++) {
         sprintf(&checksum[i * 2], "%02x", hash[i]);
     }
-    
+
+    /* 截断到实际写入的 32 字节摘要（64 个十六进制字符）之后的部分。
+     * 若调用方给的 size 小于 64，则以 size 为准，避免越界写。 */
+    size_t written = (size < 64) ? size : 64;
+    if (written < size) checksum[written] = '\0';
+
     return YQ_BACKUP_OK;
 }
 

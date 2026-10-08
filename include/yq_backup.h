@@ -38,15 +38,13 @@ extern "C" {
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Error Code Extensions
+ *
+ * 基础错误码（YQ_OK / YQ_ERR / YQ_ERR_NOMEM / YQ_ERR_INVAL /
+ * YQ_ERR_NOTFOUND / YQ_ERR_EXISTS）统一由 yq.h 的枚举 yq_rc 定义，
+ * 此处不再重复声明。曾经用宏重定义会把枚举值覆盖成错误数值
+ * （例如 YQ_ERR_NOTFOUND 被改成 4，而规范值是 6），从而让
+ * yq_strerror() 返回错误的描述字符串。
  * ═══════════════════════════════════════════════════════════════════════ */
-
-/* Basic error codes (from main yq.h) */
-#define YQ_OK              0   /* Success */
-#define YQ_ERR             1   /* Generic error */
-#define YQ_ERR_NOMEM       2   /* Memory allocation failed */
-#define YQ_ERR_INVAL       3   /* Invalid parameter */
-#define YQ_ERR_NOTFOUND    4   /* Not found */
-#define YQ_ERR_EXISTS      5   /* Already exists */
 
 typedef enum yq_backup_rc {
     YQ_BACKUP_OK                = 0,   /* Success */
@@ -63,7 +61,13 @@ typedef enum yq_backup_rc {
     YQ_BACKUP_ERR_NETWORK       = 310,  /* Network error */
     YQ_BACKUP_ERR_TIMEOUT       = 311,  /* Timeout error */
     YQ_BACKUP_ERR_PARTIAL       = 312,  /* Partial backup error */
-    YQ_BACKUP_ERR_INCONSISTENT   = 313  /* Inconsistent backup error */
+    YQ_BACKUP_ERR_INCONSISTENT   = 313,  /* Inconsistent backup error */
+    /*
+     * 下面两个由实现（src/yq_backup.c）使用，此前漏定义，
+     * 使该文件一旦真正参与编译就报 "undeclared"。
+     */
+    YQ_BACKUP_ERR_NOMEM         = 314,  /* Out of memory */
+    YQ_BACKUP_ERR_INVAL         = 315   /* Invalid argument */
 } yq_backup_rc;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -208,6 +212,12 @@ typedef struct yq_backup_stats {
     uint64_t total_backups;    /* Total backups */
     uint64_t successful_backups; /* Successful backups */
     uint64_t failed_backups;   /* Failed backups */
+    /*
+     * 恢复侧计数。实现（src/yq_backup.c 的 yq_backup_wait）会累加这两个字段，
+     * 此前结构体里没有它们，导致该文件一旦真正参与编译即报 "has no member"。
+     */
+    uint64_t successful_restores; /* Successful restores */
+    uint64_t failed_restores;     /* Failed restores */
     uint64_t total_bytes;      /* Total bytes backed up */
     uint64_t last_backup_time; /* Last backup time */
     uint32_t avg_duration_ms;  /* Average duration */

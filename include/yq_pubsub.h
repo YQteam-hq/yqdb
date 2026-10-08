@@ -32,18 +32,14 @@ extern "C" {
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 错误码扩展
+ *
+ * 基础错误码（YQ_OK / YQ_ERR / YQ_ERR_NOMEM / YQ_ERR_INVAL /
+ * YQ_ERR_NOTFOUND / YQ_ERR_EXISTS）统一由 yq.h 的枚举 yq_rc 定义，
+ * 此处不再重复声明，避免宏覆盖枚举后取到错误数值。
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* Basic error codes (from main yq.h) */
-#define YQ_OK              0   /* 成功 */
-#define YQ_ERR             1   /* 通用错误 */
-#define YQ_ERR_NOMEM       2   /* 内存分配失败 */
-#define YQ_ERR_INVAL       3   /* 无效参数 */
-#define YQ_ERR_NOTFOUND    4   /* 未找到 */
-#define YQ_ERR_EXISTS      5   /* 已存在 */
-
 typedef enum yq_pubsub_rc {
-    YQ_PUBSUB_OK               = 0,  /* 成功 */
+    YQ_PUBSUB_OK              = 0,   /* 成功 */
     YQ_PUBSUB_ERR             = 100, /* 通用错误 */
     YQ_PUBSUB_ERR_TOPIC       = 101, /* 主题相关错误 */
     YQ_PUBSUB_ERR_SUBSCRIBER  = 102, /* 订阅者相关错误 */
@@ -162,8 +158,12 @@ typedef void (*yq_stats_callback)(yq_pubsub *pubsub, void *user_data);
 
 /*
  * 初始化 Pub/Sub 系统
+ *
+ * 参数类型与实现（src/yq_pubsub.c）保持一致：数据库句柄是 yq_db *，
+ * 不是 void *。此前声明写成 void *，与定义冲突，只要该头文件被真正
+ * 包含进来就会编译失败。
  */
-int yq_pubsub_init(void *db, yq_pubsub **out);
+int yq_pubsub_init(yq_db *db, yq_pubsub **out);
 
 /*
  * 关闭 Pub/Sub 系统

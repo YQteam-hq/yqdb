@@ -1,5 +1,0 @@
-/workspace/yqdb/CMakeFiles/yqdb.dir
-/workspace/yqdb/CMakeFiles/yq_test_basic.dir
-/workspace/yqdb/CMakeFiles/yq_test_integration.dir
-/workspace/yqdb/CMakeFiles/edit_cache.dir
-/workspace/yqdb/CMakeFiles/rebuild_cache.dir

@@ -6,6 +6,29 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# 没有 enable_testing() 时 add_test() 不会生成 CTestTestfile.cmake，
+# ctest 会报 "No test configuration file found!" 而一个测试都不跑。
+enable_testing()
+
+# 功能开关必须与 include/yq.h 的默认值一致。
+# 下面这些模块被无条件编进库里（src/yq_json.c 也没有条件编译守卫），
+# 因此对应的 YQ_ENABLE_* 必须全部为 1，否则会出现"库里有符号、头文件里
+# 没有声明"的割裂。要关闭某个模块，需同时改这里、改 yq.h 默认值、
+# 并从下面的 SOURCES 列表里删掉对应源文件。
+add_compile_definitions(
+    YQ_ENABLE_JSON=1
+    YQ_ENABLE_BATCH=1
+    YQ_ENABLE_INDEX=1
+    YQ_ENABLE_TTL=1
+    YQ_ENABLE_COMPRESS=1
+    YQ_ENABLE_CRYPTO=1
+    YQ_ENABLE_PUBSUB=1
+    YQ_ENABLE_BACKUP=1
+    YQ_ENABLE_CLUSTER=1
+    YQ_ENABLE_CACHE=1
+    YQ_ENABLE_WEB=1
+)
+
 set(SOURCES
     src/yq_enc.c
     src/yq_memblk.c
@@ -28,7 +51,6 @@ set(SOURCES
     src/yq_cluster.c
     src/yq_cache.c
     src/yq_web.c
-    src/yq_web_missing_functions.c
 )
 
 add_library(yqdb STATIC ${SOURCES})

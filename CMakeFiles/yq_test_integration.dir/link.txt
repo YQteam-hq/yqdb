@@ -1,1 +1,0 @@
-/usr/bin/cc CMakeFiles/yq_test_integration.dir/src/yq_test_integration.c.o -o yq_test_integration  libyqdb.a 
