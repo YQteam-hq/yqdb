@@ -42,3 +42,7 @@ add_test(NAME integration_test COMMAND yq_test_integration)
 add_executable(yq_test_seek src/yq_test_seek.c)
 target_link_libraries(yq_test_seek yqdb)
 add_test(NAME seek_test COMMAND yq_test_seek)
+
+add_executable(yq_test_p4 src/yq_test_p4.c)
+target_link_libraries(yq_test_p4 yqdb)
+add_test(NAME p4_recovery_test COMMAND yq_test_p4)
