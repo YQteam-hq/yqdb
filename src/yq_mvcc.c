@@ -157,21 +157,25 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
 
     for (uint32_t i = 0; i < mvcc->max_readers; i++) {
         uint32_t expected = 0;
+        int acquired = 0;
 #if defined(_WIN32)
-        LONG old = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, (LONG)expected);
-        if (old == (LONG)expected)
+        /* InterlockedCompareExchange returns the *previous* value, so a match
+         * with the expected (free) value means this caller claimed the slot. */
+        LONG prev = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, (LONG)expected);
+        acquired = (prev == (LONG)expected);
 #else
         /*
-         * 注意不要写 old = atomic_compare_exchange_strong(..., &expected, 1);
-         * 再比较 old == expected。C11 的 CAS 成功时会把 expected 覆盖为
-         * 交换后的值（即 desired），失败时才写回实际读取值，所以成功路径上
-         * old(0) 恒不等于 expected(1)，该判断永远为假，导致所有槽位都
-         * 被视为“已被占用”，任何事务都无法开始（yq_txn_begin 恒返回
-         * YQ_ERR_READER_FULL）。以返回的 _Bool 结果为准。
+         * atomic_compare_exchange_strong returns a bool telling whether the
+         * swap happened -- it does NOT return the previous value. Comparing
+         * that bool against `expected` (which still holds the pre-swap value
+         * 0 on success) inverted the test, so the success branch was never
+         * entered and every snapshot acquisition fell through to
+         * YQ_ERR_READER_FULL.
          */
-        if (atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active, &expected, 1))
+        acquired = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active,
+                                                  &expected, 1) ? 1 : 0;
 #endif
-        {
+        if (acquired) {
             slots[i].pid = yq_mvcc_current_pid();
             slots[i].tid = yq_mvcc_current_tid();
             slots[i].snapshot_txn = txn_id;
