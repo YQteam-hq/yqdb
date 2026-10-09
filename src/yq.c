@@ -138,6 +138,8 @@ static void set_io_err(int err) {
  * reserved so a future version can give them meaning).
  */
 static int validate_opts(const yq_opts *opts) {
+    if (!opts) return YQ_ERR_INVAL;
+    
     if (opts->flags & ~YQ_OPEN_KNOWN_FLAGS) return YQ_ERR_INVAL;
 
     if (opts->page_size != 0) {
@@ -157,11 +159,12 @@ static int validate_opts(const yq_opts *opts) {
     for (size_t i = 0; i < sizeof(opts->reserved) / sizeof(opts->reserved[0]); i++) {
         if (opts->reserved[i] != 0) return YQ_ERR_INVAL;
     }
-
     return YQ_OK;
 }
 
 static int apply_defaults(yq_opts *opts) {
+    if (!opts) return YQ_ERR_INVAL;
+    
     if (opts->page_size == 0) opts->page_size = 4096;
     else if (opts->page_size < 4096 || opts->page_size > 65536) return YQ_ERR_INVAL;
     if (opts->sync_mode == YQ_SYNC_DEFAULT) opts->sync_mode = YQ_SYNC_NORMAL;
@@ -196,8 +199,9 @@ static void free_db(yq_db *db) {
 
 int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     *out = NULL;
-    if (!opts || !out || opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
+    if (!opts || !out) return YQ_ERR_INVAL;
     if (!path || path[0] == '\0') return YQ_ERR_INVAL;
+    if (opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
 
     int rc = validate_opts(opts);
     if (rc != YQ_OK) return rc;
