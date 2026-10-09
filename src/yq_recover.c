@@ -55,7 +55,12 @@ static void rc_hash_destroy(rc_hash_set *set) {
 }
 
 static int rc_hash_grow(rc_hash_set *set) {
+    if (!set) return YQ_ERR_INVAL;
+    if (set->cap > (1ULL << 30)) return YQ_ERR_TOOBIG; /* Prevent overflow */
+    
     size_t ncap = set->cap * 2;
+    if (ncap > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
     rc_hash_slot *nslots = (rc_hash_slot *)calloc(ncap, sizeof(rc_hash_slot));
     if (!nslots) return YQ_ERR_NOMEM;
 
@@ -74,11 +79,16 @@ static int rc_hash_grow(rc_hash_set *set) {
 }
 
 static int rc_hash_insert(rc_hash_set *set, uint64_t key) {
+    if (!set) return YQ_ERR_INVAL;
+    
     /* keep the load factor under 0.75 so a free slot always exists */
     if ((set->size + 1) * 4 >= set->cap * 3) {
         int rc = rc_hash_grow(set);
         if (rc != YQ_OK) return rc;
     }
+    
+    /* Validate key to prevent issues with hash calculations */
+    if (key == 0) return YQ_ERR_INVAL;
 
     size_t idx = (size_t)(rc_hash_mix(key) % set->cap);
     while (set->slots[idx].used) {
@@ -92,7 +102,10 @@ static int rc_hash_insert(rc_hash_set *set, uint64_t key) {
 }
 
 static int rc_hash_contains(const rc_hash_set *set, uint64_t key) {
+    if (!set) return 0;
     if (set->cap == 0) return 0;
+    if (key == 0) return 0; /* Prevent hash calculation issues */
+    
     size_t idx = (size_t)(rc_hash_mix(key) % set->cap);
     while (set->slots[idx].used) {
         if (set->slots[idx].key == key) return 1;
@@ -128,9 +141,15 @@ typedef struct {
 
 static int arena_put(uint8_t **buf, size_t *used, size_t *cap,
                      const uint8_t *src, size_t n, size_t *out_off) {
+    if (!buf || !used || !cap || !out_off) return YQ_ERR_INVAL;
+    if (!src && n > 0) return YQ_ERR_INVAL;
+    if (n > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
     if (*buf == NULL || *used + n > *cap) {
         size_t ncap = *cap ? *cap : 4096;
         while (ncap < *used + n) ncap *= 2;
+        if (ncap > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+        
         uint8_t *nb = (uint8_t *)realloc(*buf, ncap);
         if (!nb) return YQ_ERR_NOMEM;
         *buf = nb;
@@ -145,8 +164,18 @@ static int arena_put(uint8_t **buf, size_t *used, size_t *cap,
 static int ctx_push_op(recover_ctx *ctx, uint64_t txn_id, int type,
                        const uint8_t *key, size_t klen,
                        const uint8_t *val, size_t vlen) {
+    if (!ctx) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
+    if (type != 0 && type != 1) return YQ_ERR_INVAL; /* 0=PUT, 1=DEL */
+    if (!key && klen > 0) return YQ_ERR_INVAL;
+    if (!val && vlen > 0) return YQ_ERR_INVAL;
+    if (klen > 1024) return YQ_ERR_TOOBIG; /* Key size limit */
+    if (vlen > (1ULL << 30)) return YQ_ERR_TOOBIG; /* Value size limit */
+    
     if (ctx->ops_count >= ctx->ops_cap) {
         size_t ncap = ctx->ops_cap ? ctx->ops_cap * 2 : 128;
+        if (ncap > (1ULL << 20)) return YQ_ERR_TOOBIG; /* 1M limit */
+        
         rec_op *na = (rec_op *)realloc(ctx->ops, ncap * sizeof(rec_op));
         if (!na) return YQ_ERR_NOMEM;
         ctx->ops = na;
@@ -176,8 +205,19 @@ static int ctx_push_op(recover_ctx *ctx, uint64_t txn_id, int type,
 
 static int recovery_visitor(void *ctx_arg, uint64_t lsn, uint64_t txn_id, int rec_type,
     const uint8_t *payload, size_t paylen) {
+    if (!ctx_arg) return YQ_ERR_INVAL;
     recover_ctx *ctx = (recover_ctx *)ctx_arg;
     (void)lsn;
+    
+    /* Validate transaction ID */
+    if (txn_id == 0) return YQ_ERR_INVAL;
+    
+    /* Validate record type */
+    if (rec_type != 0 && rec_type != 1 && rec_type != 2) return YQ_ERR_INVAL;
+    
+    /* Validate payload */
+    if (!payload && paylen > 0) return YQ_ERR_INVAL;
+    if (paylen > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
 
     if (rec_type == 4) {
         return rc_hash_insert(&ctx->committed, txn_id);
@@ -217,22 +257,52 @@ int yq_recover(yq_wal *wal, yq_memtable *mt) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.mt = mt;
 
+    /* Initialize committed transaction set */
     int rc = rc_hash_init(&ctx.committed);
     if (rc != YQ_OK) return rc;
 
+    /* Scan WAL and collect committed transactions */
     rc = yq_wal_scan(wal, 0, recovery_visitor, &ctx);
+    if (rc != YQ_OK && rc != YQ_ERR_CORRUPT) {
+        rc_hash_destroy(&ctx.committed);
+        return rc;
+    }
 
+    /* Apply committed operations to memtable */
     if (rc == YQ_OK || rc == YQ_ERR_CORRUPT) {
+        /* Validate operations count to prevent excessive processing */
+        if (ctx.ops_count > (1ULL << 20)) {
+            rc_hash_destroy(&ctx.committed);
+            return YQ_ERR_CORRUPT;
+        }
+        
         for (size_t i = 0; i < ctx.ops_count; i++) {
             rec_op *op = &ctx.ops[i];
             if (!rc_hash_contains(&ctx.committed, op->txn_id)) continue;
+            
+            /* Validate operation before applying */
+            if (op->txn_id == 0) continue;
+            if (op->type != 2 && op->type != 3) continue;
+            if (op->key_len > 1024) continue;
+            if (op->type == 2 && op->val_len > (1ULL << 30)) continue;
+            
             yq_slice k;
             k.data = ctx.keys ? ctx.keys + op->key_off : NULL;
             k.size = op->key_len;
+            
+            /* Validate slice before using */
+            if (!k.data && k.size > 0) continue;
+            if (k.size > 1024) continue;
+            
             if (op->type == 2) {
                 yq_slice v;
                 v.data = ctx.vals ? ctx.vals + op->val_off : NULL;
                 v.size = op->val_len;
+                
+                /* Validate value slice */
+                if (!v.data && v.size > 0) continue;
+                if (v.size > (1ULL << 30)) continue;
+                
                 yq_memtable_put(mt, k, v);
             } else if (op->type == 3) {
                 yq_memtable_del(mt, k);
