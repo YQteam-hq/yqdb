@@ -598,7 +598,10 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
 }
 
 int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
+    if (!bt || !out) return YQ_ERR_INVAL;
     if (bt->root_page == 0) return YQ_ERR_NOTFOUND;
+    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
+    if (!key.data) return YQ_ERR_INVAL;
 
     uint64_t cur_page = bt->root_page;
     uint32_t ps = bt->page_size;

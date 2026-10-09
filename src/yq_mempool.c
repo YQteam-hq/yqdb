@@ -74,9 +74,6 @@ static struct yq_memchunk *memchunk_create(void) {
         return NULL;
     }
     
-    chunk->memory = (char *)p;
-    chunk->used = 0;
-    chunk->next = NULL;
     return chunk;
 }
 

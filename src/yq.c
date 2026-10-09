@@ -895,14 +895,20 @@ int yq_cur_close(yq_cur *c) {
  * from the memtable alone. Callers must check that before calling.
  */
 static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
+    if (!db) return YQ_ERR_INVAL;
+    
     char tmp_db[YQ_MAX_PATH + 32];
     char tmp_log[YQ_MAX_PATH + 32];
     char cur_log[YQ_MAX_PATH + 32];
 
     size_t plen = strlen(db->path);
     if (plen + 10 > sizeof(tmp_db)) return YQ_ERR_INVAL;   /* ".ckpt-tmp" + NUL */
+    if (plen + 10 > sizeof(tmp_log)) return YQ_ERR_INVAL;   /* ".log" + NUL */
+    
     memcpy(tmp_db, db->path, plen);
     memcpy(tmp_db + plen, ".ckpt-tmp", 10);
+    memcpy(cur_log, db->path, plen);
+    memcpy(cur_log + plen, ".log", 5);
 
     yq_wal *tmp = NULL;
     int rc = yq_wal_open(&tmp, tmp_db, db->opts.page_size);
