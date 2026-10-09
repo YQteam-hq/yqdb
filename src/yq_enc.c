@@ -46,6 +46,9 @@ uint32_t yq_crc32c(const void *data, size_t len) {
 }
 
 int yq_varint_encode(uint64_t val, uint8_t *out, size_t *nout) {
+    if (!nout) return YQ_ERR_INVAL;
+    if (val > (1ULL << 56)) return YQ_ERR_TOOBIG; /* 7 bytes max */
+    
     size_t n = 0;
     while (val >= 0x80) {
         if (out) out[n] = (uint8_t)((val & 0x7F) | 0x80);
@@ -59,9 +62,10 @@ int yq_varint_encode(uint64_t val, uint8_t *out, size_t *nout) {
 }
 
 int yq_varint_decode(const uint8_t *in, size_t inlen, uint64_t *out, size_t *nconsumed) {
-    if (inlen == 0) {
+    if (!in || inlen == 0 || !out || !nconsumed) {
         return YQ_ERR_INVAL;
     }
+    
     uint64_t val = 0;
     size_t n = 0;
     int shift = 0;
