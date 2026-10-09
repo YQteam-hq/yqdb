@@ -430,8 +430,10 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
 int yq_txn_commit(yq_txn *txn) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    if (!txn->db) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
+    if (!db->wal) return YQ_ERR_INVAL;
 
     if (txn->flags & YQ_TXN_READWRITE) {
         int rc = yq_wal_append_commit(db->wal, txn->snapshot_txn);
@@ -483,14 +485,22 @@ int yq_txn_commit(yq_txn *txn) {
 int yq_txn_abort(yq_txn *txn) {
     if (!txn) return YQ_OK;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    if (!txn->db) return YQ_OK;
+    
     yq_db *db = txn->db;
     if (txn->flags & YQ_TXN_READWRITE) {
-        yq_wal_append_abort(db->wal, txn->snapshot_txn);
-        yq_mvcc_release_writer(db->mvcc);
+        if (db->wal) {
+            yq_wal_append_abort(db->wal, txn->snapshot_txn);
+        }
+        if (db->mvcc) {
+            yq_mvcc_release_writer(db->mvcc);
+        }
     }
     pending_free(txn);
     txn->state = YQ_TXN_STATE_ABORTED;
-    if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+    if (txn->slot_idx >= 0 && db->mvcc) {
+        yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+    }
     free(txn);
     return YQ_OK;
 }
@@ -498,13 +508,22 @@ int yq_txn_abort(yq_txn *txn) {
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    if (!txn->db) return YQ_ERR_INVAL;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
+    
+    /* Enhanced input validation */
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
     if (!key.data || !val.data) return YQ_ERR_INVAL;
+    
+    /* Validate mode parameter */
+    if (mode != YQ_PUT_NOOVERWRITE && mode != YQ_PUT_DEFAULT) {
+        return YQ_ERR_INVAL;
+    }
 
     yq_db *db = txn->db;
+    if (!db->wal || !db->memtable) return YQ_ERR_INVAL;
 
     if (mode == YQ_PUT_NOOVERWRITE) {
         pending_op *p = pending_find(txn, key, NULL);
@@ -532,12 +551,17 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 int yq_del(yq_txn *txn, yq_slice key) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    if (!txn->db) return YQ_ERR_INVAL;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
+    
+    /* Enhanced input validation */
     if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
     if (!key.data) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
+    if (!db->wal || !db->memtable) return YQ_ERR_INVAL;
+    
     yq_slice empty;
     yq_slice_set(&empty, NULL, 0);
 
