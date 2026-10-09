@@ -96,6 +96,10 @@ static int ensure_buf_space(yq_wal *wal, size_t need) {
     size_t new_cap = wal->buf_cap;
     while (new_cap < wal->buf_used + need) {
         new_cap *= 2;
+        /* Check for integer overflow */
+        if (new_cap < wal->buf_cap || new_cap > SIZE_MAX) {
+            return YQ_ERR_NOMEM;
+        }
     }
 
     uint8_t *new_buf = realloc(wal->buf, new_cap);

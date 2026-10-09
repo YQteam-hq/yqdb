@@ -285,6 +285,9 @@ int yq_mvcc_increment_txn_id(yq_mvcc *mvcc, uint64_t *out) {
 #define YQ_META_CRC_LEN 96
 
 static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
+    if (!mvcc || !out) return YQ_ERR_INVAL;
+    if (page_idx > 1) return YQ_ERR_INVAL;  /* Only page 0 and 1 are meta pages */
+    
     uint8_t *buf = mvcc->io_buf;
     uint64_t off = (uint64_t)page_idx * mvcc->page_size;
 

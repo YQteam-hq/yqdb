@@ -91,15 +91,6 @@ static void set_slot(uint8_t *page, uint16_t idx, uint16_t offset) {
     *(uint16_t *)(page + YQ_PAGE_HEADER_SIZE + idx * YQ_PAGE_SLOT_SIZE) = offset;
 }
 
-static uint8_t *get_page_data(yq_btree *bt, uint64_t page_no) {
-    if (!bt) return NULL;
-    if (bt->mmap_base) {
-        return (uint8_t *)bt->mmap_base + page_no * bt->page_size;
-    }
-    return (uint8_t *)bt->arena ?
-           yq_memblk_alloc(bt->arena, bt->page_size) : NULL;
-}
-
 static uint8_t *alloc_page(yq_btree *bt, int is_leaf) {
     if (!bt) return NULL;
     if (bt->page_alloc) {
