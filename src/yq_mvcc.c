@@ -17,13 +17,13 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-#define barrier() _ReadWriteBarrier()
+#define memory_barrier() MemoryBarrier()
 static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)GetCurrentProcessId(); }
 static uint32_t yq_mvcc_current_tid(void) { return (uint32_t)GetCurrentThreadId(); }
 #else
 #include <stdatomic.h>
 #include <unistd.h>
-#define barrier() __asm__ __volatile__("" ::: "memory")
+#define memory_barrier() __sync_synchronize()
 static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)getpid(); }
 static uint32_t yq_mvcc_current_tid(void) { return 0; }
 #endif
@@ -86,7 +86,7 @@ struct yq_mvcc {
     size_t shm_size;
     uint32_t max_readers;
     uint32_t page_size;
-    volatile uint32_t meta_seq;
+    atomic_uint meta_seq;
     uint8_t meta_buf[4096];
 };
 
@@ -99,7 +99,7 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
     mvcc->lock_file = lock_file;
     mvcc->max_readers = max_readers;
     mvcc->page_size = 4096;
-    mvcc->meta_seq = 0;
+    atomic_init(&mvcc->meta_seq, 0);
 
     size_t shm_size = YQ_SHM_HEADER_SIZE + (size_t)max_readers * YQ_SLOT_SIZE;
     uint64_t fsize = yq_file_size(shm_file);
@@ -158,29 +158,20 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     for (uint32_t i = 0; i < mvcc->max_readers; i++) {
         uint32_t expected = 0;
         int acquired = 0;
-#if defined(_WIN32)
-        /* InterlockedCompareExchange returns the *previous* value, so a match
-         * with the expected (free) value means this caller claimed the slot. */
-        LONG prev = InterlockedCompareExchange((volatile LONG *)&slots[i].active, 1, (LONG)expected);
-        acquired = (prev == (LONG)expected);
-#else
-        /*
-         * atomic_compare_exchange_strong returns a bool telling whether the
-         * swap happened -- it does NOT return the previous value. Comparing
-         * that bool against `expected` (which still holds the pre-swap value
-         * 0 on success) inverted the test, so the success branch was never
-         * entered and every snapshot acquisition fell through to
-         * YQ_ERR_READER_FULL.
-         */
+        
+        memory_barrier();
         acquired = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active,
-                                                  &expected, 1) ? 1 : 0;
-#endif
+                                                  &expected, 1);
+        memory_barrier();
+        
         if (acquired) {
+            memory_barrier();
             slots[i].pid = yq_mvcc_current_pid();
             slots[i].tid = yq_mvcc_current_tid();
             slots[i].snapshot_txn = txn_id;
             slots[i].snapshot_root_page = root_page;
             slots[i].slot_epoch = (uint32_t)hdr->shm_epoch;
+            memory_barrier();
 
             *snapshot_txn = txn_id;
             *snapshot_root = root_page;
@@ -195,8 +186,11 @@ int yq_mvcc_release_snapshot(yq_mvcc *mvcc, int slot_idx) {
     if (slot_idx < 0 || (uint32_t)slot_idx >= mvcc->max_readers) return YQ_ERR_INVAL;
 
     shm_slot *slots = (shm_slot *)((uint8_t *)mvcc->shm_base + YQ_SHM_HEADER_SIZE);
+    memory_barrier();
     slots[slot_idx].snapshot_txn = UINT64_MAX;
-    slots[slot_idx].active = 0;
+    memory_barrier();
+    atomic_store(&slots[slot_idx].active, 0);
+    memory_barrier();
     return YQ_OK;
 }
 
@@ -242,26 +236,24 @@ uint64_t yq_mvcc_txn_id(yq_mvcc *mvcc) {
 
 void yq_mvcc_set_base_txn(yq_mvcc *mvcc, uint64_t base_txn) {
     uint32_t b = (uint32_t)base_txn;
-    if (b > mvcc->meta_seq) mvcc->meta_seq = b;
+    uint32_t current_seq = atomic_load(&mvcc->meta_seq);
+    if (b > current_seq) atomic_store(&mvcc->meta_seq, b);
 }
 
 int yq_mvcc_increment_txn_id(yq_mvcc *mvcc, uint64_t *out) {
-    uint32_t old_seq = mvcc->meta_seq;
+    if (!mvcc || !out) return YQ_ERR_INVAL;
+    
+    uint32_t old_seq = atomic_fetch_add(&mvcc->meta_seq, 1);
     uint32_t new_seq = old_seq + 1;
-#if defined(_WIN32)
-    old_seq = InterlockedCompareExchange((volatile LONG *)&mvcc->meta_seq, new_seq, old_seq);
-    while (old_seq != new_seq - 1) {
-        new_seq = old_seq + 1;
-        old_seq = InterlockedCompareExchange((volatile LONG *)&mvcc->meta_seq, new_seq, old_seq);
-    }
-#else
-    old_seq = atomic_fetch_add((volatile atomic_uint *)&mvcc->meta_seq, 1);
-#endif
+    memory_barrier();
     *out = (uint64_t)new_seq;
     return YQ_OK;
 }
 
 static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
+    if (!mvcc || !out) return YQ_ERR_INVAL;
+    if (!mvcc->db_file) return YQ_ERR_INVAL;
+    
     uint8_t buf[4096];
     uint64_t off = (uint64_t)page_idx * mvcc->page_size;
 
@@ -472,13 +464,15 @@ int yq_mvcc_seqlock_read(yq_mvcc *mvcc, void *dst, size_t off, size_t len) {
     if (len > sizeof(tmp)) return YQ_ERR_INVAL;
 
     do {
-        s1 = *seq_ptr;
-        barrier();
+        s1 = atomic_load(seq_ptr);
+        memory_barrier();
         memcpy(tmp, base + off, len);
-        barrier();
-        s2 = *seq_ptr;
+        memory_barrier();
+        s2 = atomic_load(seq_ptr);
     } while ((s1 & 1) || s1 != s2);
 
+    memory_barrier();
     memcpy(dst, tmp, len);
+    memory_barrier();
     return YQ_OK;
 }

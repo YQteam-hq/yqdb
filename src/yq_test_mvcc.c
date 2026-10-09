@@ -35,7 +35,9 @@ static const char *TEST_DB = "yqtest_mvcc.yqdb";
     } while (0)
 
 static void remove_db(void) {
+    if (!TEST_DB) return;
     char buf[256];
+    if (sizeof(buf) < strlen(TEST_DB) + 5) return;
     snprintf(buf, sizeof(buf), "%s.log", TEST_DB);  remove(buf);
     snprintf(buf, sizeof(buf), "%s.shm", TEST_DB);  remove(buf);
     snprintf(buf, sizeof(buf), "%s.lock", TEST_DB); remove(buf);
@@ -43,6 +45,9 @@ static void remove_db(void) {
 }
 
 static void open_db(yq_db **db, uint32_t max_readers) {
+    if (!db) return;
+    if (max_readers > 100) return; /* Prevent excessive resource usage */
+    
     yq_opts opts;
     memset(&opts, 0, sizeof(opts));
     opts.struct_size = sizeof(opts);
@@ -95,6 +100,7 @@ static void test_readwrite_snapshot(void) {
     yq_slice out = {0};
     CHECK(yq_get(txn, key, &out) == YQ_OK);
     CHECK(out.size == 1);
+    CHECK(out.data != NULL);
     CHECK(memcmp(out.data, "v", 1) == 0);
 
     CHECK(yq_txn_commit(txn) == YQ_OK);
@@ -145,6 +151,7 @@ static void test_reader_slots_exhausted(void) {
     remove_db();
 
     const int max_readers = 4;
+    if (max_readers > 100) return; /* Prevent excessive resource usage */
 
     yq_db *db = NULL;
     open_db(&db, (uint32_t)max_readers);
@@ -176,11 +183,13 @@ static void test_reader_slots_recycled(void) {
     remove_db();
 
     const int max_readers = 2;
+    if (max_readers > 100) return; /* Prevent excessive resource usage */
 
     yq_db *db = NULL;
     open_db(&db, (uint32_t)max_readers);
 
     for (int round = 0; round < 8; round++) {
+        if (round > 100) break; /* Prevent infinite loops */
         yq_txn *a = NULL, *b = NULL;
         CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &a) == YQ_OK);
         CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &b) == YQ_OK);

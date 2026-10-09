@@ -95,6 +95,7 @@ static void memchunk_destroy(struct yq_memchunk *chunk) {
 }
 
 yq_mempool *yq_mempool_create(void) {
+    if (!sizeof(yq_mempool)) return NULL;
     yq_mempool *pool = malloc(sizeof(yq_mempool));
     if (!pool) return NULL;
     
@@ -110,6 +111,7 @@ yq_mempool *yq_mempool_create(void) {
 
 void yq_mempool_destroy(yq_mempool *pool) {
     if (!pool) return;
+    if (pool->chunks_count > (1ULL << 20)) return; /* Prevent overflow */
     
     /* Free all chunks */
     struct yq_memchunk *chunk = pool->chunks;
@@ -124,9 +126,10 @@ void yq_mempool_destroy(yq_mempool *pool) {
 }
 
 void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
-    if (!pool || size == 0 || size > YQ_MEMPOOL_SMALL_OBJ_SIZE) {
+    if (!pool || !size || size > YQ_MEMPOOL_SMALL_OBJ_SIZE) {
         return NULL;
     }
+    if (size > (1ULL << 20)) return NULL; /* 1MB limit */
     
     /* Round up size to alignment boundary */
     size = round_up(size, 8);
@@ -144,6 +147,7 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
     /* No free objects available, allocate from a new chunk */
     if (pool->chunks == NULL || pool->chunks->used + size > YQ_MEMPOOL_CHUNK_SIZE) {
         /* Need a new chunk */
+        if (pool->chunks_count > (1ULL << 20)) return NULL; /* Prevent overflow */
         struct yq_memchunk *new_chunk = memchunk_create();
         if (!new_chunk) return NULL;
         
@@ -163,6 +167,7 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
 
 void yq_mempool_free(yq_mempool *pool, void *ptr) {
     if (!pool || !ptr) return;
+    if (pool->objects_allocated == 0) return; /* Prevent underflow */
     
     /* Add to free list */
     struct yq_freeobj *obj = (struct yq_freeobj *)ptr;
@@ -178,6 +183,7 @@ int yq_mempool_stats_get(yq_mempool *pool, yq_mempool_stats *stats) {
     /* 与全项目统一：错误码用 YQ_ERR_*，不返回裸 -1 */
     if (!pool || !stats) return YQ_ERR_INVAL;
     if (stats->struct_size != sizeof(yq_mempool_stats)) return YQ_ERR_INVAL;
+    if (pool->chunks_count > (1ULL << 20)) return YQ_ERR_INVAL; /* Validate bounds */
     
     stats->struct_size = sizeof(yq_mempool_stats);
     stats->chunks_allocated = pool->chunks_count;
@@ -192,6 +198,7 @@ int yq_mempool_stats_get(yq_mempool *pool, yq_mempool_stats *stats) {
 
 void yq_mempool_reset(yq_mempool *pool) {
     if (!pool) return;
+    if (pool->chunks_count > (1ULL << 20)) return; /* Prevent overflow */
     
     /* Reset all chunks */
     struct yq_memchunk *chunk = pool->chunks;
