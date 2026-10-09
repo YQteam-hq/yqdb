@@ -29,6 +29,8 @@ static int win32_error(void) {
 }
 
 yq_file *yq_file_open(const char *path, int create, int rdwr) {
+    if (!path) return NULL;
+    
     yq_file *f = (yq_file *)malloc(sizeof(yq_file));
     if (!f) return NULL;
     f->rdwr = rdwr;
@@ -53,9 +55,21 @@ int yq_file_close(yq_file *f) {
 }
 
 int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
+    if (!f || !buf || len == 0) return YQ_ERR_INVAL;
+    if (len > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
     const uint8_t *p = (const uint8_t *)buf;
     size_t remaining = len;
     uint64_t off = offset;
+
+    /* Add file size validation to prevent overflow */
+    LARGE_INTEGER file_size;
+    if (GetFileSizeEx(f->handle, &file_size)) {
+        uint64_t file_size_bytes = (uint64_t)file_size.QuadPart;
+        if (offset + len > file_size_bytes) {
+            return YQ_ERR_IO;
+        }
+    }
 
     while (remaining > 0) {
         size_t chunk = remaining > 0x7FFFFFFF ? 0x7FFFFFFF : remaining;
@@ -77,9 +91,21 @@ int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
 }
 
 int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
+    if (!f || !buf || len == 0) return YQ_ERR_INVAL;
+    if (len > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
     uint8_t *p = (uint8_t *)buf;
     size_t remaining = len;
     uint64_t off = offset;
+
+    /* Add file size validation to prevent overflow */
+    LARGE_INTEGER file_size;
+    if (GetFileSizeEx(f->handle, &file_size)) {
+        uint64_t file_size_bytes = (uint64_t)file_size.QuadPart;
+        if (offset + len > file_size_bytes) {
+            return YQ_ERR_IO;
+        }
+    }
 
     while (remaining > 0) {
         size_t chunk = remaining > 0x7FFFFFFF ? 0x7FFFFFFF : remaining;
@@ -101,6 +127,7 @@ int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
 }
 
 int yq_file_sync(yq_file *f) {
+    if (!f) return YQ_ERR_INVAL;
     if (!FlushFileBuffers(f->handle)) {
         return win32_error();
     }
@@ -108,6 +135,9 @@ int yq_file_sync(yq_file *f) {
 }
 
 int yq_file_truncate(yq_file *f, uint64_t size) {
+    if (!f) return YQ_ERR_INVAL;
+    if (size > (1ULL << 40)) return YQ_ERR_TOOBIG; /* 1TB limit */
+    
     LARGE_INTEGER pos;
     pos.QuadPart = (LONGLONG)size;
     if (!SetFilePointerEx(f->handle, pos, NULL, FILE_BEGIN)) {
@@ -120,6 +150,7 @@ int yq_file_truncate(yq_file *f, uint64_t size) {
 }
 
 uint64_t yq_file_size(yq_file *f) {
+    if (!f) return 0;
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(f->handle, &sz)) {
         return 0;
@@ -145,6 +176,9 @@ int yq_file_unlock(yq_file *f) {
 }
 
 void *yq_file_mmap(yq_file *f, uint64_t offset, size_t len) {
+    if (!f) return NULL;
+    if (len > (1ULL << 30)) return NULL; /* 1GB limit */
+    
     LARGE_INTEGER off;
     off.QuadPart = 0;
     SetFilePointerEx(f->handle, off, NULL, FILE_END);
@@ -153,6 +187,7 @@ void *yq_file_mmap(yq_file *f, uint64_t offset, size_t len) {
     if (cur.QuadPart < (LONG64)offset + (LONG64)len) {
         LARGE_INTEGER ex;
         ex.QuadPart = (LONG64)offset + (LONG64)len;
+        if (ex.QuadPart > (1ULL << 40)) return NULL; /* 1TB limit */
         SetFilePointerEx(f->handle, ex, NULL, FILE_BEGIN);
         SetEndOfFile(f->handle);
     }
