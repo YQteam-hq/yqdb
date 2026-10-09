@@ -98,10 +98,12 @@ struct yq_mvcc {
 
 int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file,
                  uint32_t max_readers, uint32_t page_size) {
+    if (!out || !db_file || !shm_file || !lock_file) return YQ_ERR_INVAL;
+    if (max_readers == 0 || max_readers > 256) return YQ_ERR_INVAL;
+    if (page_size == 0) page_size = 4096;
+    
     yq_mvcc *mvcc = calloc(1, sizeof(yq_mvcc));
     if (!mvcc) return YQ_ERR_NOMEM;
-
-    if (page_size == 0) page_size = 4096;
 
     mvcc->db_file = db_file;
     mvcc->shm_file = shm_file;
@@ -212,7 +214,9 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
 }
 
 int yq_mvcc_release_snapshot(yq_mvcc *mvcc, int slot_idx) {
+    if (!mvcc) return YQ_ERR_INVAL;
     if (slot_idx < 0 || (uint32_t)slot_idx >= mvcc->max_readers) return YQ_ERR_INVAL;
+    if (!mvcc->shm_base) return YQ_ERR_INVAL;
 
     shm_slot *slots = (shm_slot *)((uint8_t *)mvcc->shm_base + YQ_SHM_HEADER_SIZE);
     slots[slot_idx].snapshot_txn = UINT64_MAX;
