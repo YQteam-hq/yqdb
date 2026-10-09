@@ -72,8 +72,20 @@ void yq_memblk_destroy(yq_memblk *b) {
 
 void *yq_memblk_alloc(yq_memblk *b, size_t size) {
     if (!b || size == 0) return NULL;
+    
+    /* Check for unreasonable allocation sizes */
+    if (size > (1ULL << 30)) { /* 1GB limit */
+        return NULL;
+    }
+    
     size_t aligned = round_up(size, 8);
+    if (aligned < size) { /* Check for overflow in round_up */
+        return NULL;
+    }
+    
     if (b->used + aligned > b->size) return NULL;
+    if (b->used > b->size) return NULL; /* Should never happen but safety check */
+    
     void *ret = b->base + b->used;
     b->used += aligned;
     return ret;

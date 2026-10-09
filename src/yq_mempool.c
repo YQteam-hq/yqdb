@@ -147,12 +147,23 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
         struct yq_memchunk *new_chunk = memchunk_create();
         if (!new_chunk) return NULL;
         
+        /* Validate that the new chunk can accommodate the request */
+        if (size > YQ_MEMPOOL_CHUNK_SIZE) {
+            free(new_chunk);
+            return NULL;
+        }
+        
         new_chunk->next = pool->chunks;
         pool->chunks = new_chunk;
         pool->chunks_count++;
     }
     
     struct yq_memchunk *chunk = pool->chunks;
+    if (chunk->used + size > YQ_MEMPOOL_CHUNK_SIZE) {
+        /* This should not happen due to the check above, but double-check */
+        return NULL;
+    }
+    
     void *ptr = chunk->memory + chunk->used;
     chunk->used += size;
     
