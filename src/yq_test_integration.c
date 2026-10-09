@@ -629,6 +629,57 @@ static void test_stat(void) {
     printf("OK\n");
 }
 
+static void test_nosync(void) {
+    printf("test_nosync... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE | YQ_OPEN_NOSYNC;
+
+    yq_db *db = NULL;
+    int rc = yq_open(TEST_DB, &opts, &db);
+    assert(rc == YQ_OK);
+    assert(db != NULL);
+
+    yq_txn *txn = NULL;
+    rc = yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
+    assert(rc == YQ_OK);
+
+    for (int i = 0; i < 10; i++) {
+        char k[16], v[16];
+        snprintf(k, sizeof(k), "k%02d", i);
+        snprintf(v, sizeof(v), "v%02d", i);
+        yq_slice key = {k, strlen(k)};
+        yq_slice val = {v, strlen(v)};
+        rc = yq_put(txn, key, val, 0);
+        assert(rc == YQ_OK);
+    }
+    rc = yq_txn_commit(txn);
+    assert(rc == YQ_OK);
+
+    rc = yq_txn_begin(db, YQ_TXN_READONLY, &txn);
+    assert(rc == YQ_OK);
+    int count = 0;
+    for (int i = 0; i < 10; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%02d", i);
+        yq_slice key = {k, strlen(k)};
+        yq_slice out = {0};
+        if (yq_get(txn, key, &out) == YQ_OK && out.size > 0) count++;
+    }
+    assert(count == 10);
+
+    rc = yq_txn_commit(txn);
+    assert(rc == YQ_OK);
+    rc = yq_close(db);
+    assert(rc == YQ_OK);
+
+    remove_db();
+    printf("OK\n");
+}
+
 static void test_strerror(void) {
     printf("test_strerror... ");
     assert(strcmp(yq_strerror(YQ_OK), "success") == 0);
@@ -665,6 +716,7 @@ int main(void) {
     test_batch();
     test_batch_api();
     test_stat();
+    test_nosync();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;
