@@ -11,10 +11,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# 没有 enable_testing() 时 add_test() 不会生成 CTestTestfile.cmake，
-# ctest 会报 "No test configuration file found!" 而一个测试都不跑。
-enable_testing()
-
 set(SOURCES
     src/yq_enc.c
     src/yq_memblk.c
@@ -66,10 +62,19 @@ add_executable(yq_test_mvcc src/yq_test_mvcc.c)
 target_link_libraries(yq_test_mvcc yqdb)
 add_test(NAME mvcc_test COMMAND yq_test_mvcc)
 
-# The test binaries report failures through assert(). Release-like build types
-# define NDEBUG, which compiles every assertion away and lets the suite "pass"
-# without verifying anything, so keep assertions enabled for test targets.
-foreach(yq_test_target yq_test_basic yq_test_integration yq_test_seek yq_test_mvcc)
+# Fast end-to-end smoke test: open -> put -> commit -> close -> reopen -> get.
+# It is registered so a broken engine fails the suite on the very first,
+# cheapest check instead of only in the heavier integration test.
+add_executable(yq_test_mini src/yq_test_mini.c)
+target_link_libraries(yq_test_mini yqdb)
+add_test(NAME mini_smoke_test COMMAND yq_test_mini)
+
+# The test binaries report failures through assert()/CHECK. Release-like build
+# types define NDEBUG, which compiles every assert() away and lets the suite
+# "pass" without verifying anything, so keep assertions enabled for test
+# targets. (CHECK from yq_test_check.h is NDEBUG-independent, but assert() is
+# still used across the suite, so the flag stays.)
+foreach(yq_test_target yq_test_basic yq_test_integration yq_test_seek yq_test_mvcc yq_test_mini)
     if(MSVC)
         target_compile_options(${yq_test_target} PRIVATE /UNDEBUG)
     else()
