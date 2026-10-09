@@ -54,6 +54,7 @@ typedef struct pending_op {
     int is_del;
 } pending_op;
 
+typedef struct pindex pindex;
 struct yq_txn {
     yq_db *db;
     uint32_t flags;
@@ -65,6 +66,7 @@ struct yq_txn {
     pending_op *pending;
     size_t pending_count;
     size_t pending_cap;
+    pindex *pindex;   /* key -> latest pending op, or NULL */
 };
 
 struct yq_cur {
@@ -333,7 +335,135 @@ int yq_close(yq_db *db) {
     return YQ_OK;
 }
 
+/*
+ * Pending-op hash index.
+ *
+ * pending_find() used to walk the whole pending list backwards, so every
+ * yq_get() and every YQ_PUT_NOOVERWRITE yq_put() cost O(pending_count):
+ * a transaction doing N puts and N gets spent O(N^2) in memcmp (measured:
+ * 20k gets inside one transaction ~ 455 ms; doubling N quadruples it).
+ *
+ * The pending array is append-only and its entries never move, so an
+ * open-addressing hash from key bytes to the index of the *latest* op with
+ * that key makes lookups O(1) while preserving the "last write wins"
+ * semantics of the old reverse scan. If the table cannot be allocated the
+ * index simply stays disabled and the scan is used instead, so indexing
+ * is a pure performance feature with a safe fallback.
+ */
+typedef struct pindex_slot {
+    uint64_t hash;
+    const uint8_t *key;   /* borrowed from pending[i].key, lives with it */
+    size_t key_len;
+    size_t op_idx;
+    uint8_t used;
+} pindex_slot;
+
+typedef struct pindex {
+    pindex_slot *slots;
+    size_t cap;    /* power of two, 0 when disabled */
+    size_t size;
+} pindex;
+
+#define PINDEX_INIT_CAP 64u
+
+static uint64_t pindex_hash(const uint8_t *key, size_t len) {
+    /* FNV-1a */
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= key[i];
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
+
+static void pindex_destroy(pindex *ix) {
+    free(ix->slots);
+    ix->slots = NULL;
+    ix->cap = 0;
+    ix->size = 0;
+}
+
+/*
+ * Build a bigger, empty table and rehash every used slot of old into it.
+ * Returns the new table (caller owns it) or NULL on allocation failure.
+ */
+static pindex_slot *pindex_rehash(const pindex_slot *old, size_t old_cap, size_t new_cap) {
+    pindex_slot *ns = (pindex_slot *)calloc(new_cap, sizeof(pindex_slot));
+    if (!ns) return NULL;
+
+    for (size_t i = 0; i < old_cap; i++) {
+        if (!old[i].used) continue;
+        size_t idx = (size_t)(old[i].hash & (new_cap - 1));
+        while (ns[idx].used) idx = (idx + 1) & (new_cap - 1);
+        ns[idx] = old[i];
+    }
+    return ns;
+}
+
+static int pindex_grow(pindex *ix) {
+    size_t ncap = ix->cap ? ix->cap * 2 : PINDEX_INIT_CAP;
+    pindex_slot *ns = pindex_rehash(ix->slots, ix->cap, ncap);
+    if (!ns) return YQ_ERR_NOMEM;
+
+    /* Release the old table and publish the new one. */
+    pindex_slot *old_slots = ix->slots;
+    ix->slots = ns;
+    ix->cap = ncap;
+    free(old_slots);
+    return YQ_OK;
+}
+
+/* Record op_idx as the latest op for key (replacing any older entry). */
+static void pindex_put(pindex *ix, const uint8_t *key, size_t key_len, size_t op_idx) {
+    /* Grow on first use (cap == 0) and whenever the load factor demands
+     * it; pindex_grow() picks the initial capacity when cap is 0. */
+    if (ix->cap == 0 || (ix->size + 1) * 10 >= ix->cap * 7) {
+        if (pindex_grow(ix) != YQ_OK) {
+            /* Out of memory: disable rather than fail the write path. */
+            pindex_destroy(ix);
+            return;
+        }
+    }
+    uint64_t h = pindex_hash(key, key_len);
+    size_t idx = (size_t)(h & (ix->cap - 1));
+    while (ix->slots[idx].used) {
+        if (ix->slots[idx].hash == h &&
+            ix->slots[idx].key_len == key_len &&
+            memcmp(ix->slots[idx].key, key, key_len) == 0) {
+            ix->slots[idx].op_idx = op_idx;   /* keep the newest */
+            return;
+        }
+        idx = (idx + 1) & (ix->cap - 1);
+    }
+    ix->slots[idx].used = 1;
+    ix->slots[idx].hash = h;
+    ix->slots[idx].key = key;
+    ix->slots[idx].key_len = key_len;
+    ix->slots[idx].op_idx = op_idx;
+    ix->size++;
+}
+
 static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
+    if (txn->pindex && txn->pindex->cap) {
+        pindex *ix = txn->pindex;
+        uint64_t h = pindex_hash(key.data, key.size);
+        size_t idx = (size_t)(h & (ix->cap - 1));
+        while (ix->slots[idx].used) {
+            if (ix->slots[idx].hash == h &&
+                ix->slots[idx].key_len == key.size &&
+                memcmp(ix->slots[idx].key, key.data, key.size) == 0) {
+                size_t op_idx = ix->slots[idx].op_idx;
+                if (idx_out) *idx_out = op_idx;
+                return &txn->pending[op_idx];
+            }
+            idx = (idx + 1) & (ix->cap - 1);
+        }
+        if (idx_out) *idx_out = (size_t)-1;
+        return NULL;
+    }
+
+    /* Fallback: the original reverse scan (also the path for the rare case
+     * where the index could not be allocated). */
     for (size_t i = txn->pending_count; i > 0; i--) {
         pending_op *op = &txn->pending[i - 1];
         if (op->key_len == key.size && memcmp(op->key, key.data, key.size) == 0) {
@@ -368,6 +498,15 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
         op->val_len = val.size;
     }
     txn->pending_count++;
+
+    /* Keep the key -> latest-op index in step (best effort: on OOM the
+     * index disables itself and pending_find() falls back to the scan). */
+    if (!txn->pindex) {
+        txn->pindex = (pindex *)calloc(1, sizeof(pindex));
+    }
+    if (txn->pindex) {
+        pindex_put(txn->pindex, op->key, op->key_len, txn->pending_count - 1);
+    }
     return YQ_OK;
 }
 
@@ -376,6 +515,11 @@ static void pending_free(yq_txn *txn) {
     for (size_t i = 0; i < txn->pending_count; i++) {
         free(txn->pending[i].key);
         free(txn->pending[i].val);
+    }
+    if (txn->pindex) {
+        pindex_destroy(txn->pindex);
+        free(txn->pindex);
+        txn->pindex = NULL;
     }
     free(txn->pending);
     txn->pending = NULL;

@@ -1550,6 +1550,76 @@ static void test_batch_readonly_rejected(void) {
 }
 
 
+/*
+ * The pending-op hash index must preserve the exact semantics of the old
+ * reverse scan: the newest op for a key wins, tombstones hide older
+ * values, and NOOVERWRITE still sees keys written earlier in the same
+ * transaction.
+ */
+static void test_pending_index_semantics(void) {
+    printf("test_pending_index_semantics... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    yq_txn *txn = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+
+    /* enough keys to force the hash table to grow past its initial 64 */
+    char k[32], v[32];
+    for (int i = 0; i < 500; i++) {
+        snprintf(k, sizeof(k), "k%04d", i);
+        snprintf(v, sizeof(v), "v%04d", i);
+        yq_slice key = { k, strlen(k) }, val = { v, strlen(v) };
+        CHECK_EQ(yq_put(txn, key, val, 0), YQ_OK);
+    }
+
+    yq_slice key = { "k0100", 6 };
+    yq_slice val = { "second", 6 };
+    CHECK_EQ(yq_put(txn, key, val, 0), YQ_OK);          /* overwrite */
+    yq_slice val2 = { "third", 5 };
+    CHECK_EQ(yq_put(txn, key, val2, 0), YQ_OK);         /* overwrite again */
+
+    yq_slice out = {0};
+    CHECK_EQ(yq_get(txn, key, &out), YQ_OK);
+    CHECK(out.size == 5 && memcmp(out.data, "third", 5) == 0);
+
+    /* NOOVERWRITE must still reject a key already written in this txn. */
+    CHECK_EQ(yq_put(txn, key, val, YQ_PUT_NOOVERWRITE), YQ_ERR_EXISTS);
+
+    /* Delete inside the txn hides the older value; re-put revives it. */
+    CHECK_EQ(yq_del(txn, key), YQ_OK);
+    CHECK_EQ(yq_get(txn, key, &out), YQ_ERR_NOTFOUND);
+    yq_slice val3 = { "fourth", 6 };
+    CHECK_EQ(yq_put(txn, key, val3, 0), YQ_OK);
+    CHECK_EQ(yq_get(txn, key, &out), YQ_OK);
+    CHECK(out.size == 6 && memcmp(out.data, "fourth", 6) == 0);
+
+    /* A key never touched in this txn still resolves to NOTFOUND. */
+    yq_slice missing = { "zzzz", 4 };
+    CHECK_EQ(yq_get(txn, missing, &out), YQ_ERR_NOTFOUND);
+
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    /* After the commit the values are visible through a fresh read txn. */
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &txn), YQ_OK);
+    CHECK_EQ(yq_get(txn, key, &out), YQ_OK);
+    CHECK(out.size == 6 && memcmp(out.data, "fourth", 6) == 0);
+    yq_slice untouched = { "k0499", 5 };
+    CHECK_EQ(yq_get(txn, untouched, &out), YQ_OK);
+    CHECK(out.size == 5 && memcmp(out.data, "v0499", 5) == 0);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -1581,6 +1651,7 @@ int main(void) {
     test_checkpoint_large_value();
     test_key_value_limits();
     test_nosync();
+    test_pending_index_semantics();
     test_batch_readonly_rejected();
     test_mempool_size_classes();
 
