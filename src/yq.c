@@ -885,36 +885,49 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
     memcpy(cur_log + plen, ".log", 5);
 
     /*
-     * 先释放旧句柄再 rename。Win32 上 MoveFileExA(MOVEFILE_REPLACE_EXISTING)
-     * 需要先删除目标文件，任何仍持有 <db>.log 的句柄都会挡住这一步（除非它
-     * 共享了 FILE_SHARE_DELETE）。yq_file_open 现在已带 FILE_SHARE_DELETE，
-     * 但先关闭更稳妥，也顺带避免"旧句柄指向被替换掉的 inode"的语义歧义。
+     * 必须先关闭旧日志句柄，再 rename。
      *
-     * 注意：压实后的数据此刻已持久化在新 <db>.log 中，所以从这里往下即使
-     * 出错，磁盘上也不缺数据；要保证的只是别把 db 留在不可用状态。
+     * Win32 上 MoveFileExA(MOVEFILE_REPLACE_EXISTING) 替换目标文件前要先
+     * "删除"它，而只要目标仍被任何句柄打开，删除就以 ERROR_ACCESS_DENIED(5)
+     * 失败——句柄即使带 FILE_SHARE_DELETE 也不行（已用最小化程序实测确认：
+     * 句柄开着 rename 必失败，关掉才成功）。旧注释声称的"除非它共享了
+     * FILE_SHARE_DELETE"并不成立。POSIX 的 rename() 无视已打开的句柄，所以
+     * 这个 bug 只在 Windows 上显形：checkpoint 直接返回 YQ_ERR_IO，main 上
+     * windows/msvc 的 CI 正是挂在 test_checkpoint（yq_test_integration.c）。
+     *
+     * 数据安全方面：压实后的记录此刻已完整写入临时文件并 fsync 过，关闭旧
+     * 句柄不会丢数据；要保证的只是 rename 失败时 db 依然可用。
      */
     yq_wal *old_wal = db->wal;
     db->wal = NULL;
+
+    yq_wal_close(old_wal);
 
     rc = yq_file_rename(tmp_log, cur_log);
     if (rc != YQ_OK) {
         remove(tmp_log);
         /*
-         * 重命名失败：新日志没顶上，但旧日志文件仍在原位且内容完好，
-         * 于是把旧句柄恢复回去继续用，而不是让 db->wal 停在 NULL ——
+         * 重命名失败：新日志没顶上，但旧日志文件仍在原位且内容完好。重新
+         * 打开它挂回 db->wal，而不是让 db->wal 停在 NULL ——
          * yq_wal_append_put() 不做空指针检查，NULL 会在下一个写事务里崩。
+         * 万一重开也失败，数据依然在磁盘上，把库标成待重开（拒绝后续写而
+         * 不是踩 NULL），然后把错误透出去。
          */
-        db->wal = old_wal;
+        yq_wal *reopen_wal = NULL;
+        int reopen_rc = yq_wal_open(&reopen_wal, db->path, db->opts.page_size);
+        if (reopen_rc != YQ_OK) {
+            db->write_enabled = 0;
+            return rc;
+        }
+        db->wal = reopen_wal;
         return rc;
     }
 
     /*
-     * rename 成功：旧句柄现在指向已从目录中消失的文件，必须关掉。
-     * 先把新句柄开进局部变量，确认成功后再交给 db->wal，避免"落盘已成功
-     * 却把库搞成不可用"——reopen 失败时明确报错而不是留下悬空 NULL。
+     * rename 成功：新日志已就位。重开新句柄并确认成功后再交给 db->wal，避免
+     * "落盘已成功却把库搞成不可用"——reopen 失败时明确报错，而不是留下一个
+     * 悬空 NULL。
      */
-    yq_wal_close(old_wal);
-
     yq_wal *new_wal = NULL;
     rc = yq_wal_open(&new_wal, db->path, db->opts.page_size);
     if (rc != YQ_OK) {
