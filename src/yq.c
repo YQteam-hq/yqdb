@@ -707,6 +707,7 @@ int yq_cur_open(yq_txn *txn, yq_cur **out) {
 
 int yq_cur_first(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    if (!c->txn || c->txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     c->at_end = 0; c->state = 0;
     if (c->mt_iter) {
         int rc = yq_memtable_iter_first(c->mt_iter);
@@ -735,6 +736,7 @@ int yq_cur_last(yq_cur *c) {
 
 int yq_cur_next(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    if (!c->txn || c->txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     if (c->at_end) return YQ_ERR_NOTFOUND;
     if (c->state == 1) {
         if (c->mt_iter) {
@@ -759,6 +761,7 @@ int yq_cur_next(yq_cur *c) {
 
 int yq_cur_prev(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    if (!c->txn || c->txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     if (c->at_end) return yq_cur_last(c);
     if (c->state == 2) {
         if (c->bt_cur) {
