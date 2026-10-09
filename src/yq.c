@@ -438,12 +438,17 @@ static void pending_free(yq_txn *txn) {
 }
 
 static int pending_apply(yq_txn *txn) {
+    if (!txn || !txn->db) return YQ_ERR_INVAL;
+    
     yq_db *db = txn->db;
     int rc = YQ_OK;
+    
+    /* Apply all pending operations in order */
     for (size_t i = 0; i < txn->pending_count; i++) {
         pending_op *op = &txn->pending[i];
         yq_slice k;
         yq_slice_set(&k, op->key, op->key_len);
+        
         if (op->is_del) {
             yq_memtable_del(db->memtable, k);
         } else {
@@ -453,6 +458,7 @@ static int pending_apply(yq_txn *txn) {
             if (r != YQ_OK && rc == YQ_OK) rc = r;
         }
     }
+    
     return rc;
 }
 
@@ -460,6 +466,11 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     if (!db || !out) return YQ_ERR_INVAL;
     *out = NULL;
     if (db->closed) return YQ_ERR_CORRUPT;
+    
+    /* Validate transaction flags */
+    if (flags != YQ_TXN_READONLY && flags != YQ_TXN_READWRITE) {
+        return YQ_ERR_INVAL;
+    }
 
     /* A handle opened with YQ_OPEN_READONLY must not hand out write
      * transactions: yq_put()/yq_del() guard on the transaction flag, but

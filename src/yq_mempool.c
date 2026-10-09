@@ -20,6 +20,12 @@
 #endif
 
 /*
+ * Memory pool implementation for efficient allocation of small memory blocks.
+ * Uses a linked list of memory chunks for efficient memory management.
+ * Each chunk is YQ_MEMPOOL_CHUNK_SIZE bytes and can hold multiple allocations.
+ */
+
+/*
  * Memory chunk - contains multiple objects
  */
 struct yq_memchunk {
