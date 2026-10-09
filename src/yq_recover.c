@@ -191,6 +191,7 @@ static int recovery_visitor(void *ctx_arg, uint64_t lsn, uint64_t txn_id, int re
         size_t vpos_rel = 0;
         uint64_t vlen = 0;
         if (yq_varint_decode(payload + kpos + klen, paylen - kpos - klen, &vlen, &vpos_rel) != YQ_OK) return YQ_ERR_CORRUPT;
+        if (vlen > YQ_VAL_MAX_SIZE) return YQ_ERR_CORRUPT;
         size_t vstart = kpos + klen + vpos_rel;
         if (vstart + vlen > paylen) return YQ_ERR_CORRUPT;
         return ctx_push_op(ctx, txn_id, 2, payload + kpos, (size_t)klen,
