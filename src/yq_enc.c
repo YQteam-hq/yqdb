@@ -67,6 +67,11 @@ int yq_varint_decode(const uint8_t *in, size_t inlen, uint64_t *out, size_t *nco
     int shift = 0;
     while (n < inlen) {
         uint8_t b = in[n];
+        if (shift == 63 && (b & 0x7F) > 1) {
+            /* The 10th byte may only carry the single top bit of a uint64.
+             * Anything larger overflows and must be rejected. */
+            return YQ_ERR_INVAL;
+        }
         val |= (uint64_t)(b & 0x7F) << shift;
         n++;
         if ((b & 0x80) == 0) {
