@@ -80,6 +80,9 @@ static struct yq_memchunk *memchunk_create(void) {
         return NULL;
     }
     
+    chunk->memory = p;
+    chunk->used = 0;
+    chunk->next = NULL;
     return chunk;
 }
 
@@ -126,9 +129,9 @@ void yq_mempool_destroy(yq_mempool *pool) {
     free(pool);
 }
 
-void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
-    if (!pool || size == 0 || size > YQ_MEMPOOL_SMALL_OBJ_SIZE) {
-        return NULL;
+int yq_mempool_alloc(yq_mempool *pool, size_t size, void **out) {
+    if (!pool || !out || size == 0 || size > YQ_MEMPOOL_SMALL_OBJ_SIZE) {
+        return YQ_ERR_INVAL;
     }
     
     /* Round up size to alignment boundary */
@@ -141,7 +144,8 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
         pool->free_objects--;
         pool->objects_allocated++;
         memset(obj, 0, size);  /* Zero-fill for security */
-        return obj;
+        *out = obj;
+        return YQ_OK;
     }
     
     /* No free objects available, allocate from a new chunk */
