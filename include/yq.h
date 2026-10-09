@@ -186,12 +186,8 @@ int yq_last_io_error(void);
  * 事务
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* txn_begin 的 flags
- *
- * 注意：YQ_TXN_READONLY 的值就是 0，因此不能写作 `if (flags & YQ_TXN_READONLY)`
- * ——该表达式恒为 0。只读是默认行为，判定必须写成"没有 YQ_TXN_READWRITE 位"。
- */
-#define YQ_TXN_READONLY  0x0000u /* 只读事务，获取 MVCC 快照，绝不阻塞写者 */
+/* txn_begin 的 flags */
+#define YQ_TXN_READONLY  0x0002u /* 只读事务，获取 MVCC 快照，绝不阻塞写者 */
 #define YQ_TXN_READWRITE 0x0001u /* 读写事务，需要写锁；拿不到返回 YQ_ERR_BUSY */
 
 /*
@@ -308,6 +304,67 @@ int yq_sync(yq_db *db);
 
 /* 读取统计信息。struct_size 必须先填 sizeof(yq_stat)。 */
 int yq_db_stat(yq_db *db, yq_stat *out);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Batch operations
+ *
+ * A batch folds many PUT/DELETE calls into a single invocation, removing the
+ * per-call overhead. Every operation still runs inside the caller's
+ * transaction: the whole batch becomes visible on commit and is discarded on
+ * rollback.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* One entry in a batch. */
+typedef struct yq_batch_entry {
+    yq_slice key;      /* Key; size must be 1..1024. */
+    yq_slice val;      /* Value; used by PUT, ignored by DELETE. */
+    uint32_t op;       /* 0 = PUT, 1 = DELETE. */
+    uint32_t flags;    /* PUT mode, see YQ_PUT_*; ignored by DELETE. */
+} yq_batch_entry;
+
+/* Batch result. struct_size is filled by the library. */
+typedef struct yq_batch_result {
+    uint32_t struct_size;    /* Written by the library as sizeof(yq_batch_result). */
+    uint32_t entries_total;  /* Total number of entries in this batch. */
+    uint32_t entries_ok;     /* Number of entries that succeeded. */
+    uint32_t entries_failed; /* Number of entries that failed. */
+    int      first_error;    /* First error code; YQ_OK when all succeeded. */
+    uint32_t reserved[4];    /* Must be zero. */
+} yq_batch_result;
+
+/*
+ * Run a batch of PUT/DELETE operations. Returns YQ_ERR_INVAL when a required
+ * argument is NULL or count is 0. A read-only transaction returns
+ * YQ_ERR_READONLY and a finished transaction returns YQ_ERR_TXN_CLOSED.
+ *
+ * result is optional: pass NULL if you do not need the per-entry statistics.
+ *
+ * Validation happens before any mutation, so a batch is all-or-nothing: if any
+ * entry is invalid, nothing is applied and the return value is YQ_ERR_INVAL.
+ *
+ * Counters are always self-consistent — entries_ok + entries_failed equals
+ * entries_total, including on the rejected-before-apply path, where every
+ * entry is counted as failed rather than silently omitted.
+ */
+int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
+                 yq_batch_result *result);
+
+/*
+ * Delete a batch of keys. Semantics match yq_batch_put; equivalent to wrapping
+ * every key as a DELETE entry.
+ */
+int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_batch_result *result);
+
+/*
+ * Read many keys in one call. values is an output array with at least count
+ * elements, aligned one-to-one with keys. A missed key is written as {NULL, 0}.
+ * *found_count receives the number of keys that were found.
+ * This function always returns YQ_OK unless an argument is invalid or the
+ * transaction has already finished.
+ */
+int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_slice *values, size_t *found_count);
 
 #ifdef __cplusplus
 } /* extern "C" */
