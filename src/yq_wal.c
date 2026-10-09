@@ -120,22 +120,10 @@ static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
     p[16] = (uint8_t)rec_type;
     memcpy(p + 17, &paylen, 4);
 
-    uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
-    memcpy(header_for_crc + 0, p + 0, 8);
-    memcpy(header_for_crc + 8, p + 8, 8);
-    header_for_crc[16] = p[16];
-    memcpy(header_for_crc + 17, p + 17, 4);
-    memset(header_for_crc + 21, 0, 4);
-    memset(header_for_crc + 25, 0, 4);
-
-    uint32_t header_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
-    memcpy(p + 21, &header_crc, 4);
-
-    uint32_t payload_crc = 0;
-    if (paylen > 0 && payload) {
-        payload_crc = yq_crc32c(payload, paylen);
-    }
-    memcpy(p + 25, &payload_crc, 4);
+    /* The header/payload CRC fields are NOT computed here. yq_wal_flush()
+     * recomputes both CRCs from scratch (it is the only place that stamps
+     * them) right before any byte is written to disk, so computing them at
+     * encode time would be dead, redundant work on every append. */
 
     if (paylen > 0 && payload) {
         memcpy(p + YQ_WAL_HEADER_SIZE, payload, paylen);
