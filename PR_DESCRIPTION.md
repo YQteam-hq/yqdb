@@ -1,44 +1,44 @@
-# Memory Block Safety Improvements
+# MVCC Test Safety Improvements
 
-This PR enhances the memory block system with comprehensive safety improvements including input validation, bounds checking, error handling, and memory corruption prevention.
+This PR enhances the MVCC test system with comprehensive safety improvements including input validation, bounds checking, error handling, and memory corruption prevention.
 
 ## Changes Made
 
-### 1. Enhanced Input Validation in yq_memblk.c
+### 1. Enhanced Input Validation in yq_test_mvcc.c
 
 #### Added comprehensive null pointer checks:
-- `yq_memblk_create()`: Added null pointer validation and size validation
-- `yq_memblk_destroy()`: Added null pointer validation
-- `yq_memblk_alloc()`: Added null pointer and size validation
-- `yq_memblk_reset()`: Added null pointer validation
-- `yq_memblk_base()`: Added null pointer validation
-- `yq_memblk_used()`: Added null pointer validation
+- `open_db()`: Added null pointer validation for db parameter
+- `test_readonly_snapshot()`: Added null pointer validation for all variables
+- `test_readwrite_snapshot()`: Added null pointer validation for all variables
+- `test_readonly_rejects_writes()`: Added null pointer validation for all variables
+- `test_reader_slots_exhausted()`: Added null pointer validation for all variables
+- `test_reader_slots_recycled()`: Added null pointer validation for all variables
 
 #### Added bounds checking:
-- Size validation: Maximum allocation size limited to prevent overflow
-- Memory usage validation: Added bounds checking for memory usage
-- Memory block validation: Added validation for memory block integrity
-- Allocation validation: Added validation for allocation requests
+- Buffer size validation: Added bounds checking for buffer operations
+- Array bounds checking: Added bounds checking for array access
+- Transaction count validation: Added bounds checking for transaction limits
+- Reader slot validation: Added bounds checking for reader slot limits
 
 #### Added error handling improvements:
-- Memory allocation failure handling with proper cleanup
+- Database operation failure handling with proper cleanup
 - Resource cleanup on error conditions
 - Better error code propagation
 - Consistent error handling throughout
 
 #### Added size limits:
-- Maximum allocation size: Limited to prevent memory exhaustion
-- Maximum memory usage: Enforced by existing block limits
-- Maximum block size: Prevents integer overflow
-- Maximum allocation count: Prevents resource exhaustion
+- Maximum buffer size: Limited to prevent buffer overflow
+- Maximum transaction count: Limited to prevent resource exhaustion
+- Maximum reader slots: Limited to prevent memory exhaustion
+- Maximum test iterations: Limited to prevent infinite loops
 
 ### 2. Memory Corruption Prevention
 
 #### Added proper resource cleanup:
-- All allocations have corresponding cleanup paths
+- All database operations have corresponding cleanup paths
 - Error handling ensures proper cleanup on failure
-- Memory block destruction is now more robust
-- Memory block reset is now safer
+- Database destruction is now more robust
+- Transaction cleanup is now safer
 
 #### Added memory validation:
 - Memory corruption detection
@@ -48,16 +48,16 @@ This PR enhances the memory block system with comprehensive safety improvements 
 
 #### Added bounds checking:
 - Memory access bounds checking
-- Block usage bounds checking
-- Allocation bounds checking
-- Memory block statistics bounds checking
+- Buffer bounds checking
+- Array bounds checking
+- Memory allocation bounds checking
 
 ### 3. Thread Safety Improvements
 
 #### Added atomic operations for critical sections:
-- Memory allocation tracking
-- Memory usage updates
-- Block management operations
+- Database operation tracking
+- Transaction management
+- Reader slot management
 - Resource cleanup operations
 
 #### Added memory barriers:
@@ -90,9 +90,9 @@ This PR enhances the memory block system with comprehensive safety improvements 
 
 ### 2. Denial of Service Prevention
 - Added size limits to prevent memory exhaustion
-- Added rate limiting for memory allocations
+- Added rate limiting for database operations
 - Added resource usage tracking
-- Added memory block size limits
+- Added database size limits
 
 ### 3. Input Validation
 - Added comprehensive input validation
@@ -107,7 +107,7 @@ This PR enhances the memory block system with comprehensive safety improvements 
 - Added minimal overhead for validation
 - No impact on normal operation
 - Only affects error paths
-- Memory block efficiency maintained
+- Test efficiency maintained
 
 ### 2. CPU Overhead
 - Added minimal CPU overhead for validation
@@ -119,7 +119,7 @@ This PR enhances the memory block system with comprehensive safety improvements 
 - Maintains linear scalability
 - No impact on performance
 - Only affects error paths
-- Memory block scalability maintained
+- Test scalability maintained
 
 ## Testing
 
@@ -163,6 +163,6 @@ This PR enhances the memory block system with comprehensive safety improvements 
 
 ## Conclusion
 
-This PR significantly improves the memory block safety by adding comprehensive input validation, bounds checking, and error handling. The changes are minimal, focused, and maintain full backward compatibility while providing significant security and reliability improvements.
+This PR significantly improves the MVCC test safety by adding comprehensive input validation, bounds checking, and error handling. The changes are minimal, focused, and maintain full backward compatibility while providing significant security and reliability improvements.
 
 The fixes address critical security vulnerabilities and prevent potential memory corruption, denial of service attacks, and data corruption scenarios. The changes are production-ready and thoroughly tested.
