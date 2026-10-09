@@ -263,7 +263,17 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
 
     for (uint16_t i = 0; i < nkeys - split_pos; i++) {
         uint16_t old_offset = get_slot(page, split_pos + i);
-        uint16_t new_offset = (uint16_t)(ps - YQ_PAGE_CRC_SIZE - (i * YQ_PAGE_SLOT_SIZE) - (cell_size(page, split_pos + i, ps)));
+        size_t cell_sz = cell_size(page, split_pos + i, ps);
+        if (cell_sz > ps || i > UINT16_MAX / YQ_PAGE_SLOT_SIZE) {
+            free_page(bt, new_page);
+            return YQ_ERR_CORRUPT;
+        }
+        size_t new_offset_calc = ps - YQ_PAGE_CRC_SIZE - (i * YQ_PAGE_SLOT_SIZE) - cell_sz;
+        if (new_offset_calc > UINT16_MAX) {
+            free_page(bt, new_page);
+            return YQ_ERR_CORRUPT;
+        }
+        uint16_t new_offset = (uint16_t)new_offset_calc;
         set_slot(new_page, i, new_offset);
         uint8_t *src_cell = page + old_offset;
         uint8_t *dst_cell = new_page + new_offset;
@@ -539,11 +549,16 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
             yq_slice median_key;
             uint8_t key_buf[1025];
             size_t key_len = 0;
-            read_key_from_slot(right_page, 0, key_buf, &key_len, bt->page_size);
+            
+            /* First read the key length without copying data */
+            read_key_from_slot(right_page, 0, NULL, &key_len, bt->page_size);
             if (key_len > 1024) {
                 free_page(bt, right_page);
                 return YQ_ERR_CORRUPT;
             }
+            
+            /* Now copy the key data with validated length */
+            read_key_from_slot(right_page, 0, key_buf, &key_len, bt->page_size);
             median_key.data = key_buf;
             median_key.size = key_len;
 

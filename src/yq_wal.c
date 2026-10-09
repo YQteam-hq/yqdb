@@ -173,10 +173,14 @@ int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) 
     if (yq_varint_encode(key.size, klen_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
     if (yq_varint_encode(val.size, vlen_buf, &nv) != YQ_OK) return YQ_ERR_INVAL;
 
-    if (nk > SIZE_MAX - key.size || key.size > SIZE_MAX - nk || 
-        nv > SIZE_MAX - (nk + key.size) || 
-        val.size > SIZE_MAX - (nk + key.size + nv)) return YQ_ERR_TOOBIG;
+    /* Comprehensive overflow checks */
+    if (key.size > SIZE_MAX / 2 || val.size > SIZE_MAX / 2) return YQ_ERR_TOOBIG;
+    if (nk > SIZE_MAX - key.size || key.size > SIZE_MAX - nk) return YQ_ERR_TOOBIG;
+    if (nv > SIZE_MAX - (nk + key.size)) return YQ_ERR_TOOBIG;
+    if (val.size > SIZE_MAX - (nk + key.size + nv)) return YQ_ERR_TOOBIG;
+    
     size_t total = nk + key.size + nv + val.size;
+    if (total > SIZE_MAX / 2) return YQ_ERR_TOOBIG;
 
     uint8_t stack_buf[YQ_WAL_STACK_ENC];
     uint8_t *enc = stack_buf;

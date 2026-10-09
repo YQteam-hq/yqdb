@@ -272,6 +272,18 @@ int yq_file_unlock(yq_file *f) {
 }
 
 void *yq_file_mmap(yq_file *f, uint64_t offset, size_t len) {
+    if (!f || offset > UINT64_MAX - len || len == 0) return NULL;
+    
+    /* Check if file size is known and validate bounds */
+    if (f->size > 0 && offset + len > f->size) {
+        return NULL;
+    }
+    
+    /* Check for reasonable mapping size */
+    if (len > (1ULL << 30)) { /* 1GB limit */
+        return NULL;
+    }
+    
     int prot = f->rdwr ? (PROT_READ | PROT_WRITE) : (PROT_READ);
     void *ptr = mmap(NULL, len, prot, MAP_SHARED, f->fd, (off_t)offset);
     if (ptr == MAP_FAILED) return NULL;
