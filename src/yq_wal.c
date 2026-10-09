@@ -142,6 +142,17 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
     return append_record(wal, txn_id, WAL_TYPE_BEGIN, NULL, 0);
 }
 
+/*
+ * PUT 记录 payload = varint(key_len) + key + varint(val_len) + val。
+ *
+ * key 上限 1024 字节、val 上限 1 GiB（见 yq_put），所以 payload 不适合放在
+ * 栈上定长数组里：旧实现用 uint8_t enc_buf[2048] 且 memcpy 前不做边界检查，
+ * 任何 > ~2KB 的 value 都会写爆栈（ASan: stack-buffer-overflow @ yq_wal.c）。
+ * 这里改为按需小缓冲：小 payload 走栈上的 2 KiB 缓冲避免堆分配，
+ * 大 payload 回退到堆缓冲，两条路径都不再有溢出可能。
+ */
+#define YQ_WAL_SMALL_PAYLOAD 2048
+
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
     if (!wal) return YQ_ERR_INVAL;
     if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
@@ -194,6 +205,7 @@ int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
     uint8_t enc_buf[YQ_WAL_MAX_KEY_SIZE + YQ_WAL_VARINT_MAX];
     size_t nk;
     if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
+    if (key.size > sizeof(enc_buf) - nk) return YQ_ERR_TOOBIG;
     memcpy(enc_buf + nk, key.data, key.size);
 
     return append_record(wal, txn_id, WAL_TYPE_DEL, enc_buf, nk + key.size);
@@ -331,31 +343,113 @@ uint64_t yq_wal_last_lsn(yq_wal *wal) {
     return wal->last_lsn;
 }
 
-int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx) {
-    size_t pos = 0;
-    int rc;
+/*
+ * 扫描用的块缓冲：一次性读入 64 KiB 后在其上解析记录，
+ * 把"每条记录两次 pread + 一次 malloc"降为"每 64 KiB 一次 pread"，
+ * payload 复用同一块交换缓冲。
+ */
+#define YQ_WAL_SCAN_BLOCK (64 * 1024)
 
-    if (from_lsn == 0) {
-        from_lsn = 1;
+typedef struct {
+    uint8_t  block[YQ_WAL_SCAN_BLOCK]; /* 已读入的块缓冲 */
+    size_t   block_len;                /* 块内有效字节数 */
+    size_t   block_pos;                /* 块内已消费字节数 */
+    uint64_t block_off;                /* block[0] 对应的文件偏移 */
+    uint8_t *payload;                  /* payload 交换缓冲（跨记录复用） */
+    size_t   payload_cap;              /* 交换缓冲容量 */
+    uint64_t file_size;                /* 本次扫描的文件大小 */
+} yq_wal_scan_buf;
+
+/*
+ * 从块缓冲取走 n 字节写入 dst。
+ * 返回 1 成功；0 表示文件已到尾部（调用方按截断处理）；-1 表示 IO 错误。
+ */
+static int yq_wal_scan_gather(yq_wal *wal, yq_wal_scan_buf *b, uint8_t *dst, size_t n) {
+    size_t copied = 0;
+
+    while (copied < n) {
+        size_t avail = b->block_len - b->block_pos;
+
+        if (avail == 0) {
+            uint64_t next_off = b->block_off + b->block_len;
+            uint64_t remain;
+            size_t want;
+
+            if (next_off >= b->file_size) return 0;
+
+            remain = b->file_size - next_off;
+            want = YQ_WAL_SCAN_BLOCK;
+            if ((uint64_t)want > remain) want = (size_t)remain;
+
+            if (yq_file_pread(wal->file, b->block, want, next_off) != YQ_OK) {
+                return -1;
+            }
+
+            b->block_off = next_off;
+            b->block_len = want;
+            b->block_pos = 0;
+            avail = want;
+        }
+
+        {
+            size_t chunk = avail < (n - copied) ? avail : (n - copied);
+            memcpy(dst + copied, b->block + b->block_pos, chunk);
+            b->block_pos += chunk;
+            copied += chunk;
+        }
     }
 
-    while (pos + YQ_WAL_HEADER_SIZE <= wal->file_size) {
+    return 1;
+}
+
+static int yq_wal_scan_reserve_payload(yq_wal_scan_buf *b, size_t need) {
+    if (b->payload_cap >= need) return YQ_OK;
+
+    uint8_t *np = (uint8_t *)realloc(b->payload, need);
+    if (!np) return YQ_ERR_NOMEM;
+
+    b->payload = np;
+    b->payload_cap = need;
+    return YQ_OK;
+}
+
+int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx) {
+    yq_wal_scan_buf *b;
+    uint64_t pos = 0;
+    int result = YQ_OK;
+
+    if (!wal) return YQ_ERR_INVAL;
+    if (from_lsn == 0) from_lsn = 1;
+
+    /* 64 KiB 结构体放堆上，避免占用调用栈 */
+    b = (yq_wal_scan_buf *)malloc(sizeof(*b));
+    if (!b) return YQ_ERR_NOMEM;
+    memset(b, 0, sizeof(*b));
+    b->file_size = wal->file_size;
+
+    while (pos + YQ_WAL_HEADER_SIZE <= b->file_size) {
         uint8_t header[YQ_WAL_HEADER_SIZE];
-        rc = yq_file_pread(wal->file, header, YQ_WAL_HEADER_SIZE, pos);
-        if (rc != YQ_OK) return rc;
-
+        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
         uint64_t lsn;
-        memcpy(&lsn, header + 0, 8);
-
         uint64_t txn_id;
-        memcpy(&txn_id, header + 8, 8);
-
-        int rec_type = header[16];
-
+        int rec_type;
         uint32_t payload_len;
+        uint32_t stored_crc;
+        uint32_t calc_crc;
+        const uint8_t *payload = NULL;
+        int g;
+
+        g = yq_wal_scan_gather(wal, b, header, YQ_WAL_HEADER_SIZE);
+        if (g != 1) {
+            if (g < 0) result = YQ_ERR_IO;
+            break;
+        }
+
+        memcpy(&lsn, header + 0, 8);
+        memcpy(&txn_id, header + 8, 8);
+        rec_type = header[16];
         memcpy(&payload_len, header + 17, 4);
 
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
         memcpy(header_for_crc + 0, header + 0, 8);
         memcpy(header_for_crc + 8, header + 8, 8);
         header_for_crc[16] = header[16];
@@ -363,46 +457,61 @@ int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx)
         memset(header_for_crc + 21, 0, 4);
         memset(header_for_crc + 25, 0, 4);
 
-        uint32_t stored_crc;
         memcpy(&stored_crc, header + 21, 4);
-        uint32_t calc_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        calc_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        if (stored_crc != calc_crc) break; /* 坏记录：停止，保持截断语义 */
 
-        if (stored_crc != calc_crc) break;
-
-        uint8_t *payload = NULL;
         if (payload_len > 0) {
-            if (pos + YQ_WAL_HEADER_SIZE + payload_len > wal->file_size) break;
+            uint32_t stored_payload_crc;
+            uint32_t calc_payload_crc;
 
-            payload = malloc(payload_len);
-            if (!payload) return YQ_ERR_NOMEM;
+            /* 记录不完整（尾部截断）：停止 */
+            if (pos + YQ_WAL_HEADER_SIZE + payload_len > b->file_size) break;
 
-            rc = yq_file_pread(wal->file, payload, payload_len, pos + YQ_WAL_HEADER_SIZE);
-            if (rc != YQ_OK) {
-                free(payload);
-                return rc;
+            if (yq_wal_scan_reserve_payload(b, payload_len) != YQ_OK) {
+                result = YQ_ERR_NOMEM;
+                break;
             }
 
-            uint32_t stored_payload_crc;
-            memcpy(&stored_payload_crc, header + 25, 4);
-            uint32_t calc_payload_crc = yq_crc32c(payload, payload_len);
+            if ((uint64_t)payload_len <= YQ_WAL_SCAN_BLOCK) {
+                /* 小 payload：从块缓冲取，通常零系统调用 */
+                g = yq_wal_scan_gather(wal, b, b->payload, payload_len);
+                if (g != 1) {
+                    if (g < 0) result = YQ_ERR_IO;
+                    break;
+                }
+            } else {
+                /* 大 payload：按精确长度一次读取，避免多次小块读 */
+                if (yq_file_pread(wal->file, b->payload, payload_len,
+                                  pos + YQ_WAL_HEADER_SIZE) != YQ_OK) {
+                    result = YQ_ERR_IO;
+                    break;
+                }
+                /* 块缓冲与文件位置脱节，重置以免读到旧数据 */
+                b->block_off = pos + YQ_WAL_HEADER_SIZE + payload_len;
+                b->block_len = 0;
+                b->block_pos = 0;
+            }
 
-            if (stored_payload_crc != calc_payload_crc) {
-                free(payload);
+            memcpy(&stored_payload_crc, header + 25, 4);
+            calc_payload_crc = yq_crc32c(b->payload, payload_len);
+            if (stored_payload_crc != calc_payload_crc) break; /* 坏记录：停止 */
+
+            payload = b->payload;
+        }
+
+        if (lsn >= from_lsn) {
+            int vrc = visit(ctx, lsn, txn_id, rec_type, payload, payload_len);
+            if (vrc != YQ_OK) {
+                result = vrc;
                 break;
             }
         }
 
-        if (lsn >= from_lsn) {
-            rc = visit(ctx, lsn, txn_id, rec_type, payload, payload_len);
-            if (rc != YQ_OK) {
-                free(payload);
-                return rc;
-            }
-        }
-
-        free(payload);
         pos += YQ_WAL_HEADER_SIZE + payload_len;
     }
 
-    return YQ_OK;
+    free(b->payload);
+    free(b);
+    return result;
 }
