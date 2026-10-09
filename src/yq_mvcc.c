@@ -246,22 +246,27 @@ void yq_mvcc_set_base_txn(yq_mvcc *mvcc, uint64_t base_txn) {
 }
 
 int yq_mvcc_increment_txn_id(yq_mvcc *mvcc, uint64_t *out) {
+    if (!mvcc || !out) return YQ_ERR_INVAL;
+    
     uint32_t old_seq = mvcc->meta_seq;
-    uint32_t new_seq = old_seq + 1;
+    uint32_t new_seq;
 #if defined(_WIN32)
-    old_seq = InterlockedCompareExchange((volatile LONG *)&mvcc->meta_seq, new_seq, old_seq);
-    while (old_seq != new_seq - 1) {
+    do {
         new_seq = old_seq + 1;
-        old_seq = InterlockedCompareExchange((volatile LONG *)&mvcc->meta_seq, new_seq, old_seq);
-    }
+        old_seq = InterlockedCompareExchange((volatile LONG *)&mvcc->meta_seq, (LONG)new_seq, (LONG)old_seq);
+    } while (old_seq != new_seq - 1);
 #else
     old_seq = atomic_fetch_add((volatile atomic_uint *)&mvcc->meta_seq, 1);
+    new_seq = old_seq + 1;
 #endif
     *out = (uint64_t)new_seq;
     return YQ_OK;
 }
 
 static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
+    if (!mvcc || !out) return YQ_ERR_INVAL;
+    if (!mvcc->db_file) return YQ_ERR_INVAL;
+    
     uint8_t buf[4096];
     uint64_t off = (uint64_t)page_idx * mvcc->page_size;
 
