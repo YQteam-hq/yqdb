@@ -555,7 +555,7 @@ int yq_del(yq_txn *txn, yq_slice key) {
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
+    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
 
     yq_db *db = txn->db;
     yq_slice empty;
