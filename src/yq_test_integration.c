@@ -1483,6 +1483,73 @@ static void test_mempool_size_classes(void) {
     yq_mempool_destroy(pool);
     printf("OK\n");
 }
+/*
+ * yq_batch_put() must reject a read-only transaction up front, whatever
+ * spelling of "read-only" the caller passed to yq_txn_begin().
+ *
+ * The guard used to test txn->flags & YQ_TXN_READONLY, which only catches
+ * the explicit 0x2 form: a transaction begun with flags == 0 is read-only
+ * as well (anything without the YQ_TXN_READWRITE bit is), and it used to
+ * slip past the guard and be rejected one entry at a time instead.
+ */
+static void test_batch_readonly_rejected(void) {
+    printf("test_batch_readonly_rejected... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    uint8_t kbuf[5] = "key";
+    uint8_t vbuf[4] = "val";
+    yq_batch_entry entries[1];
+    memset(entries, 0, sizeof(entries));
+    entries[0].key.data = kbuf; entries[0].key.size = 3;
+    entries[0].val.data = vbuf; entries[0].val.size = 3;
+    entries[0].op = 0;
+
+    /* Explicit YQ_TXN_READONLY. */
+    yq_txn *txn = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &txn), YQ_OK);
+    yq_batch_result res;
+    memset(&res, 0, sizeof(res));
+    res.struct_size = sizeof(res);
+    CHECK_EQ(yq_batch_put(txn, entries, 1, &res), YQ_ERR_READONLY);
+    CHECK(res.entries_total == 0);
+    CHECK(res.entries_ok == 0);
+    CHECK(res.entries_failed == 0);
+    CHECK(res.first_error == YQ_ERR_READONLY);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    /* Bare 0: also read-only, must be rejected the same way. */
+    CHECK_EQ(yq_txn_begin(db, 0, &txn), YQ_OK);
+    memset(&res, 0, sizeof(res));
+    res.struct_size = sizeof(res);
+    CHECK_EQ(yq_batch_put(txn, entries, 1, &res), YQ_ERR_READONLY);
+    CHECK(res.entries_total == 0);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    /* A write transaction still goes through. */
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+    memset(&res, 0, sizeof(res));
+    res.struct_size = sizeof(res);
+    CHECK_EQ(yq_batch_put(txn, entries, 1, &res), YQ_OK);
+    CHECK(res.entries_total == 1);
+    CHECK(res.entries_ok == 1);
+    CHECK(res.entries_failed == 0);
+    CHECK(res.first_error == YQ_OK);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -1514,6 +1581,7 @@ int main(void) {
     test_checkpoint_large_value();
     test_key_value_limits();
     test_nosync();
+    test_batch_readonly_rejected();
     test_mempool_size_classes();
 
     printf("\n=== ALL TESTS PASSED ===\n");

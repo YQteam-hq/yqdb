@@ -421,13 +421,15 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     txn->state = YQ_TXN_STATE_ACTIVE;
     txn->slot_idx = -1;
     txn->first_write = (flags & YQ_TXN_READWRITE) ? 1 : 0;
-
     /*
-     * YQ_TXN_READONLY is 0, so `flags & YQ_TXN_READONLY` is always false and
-     * cannot be used to select this branch -- read-write must be tested for
-     * and read-only treated as the fallback. Getting this wrong silently
-     * skipped snapshot registration for every read-only transaction, i.e. the
-     * reader table never learned about them and MVCC had nothing to protect.
+     * YQ_TXN_READWRITE is a flag bit, not an enum: the read-only form is
+     * anything without that bit, which covers both YQ_TXN_READONLY (0x2)
+     * and a bare 0. (An older version of this comment claimed READONLY
+     * was 0 and the flag test useless; it is neither.) Test for the
+     * read-write bit and treat read-only as the fallback. Getting this
+     * wrong silently skipped snapshot registration for every read-only
+     * transaction, i.e. the reader table never learned about them and
+     * MVCC had nothing to protect.
      */
     if (!(flags & YQ_TXN_READWRITE)) {
         uint64_t txn_id = 0, root = 0;
@@ -544,7 +546,7 @@ int yq_txn_abort(yq_txn *txn) {
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    /* Read-only is anything without the YQ_TXN_READWRITE bit (see yq_txn_begin). */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
@@ -577,7 +579,7 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 int yq_del(yq_txn *txn, yq_slice key) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    /* Read-only is anything without the YQ_TXN_READWRITE bit (see yq_txn_begin). */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     /* Mirror yq_put(): ERRORS.md 4.2 maps a key outside 1..1024 bytes to
      * YQ_ERR_TOOBIG, not YQ_ERR_INVAL. */
@@ -1088,7 +1090,11 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
         yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
         return YQ_ERR_TXN_CLOSED;
     }
-    if (txn->flags & YQ_TXN_READONLY) {
+    /* YQ_TXN_READWRITE is a flag bit, not an enum value: a read-only
+     * transaction is anything without that bit, which includes both the
+     * YQ_TXN_READONLY flag and a bare 0. Testing the READONLY flag alone
+     * (as this line used to) misses the 0 form and disagrees with yq_put(). */
+    if (!(txn->flags & YQ_TXN_READWRITE)) {
         yq_batch_result_init(result, 0, YQ_ERR_READONLY);
         return YQ_ERR_READONLY;
     }
