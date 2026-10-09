@@ -31,7 +31,10 @@ static size_t round_up(size_t n, size_t align) {
 
 yq_memblk *yq_memblk_create(size_t size) {
     if (size == 0) size = 4096;
+    if (size > SIZE_MAX - 4096) return NULL;
     size = round_up(size, 4096);
+    if (size > SIZE_MAX - 4096) return NULL;
+    
 #ifdef _WIN32
     void *p = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
@@ -64,6 +67,7 @@ void yq_memblk_destroy(yq_memblk *b) {
 #else
             munmap(b->base, b->size);
 #endif
+            b->base = NULL;
         }
         free(b);
         b = next;
@@ -72,21 +76,32 @@ void yq_memblk_destroy(yq_memblk *b) {
 
 void *yq_memblk_alloc(yq_memblk *b, size_t size) {
     if (!b || size == 0) return NULL;
+    if (size > SIZE_MAX - 8) return NULL;
+    if (b->used > SIZE_MAX - 8) return NULL;
+    
     size_t aligned = round_up(size, 8);
     if (b->used + aligned > b->size) return NULL;
+    if (aligned > SIZE_MAX - 8) return NULL;
+    
     void *ret = b->base + b->used;
     b->used += aligned;
     return ret;
 }
 
 void yq_memblk_reset(yq_memblk *b) {
-    if (b) b->used = 0;
+    if (b) {
+        b->used = 0;
+    }
 }
 
 void *yq_memblk_base(yq_memblk *b) {
-    return b ? b->base : NULL;
+    if (!b) return NULL;
+    if (!b->base) return NULL;
+    return b->base;
 }
 
 size_t yq_memblk_used(yq_memblk *b) {
-    return b ? b->used : 0;
+    if (!b) return 0;
+    if (b->used > SIZE_MAX - 1) return 0;
+    return b->used;
 }
