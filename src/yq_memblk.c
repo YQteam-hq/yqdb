@@ -39,7 +39,7 @@ yq_memblk *yq_memblk_create(size_t size) {
     if (p == MAP_FAILED) p = NULL;
 #endif
     if (!p) return NULL;
-    yq_memblk *blk = calloc(1, sizeof(yq_memblk));
+    yq_memblk *blk = malloc(sizeof(yq_memblk));
     if (!blk) {
 #ifdef _WIN32
         VirtualFree(p, 0, MEM_RELEASE);
