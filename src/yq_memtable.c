@@ -105,14 +105,30 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
 
     if (found) {
         mt_entry *e = &mt->entries[idx];
-        if (!e->tombstone) mt->used_bytes -= entry_cost(e->key_len, e->val_len);
+        /*
+         * The key and its entry slot are already charged to used_bytes; only
+         * the value length can change, so reserve/charge just the *net* delta
+         * of the value. The old code charged the full entry_cost here, which
+         * double-counted the key and the entry slot on the tombstone->live
+         * path: used_bytes then grew without bound and the memtable reported
+         * itself "full" long before it really was, spuriously failing puts
+         * that still fit. (The !tombstone update path is unaffected because the
+         * net delta it computes equals entry_cost(new) - entry_cost(old) when
+         * the key and entry slot are unchanged.)
+         */
+        size_t old_val_len = e->tombstone ? 0 : e->val_len;
+        if (val.size > old_val_len) {
+            if (mt->used_bytes + (val.size - old_val_len) > mt->max_bytes)
+                return YQ_ERR_NOMEM;
+        }
         size_t voff = 0;
         int rc = alloc_copy(mt, val.data, val.size, &voff);
         if (rc != YQ_OK) return rc;
         e->val_offset = voff;
         e->val_len = val.size;
         e->tombstone = 0;
-        mt->used_bytes += cost;
+        if (val.size >= old_val_len) mt->used_bytes += (val.size - old_val_len);
+        else mt->used_bytes -= (old_val_len - val.size);
         return YQ_OK;
     }
 

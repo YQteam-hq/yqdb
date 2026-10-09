@@ -79,3 +79,7 @@ endforeach()
 add_executable(yq_test_p4 src/yq_test_p4.c)
 target_link_libraries(yq_test_p4 yqdb)
 add_test(NAME p4_recovery_test COMMAND yq_test_p4)
+
+add_executable(yq_test_memtable src/yq_test_memtable.c)
+target_link_libraries(yq_test_memtable yqdb)
+add_test(NAME memtable_test COMMAND yq_test_memtable)
