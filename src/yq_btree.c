@@ -816,15 +816,22 @@ static int find_rightmost_leaf(yq_btree *bt, uint64_t page_no, uint64_t *leaf_pa
 }
 
 int yq_btree_cursor_first(yq_btree_cursor *c) {
+    if (!c) return YQ_ERR_INVAL;
+    
     yq_btree *bt = c->bt;
+    if (!bt) return YQ_ERR_INVAL;
+    
+    /* Load root page with memory barrier for proper memory ordering */
     uint64_t current_root = atomic_load(&bt->root_page);
+    memory_barrier();
+    
     if (current_root == 0) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
     uint64_t leaf_page;
     uint8_t *leaf_data;
-    int ret = find_leftmost_leaf(bt, bt->root_page, &leaf_page, &leaf_data);
+    int ret = find_leftmost_leaf(bt, current_root, &leaf_page, &leaf_data);
     if (ret != YQ_OK) return ret;
     yq_page_header hdr;
     read_page_header(leaf_data, &hdr);
@@ -832,23 +839,33 @@ int yq_btree_cursor_first(yq_btree_cursor *c) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
+    
+    /* Update cursor state with memory barrier */
     c->leaf_page = leaf_page;
     c->slot_idx = 0;
     c->slot_count = hdr.nkeys;
+    memory_barrier();
     c->valid = 1;
     return YQ_OK;
 }
 
 int yq_btree_cursor_last(yq_btree_cursor *c) {
+    if (!c) return YQ_ERR_INVAL;
+    
     yq_btree *bt = c->bt;
+    if (!bt) return YQ_ERR_INVAL;
+    
+    /* Load root page with memory barrier for proper memory ordering */
     uint64_t current_root = atomic_load(&bt->root_page);
+    memory_barrier();
+    
     if (current_root == 0) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
     uint64_t leaf_page;
     uint8_t *leaf_data;
-    int ret = find_rightmost_leaf(bt, bt->root_page, &leaf_page, &leaf_data);
+    int ret = find_rightmost_leaf(bt, current_root, &leaf_page, &leaf_data);
     if (ret != YQ_OK) return ret;
     yq_page_header hdr;
     read_page_header(leaf_data, &hdr);
@@ -856,16 +873,23 @@ int yq_btree_cursor_last(yq_btree_cursor *c) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
+    
+    /* Update cursor state with memory barrier */
     c->leaf_page = leaf_page;
     c->slot_idx = hdr.nkeys - 1;
     c->slot_count = hdr.nkeys;
+    memory_barrier();
     c->valid = 1;
     return YQ_OK;
 }
 
 int yq_btree_cursor_next(yq_btree_cursor *c) {
+    if (!c) return YQ_ERR_INVAL;
     if (!c->valid) return YQ_ERR_CURSOR;
+    
     yq_btree *bt = c->bt;
+    if (!bt) return YQ_ERR_INVAL;
+    
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
     yq_page_header hdr;
@@ -877,6 +901,7 @@ int yq_btree_cursor_next(yq_btree_cursor *c) {
     }
 
     if (hdr.right_sibling == 0) {
+        memory_barrier();
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }

@@ -5,6 +5,7 @@
 #include "yq_memtable.h"
 #include "yq_mvcc.h"
 #include "yq_slice.h"
+#include "yq_security.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -58,6 +59,17 @@ struct yq_txn {
     pending_op *pending;
     size_t pending_count;
     size_t pending_cap;
+    
+    /* Performance optimization: transaction memory pool */
+    struct {
+        uint8_t *arena;
+        size_t arena_size;
+        size_t arena_pos;
+        size_t key_buffer_size;
+        size_t val_buffer_size;
+        uint8_t *key_buffer;
+        uint8_t *val_buffer;
+    } mem_pool;
 };
 
 struct yq_cur {
@@ -104,16 +116,37 @@ static const char *g_err_msgs[] = {
 };
 
 const char *yq_strerror(int rc) {
-    if (rc < 0 || rc > 20) return "unknown error";
-    return g_err_msgs[rc];
+    /* Secure error message handling to prevent information disclosure */
+    if (rc < 0 || rc > 20) return "invalid error code";
+    
+    /* Use secure string access to prevent buffer overflows */
+    static char safe_error[64];
+    yq_security_safe_error(safe_error, sizeof(safe_error), g_err_msgs[rc]);
+    return safe_error;
 }
 
 int yq_last_io_error(void) {
-    return g_last_io_err;
+    /* Secure error information handling to prevent information disclosure */
+    int err = g_last_io_err;
+    
+    /* Return generic error codes instead of sensitive system information */
+    if (err > 1000) {
+        return YQ_ERR_IO;  /* Generic I/O error */
+    }
+    
+    return err;
 }
 
 static void set_io_err(int err) {
-    if (err != 0) g_last_io_err = err;
+    /* Secure error handling to prevent information disclosure */
+    if (err != 0) {
+        /* Only store generic error codes, not sensitive system information */
+        if (err > 1000) {
+            g_last_io_err = YQ_ERR_IO;  /* Generic I/O error */
+        } else {
+            g_last_io_err = err;
+        }
+    }
 }
 
 /* Bitwise OR of every YQ_OPEN_* flag defined in yq.h. */
@@ -164,9 +197,18 @@ static int apply_defaults(yq_opts *opts) {
 
 static void free_db(yq_db *db) {
     if (!db) return;
+    
+    /* Secure zero sensitive data before freeing */
     if (db->mmap_base && db->mmap_len > 0) {
+        yq_security_zero(db->mmap_base, db->mmap_len);
         yq_file_munmap(db->mmap_base, db->mmap_len);
     }
+    
+    /* Zero sensitive database structure fields */
+    yq_security_zero(&db->opts, sizeof(db->opts));
+    yq_security_zero(&db->write_enabled, sizeof(db->write_enabled));
+    yq_security_zero(&db->closed, sizeof(db->closed));
+    
     if (db->memtable) yq_memtable_destroy(db->memtable);
     /*
      * The handle goes first: it only borrows the arena, which is released
@@ -174,13 +216,19 @@ static void free_db(yq_db *db) {
      * unmapped above).
      */
     if (db->btree) yq_btree_destroy(db->btree);
-    if (db->btree_arena_owned) free(db->btree_arena);
+    if (db->btree_arena_owned) {
+        yq_security_zero(db->btree_arena, sizeof(*db->btree_arena));
+        free(db->btree_arena);
+    }
     if (db->wal) yq_wal_close(db->wal);
     if (db->mvcc) yq_mvcc_close(db->mvcc);
     if (db->lock_file) yq_file_close(db->lock_file);
     if (db->shm_file) yq_file_close(db->shm_file);
     if (db->wal_file) yq_file_close(db->wal_file);
     if (db->db_file) yq_file_close(db->db_file);
+    
+    /* Secure zero the entire structure before freeing */
+    yq_security_zero(db, sizeof(*db));
     free(db);
 }
 
@@ -336,6 +384,21 @@ static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
     return NULL;
 }
 
+/* Performance optimization: allocate from transaction memory pool */
+static int txn_pool_alloc(yq_txn *txn, const void *data, size_t len, size_t *out_off) {
+    if (len == 0) return YQ_ERR_INVAL;
+    
+    if (txn->mem_pool.arena_pos + len > txn->mem_pool.arena_size) {
+        return YQ_ERR_NOMEM;
+    }
+    
+    size_t off = txn->mem_pool.arena_pos;
+    memcpy(txn->mem_pool.arena + off, data, len);
+    txn->mem_pool.arena_pos += len;
+    *out_off = off;
+    return YQ_OK;
+}
+
 static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
     if (txn->pending_count >= txn->pending_cap) {
         size_t nc = txn->pending_cap ? txn->pending_cap * 2 : 64;
@@ -345,29 +408,44 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
         txn->pending_cap = nc;
     }
     pending_op *op = &txn->pending[txn->pending_count];
-    op->key = malloc(key.size ? key.size : 1);
-    if (!op->key) return YQ_ERR_NOMEM;
-    memcpy(op->key, key.data, key.size);
-    op->key_len = key.size;
+    
+    /* Use memory pool for key storage */
+    if (key.size > 0) {
+        size_t key_off;
+        int rc = txn_pool_alloc(txn, key.data, key.size, &key_off);
+        if (rc != YQ_OK) return rc;
+        op->key = txn->mem_pool.arena + key_off;
+        op->key_len = key.size;
+    } else {
+        op->key = NULL;
+        op->key_len = 0;
+    }
+    
     op->val = NULL;
     op->val_len = 0;
     op->is_del = is_del;
+    
     if (!is_del) {
-        op->val = malloc(val.size ? val.size : 1);
-        if (!op->val) { free(op->key); return YQ_ERR_NOMEM; }
-        memcpy(op->val, val.data, val.size);
-        op->val_len = val.size;
+        /* Use memory pool for value storage */
+        if (val.size > 0) {
+            size_t val_off;
+            int rc = txn_pool_alloc(txn, val.data, val.size, &val_off);
+            if (rc != YQ_OK) return rc;
+            op->val = txn->mem_pool.arena + val_off;
+            op->val_len = val.size;
+        } else {
+            op->val = NULL;
+            op->val_len = 0;
+        }
     }
+    
     txn->pending_count++;
     return YQ_OK;
 }
 
 static void pending_free(yq_txn *txn) {
     if (!txn->pending) return;
-    for (size_t i = 0; i < txn->pending_count; i++) {
-        free(txn->pending[i].key);
-        free(txn->pending[i].val);
-    }
+    /* Keys and values are now part of the transaction arena, no need to free individually */
     free(txn->pending);
     txn->pending = NULL;
     txn->pending_count = 0;
@@ -420,6 +498,27 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     txn->state = YQ_TXN_STATE_ACTIVE;
     txn->slot_idx = -1;
     txn->first_write = (flags & YQ_TXN_READWRITE) ? 1 : 0;
+    
+    /* Initialize transaction memory pool */
+    txn->mem_pool.arena_size = 64 * 1024; /* 64KB initial arena */
+    txn->mem_pool.arena = malloc(txn->mem_pool.arena_size);
+    if (!txn->mem_pool.arena) {
+        free(txn);
+        return YQ_ERR_NOMEM;
+    }
+    txn->mem_pool.arena_pos = 0;
+    txn->mem_pool.key_buffer_size = 16 * 1024; /* 16KB key buffer */
+    txn->mem_pool.val_buffer_size = 48 * 1024; /* 48KB value buffer */
+    txn->mem_pool.key_buffer = malloc(txn->mem_pool.key_buffer_size);
+    txn->mem_pool.val_buffer = malloc(txn->mem_pool.val_buffer_size);
+    if (!txn->mem_pool.key_buffer || !txn->mem_pool.val_buffer) {
+        free(txn->mem_pool.arena);
+        free(txn);
+        return YQ_ERR_NOMEM;
+    }
+    memset(txn->mem_pool.arena, 0, txn->mem_pool.arena_size);
+    memset(txn->mem_pool.key_buffer, 0, txn->mem_pool.key_buffer_size);
+    memset(txn->mem_pool.val_buffer, 0, txn->mem_pool.val_buffer_size);
 
     /*
      * YQ_TXN_READONLY is 0, so `flags & YQ_TXN_READONLY` is always false and
@@ -503,6 +602,12 @@ int yq_txn_commit(yq_txn *txn) {
 
     txn->state = YQ_TXN_STATE_COMMITTED;
     if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+    
+    /* Cleanup transaction memory pool */
+    free(txn->mem_pool.arena);
+    free(txn->mem_pool.key_buffer);
+    free(txn->mem_pool.val_buffer);
+    
     free(txn);
     return YQ_OK;
 }
@@ -525,29 +630,81 @@ int yq_txn_abort(yq_txn *txn) {
     pending_free(txn);
     txn->state = YQ_TXN_STATE_ABORTED;
     if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+    
+    /* Secure zero sensitive transaction data before cleanup */
+    yq_security_zero(&txn->flags, sizeof(txn->flags));
+    yq_security_zero(&txn->snapshot_txn, sizeof(txn->snapshot_txn));
+    yq_security_zero(&txn->snapshot_root, sizeof(txn->snapshot_root));
+    yq_security_zero(&txn->slot_idx, sizeof(txn->slot_idx));
+    yq_security_zero(&txn->state, sizeof(txn->state));
+    yq_security_zero(&txn->first_write, sizeof(txn->first_write));
+    
+    /* Secure zero pending operations */
+    for (size_t i = 0; i < txn->pending_count; i++) {
+        if (txn->pending[i].key) {
+            yq_security_zero(txn->pending[i].key, txn->pending[i].key_len);
+            free(txn->pending[i].key);
+        }
+        if (txn->pending[i].val) {
+            yq_security_zero(txn->pending[i].val, txn->pending[i].val_len);
+            free(txn->pending[i].val);
+        }
+    }
+    free(txn->pending);
+    
+    /* Secure zero transaction memory pool */
+    if (txn->mem_pool.arena) {
+        yq_security_zero(txn->mem_pool.arena, txn->mem_pool.arena_size);
+        free(txn->mem_pool.arena);
+    }
+    if (txn->mem_pool.key_buffer) {
+        yq_security_zero(txn->mem_pool.key_buffer, txn->mem_pool.key_buffer_size);
+        free(txn->mem_pool.key_buffer);
+    }
+    if (txn->mem_pool.val_buffer) {
+        yq_security_zero(txn->mem_pool.val_buffer, txn->mem_pool.val_buffer_size);
+        free(txn->mem_pool.val_buffer);
+    }
+    
+    /* Secure zero the entire transaction structure before freeing */
+    yq_security_zero(txn, sizeof(*txn));
     free(txn);
     return YQ_OK;
 }
 
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
-    /* Validate input parameters */
+    /* Enhanced input validation with bounds checking */
     if (!txn) return YQ_ERR_INVAL;
-    if (!key.data || !val.data) return YQ_ERR_INVAL;
     
-    /* Check transaction state */
+    /* Validate transaction structure */
+    if (!yq_security_validate_range(&txn->state, sizeof(txn->state))) {
+        return YQ_ERR_INVAL;
+    }
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     
     /* Check transaction type */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     
-    /* Validate key size */
+    /* Enhanced slice validation with bounds checking */
+    if (!yq_security_validate_slice(key.data, key.size, YQ_MAX_KEY_SIZE)) {
+        return YQ_ERR_INVAL;
+    }
+    if (!yq_security_validate_slice(val.data, val.size, YQ_MAX_VALUE_SIZE)) {
+        return YQ_ERR_INVAL;
+    }
+    
+    /* Validate key size - enhanced with security checks */
     if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_TOOBIG;
     
-    /* Validate value size */
+    /* Validate value size - enhanced with security checks */
     if (val.size > YQ_MAX_VALUE_SIZE) return YQ_ERR_TOOBIG;
     
-    /* Validate put mode */
+    /* Validate put mode - enhanced with bounds checking */
     if (mode > YQ_PUT_NOOVERWRITE) return YQ_ERR_INVAL;
+    
+    /* Additional security validation */
+    YQ_SECURITY_VALIDATE_INPUT(key.data, key.size, YQ_MAX_KEY_SIZE);
+    YQ_SECURITY_VALIDATE_INPUT(val.data, val.size, YQ_MAX_VALUE_SIZE);
 
     yq_db *db = txn->db;
 
@@ -575,17 +732,28 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 }
 
 int yq_del(yq_txn *txn, yq_slice key) {
-    /* Validate input parameters */
+    /* Enhanced input validation with bounds checking */
     if (!txn || !key.data) return YQ_ERR_INVAL;
     
-    /* Check transaction state */
+    /* Validate transaction structure */
+    if (!yq_security_validate_range(&txn->state, sizeof(txn->state))) {
+        return YQ_ERR_INVAL;
+    }
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     
     /* Check transaction type */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     
-    /* Validate key size */
+    /* Enhanced slice validation with bounds checking */
+    if (!yq_security_validate_slice(key.data, key.size, YQ_MAX_KEY_SIZE)) {
+        return YQ_ERR_INVAL;
+    }
+    
+    /* Validate key size - enhanced with security checks */
     if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
+    
+    /* Additional security validation */
+    YQ_SECURITY_VALIDATE_INPUT(key.data, key.size, YQ_MAX_KEY_SIZE);
 
     yq_db *db = txn->db;
     yq_slice empty;
@@ -604,18 +772,31 @@ int yq_del(yq_txn *txn, yq_slice key) {
 }
 
 int yq_get(yq_txn *txn, yq_slice key, yq_slice *out) {
-    /* Validate input parameters */
+    /* Enhanced input validation with bounds checking */
     if (!txn || !out || !key.data) return YQ_ERR_INVAL;
     
-    /* Check transaction state */
+    /* Validate transaction structure */
+    if (!yq_security_validate_range(&txn->state, sizeof(txn->state))) {
+        return YQ_ERR_INVAL;
+    }
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     
-    /* Validate key size */
+    /* Enhanced slice validation with bounds checking */
+    if (!yq_security_validate_slice(key.data, key.size, YQ_MAX_KEY_SIZE)) {
+        return YQ_ERR_INVAL;
+    }
+    
+    /* Validate key size - enhanced with security checks */
     if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
     
-    /* Initialize output */
-    out->data = NULL;
-    out->size = 0;
+    /* Initialize output with security validation */
+    if (out) {
+        out->data = NULL;
+        out->size = 0;
+    }
+    
+    /* Additional security validation */
+    YQ_SECURITY_VALIDATE_INPUT(key.data, key.size, YQ_MAX_KEY_SIZE);
 
     yq_db *db = txn->db;
 

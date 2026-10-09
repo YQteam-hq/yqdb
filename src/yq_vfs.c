@@ -82,7 +82,7 @@ int yq_file_close(yq_file *f) {
 }
 
 int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
-    /* Validate input parameters */
+    /* Enhanced security validation */
     if (!f || !buf || len == 0) {
         return YQ_ERR_INVAL;
     }
@@ -92,13 +92,23 @@ int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
         return YQ_ERR_INVAL;
     }
     
-    /* Validate size bounds */
+    /* Enhanced size bounds validation */
     if (len > YQ_MAX_IO_SIZE) {
+        return YQ_ERR_TOOBIG;
+    }
+    
+    /* Validate offset bounds with security checks */
+    if (offset > f->max_size || len > f->max_size - offset) {
         return YQ_ERR_INVAL;
     }
     
-    /* Validate offset bounds */
-    if (offset > f->max_size || len > f->max_size - offset) {
+    /* Additional security validation for buffer */
+    if (!yq_security_validate_range(buf, len)) {
+        return YQ_ERR_INVAL;
+    }
+    
+    /* Check for integer overflow */
+    if (len > SIZE_MAX - offset) {
         return YQ_ERR_INVAL;
     }
     
@@ -135,7 +145,7 @@ int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
 }
 
 int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
-    /* Validate input parameters */
+    /* Enhanced security validation */
     if (!f || !buf || len == 0) {
         return YQ_ERR_INVAL;
     }
@@ -145,13 +155,23 @@ int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
         return YQ_ERR_INVAL;
     }
     
-    /* Validate size bounds */
+    /* Enhanced size bounds validation */
     if (len > YQ_MAX_IO_SIZE) {
+        return YQ_ERR_TOOBIG;
+    }
+    
+    /* Validate offset bounds with security checks */
+    if (offset > f->max_size || len > f->max_size - offset) {
         return YQ_ERR_INVAL;
     }
     
-    /* Validate offset bounds */
-    if (offset > f->max_size || len > f->max_size - offset) {
+    /* Additional security validation for buffer */
+    if (!yq_security_validate_range(buf, len)) {
+        return YQ_ERR_INVAL;
+    }
+    
+    /* Check for integer overflow */
+    if (len > SIZE_MAX - offset) {
         return YQ_ERR_INVAL;
     }
     
