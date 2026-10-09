@@ -250,8 +250,13 @@ int yq_mvcc_scan_slots(yq_mvcc *mvcc, void (*cb)(void *ctx, int slot_idx, uint64
 }
 
 uint32_t yq_mvcc_active_readers(yq_mvcc *mvcc) {
+    if (!mvcc) return 0;
+    if (!mvcc->shm_base) return 0;
+    if (mvcc->max_readers > 65535u) return 0;
+    
     uint32_t count = 0;
     shm_slot *slots = (shm_slot *)((uint8_t *)mvcc->shm_base + YQ_SHM_HEADER_SIZE);
+    if (!slots) return 0;
 
     for (uint32_t i = 0; i < mvcc->max_readers; i++) {
         if (slots[i].active) count++;
@@ -315,6 +320,9 @@ static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
 }
 
 int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint64_t *free_head, uint64_t *npages, uint64_t *ckpt_lsn) {
+    if (!mvcc) return YQ_ERR_INVAL;
+    if (!txn_id || !root_page || !free_head || !npages || !ckpt_lsn) return YQ_ERR_INVAL;
+
     meta_block meta_a, meta_b;
     int rc_a = read_meta_page(mvcc, 0, &meta_a);
     int rc_b = read_meta_page(mvcc, 1, &meta_b);
@@ -333,6 +341,11 @@ int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint
     } else if (rc_b == YQ_OK) {
         chosen = &meta_b;
     } else {
+        return YQ_ERR_CORRUPT;
+    }
+
+    /* Validate chosen metadata block */
+    if (chosen->magic != ((uint64_t)YQ_MAGIC_0 | ((uint64_t)YQ_MAGIC_1 << 32))) {
         return YQ_ERR_CORRUPT;
     }
 

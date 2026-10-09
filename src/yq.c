@@ -1100,6 +1100,7 @@ int yq_sync(yq_db *db) {
 
 int yq_db_stat(yq_db *db, yq_stat *out) {
     if (!db || !out) return YQ_ERR_INVAL;
+    if (!db->mvcc || !db->wal) return YQ_ERR_INVAL;
     if (out->struct_size != sizeof(yq_stat)) return YQ_ERR_INVAL;
     
     /* Clear the output structure */
@@ -1114,12 +1115,20 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
     int rc = yq_mvcc_meta_read(db->mvcc, &txn_id, &root_page, &free_head, &npages, &ckpt_lsn);
     if (rc != YQ_OK) return rc;
     
-    /* Fill in statistics */
+    /* Validate MVCC metadata */
+    if (txn_id > UINT64_MAX) return YQ_ERR_CORRUPT;
+    if (root_page > UINT64_MAX) return YQ_ERR_CORRUPT;
+    if (free_head > UINT64_MAX) return YQ_ERR_CORRUPT;
+    if (npages > UINT64_MAX) return YQ_ERR_CORRUPT;
+    
+    /* Fill in statistics with validation */
     out->txn_id = txn_id;
     out->npages = npages;
     out->free_pages = free_head;
     out->log_bytes = yq_wal_size(db->wal);
+    if (out->log_bytes > UINT64_MAX) return YQ_ERR_CORRUPT;
     out->active_readers = yq_mvcc_active_readers(db->mvcc);
+    if (out->active_readers > UINT16_MAX) return YQ_ERR_CORRUPT;
     return YQ_OK;
 }
 
