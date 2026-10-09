@@ -154,6 +154,7 @@ static int validate_opts(const yq_opts *opts) {
     if (opts->map_size != 0) {
         uint64_t min_map = 2ull * (opts->page_size ? (uint64_t)opts->page_size : 4096ull);
         if (opts->map_size < min_map) return YQ_ERR_INVAL;
+        if (opts->map_size > SIZE_MAX) return YQ_ERR_INVAL;
     }
 
     for (size_t i = 0; i < sizeof(opts->reserved) / sizeof(opts->reserved[0]); i++) {
@@ -169,9 +170,13 @@ static int apply_defaults(yq_opts *opts) {
     else if (opts->page_size < 4096 || opts->page_size > 65536) return YQ_ERR_INVAL;
     if (opts->sync_mode == YQ_SYNC_DEFAULT) opts->sync_mode = YQ_SYNC_NORMAL;
     if (opts->map_size == 0) opts->map_size = 1024ULL * 1024 * 1024;
+    else if (opts->map_size > SIZE_MAX) return YQ_ERR_INVAL;
     if (opts->memtable_bytes == 0) opts->memtable_bytes = 64ULL * 1024 * 1024;
+    else if (opts->memtable_bytes > SIZE_MAX) return YQ_ERR_INVAL;
     if (opts->log_bytes == 0) opts->log_bytes = 256ULL * 1024 * 1024;
+    else if (opts->log_bytes > SIZE_MAX) return YQ_ERR_INVAL;
     if (opts->max_readers == 0) opts->max_readers = 126;
+    else if (opts->max_readers > 65535u) return YQ_ERR_INVAL;
     return YQ_OK;
 }
 
@@ -194,6 +199,7 @@ static void free_db(yq_db *db) {
     if (db->shm_file) yq_file_close(db->shm_file);
     if (db->wal_file) yq_file_close(db->wal_file);
     if (db->db_file) yq_file_close(db->db_file);
+    memset(db, 0, sizeof(yq_db));  /* Clear sensitive data */
     free(db);
 }
 
@@ -202,6 +208,9 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     if (!opts || !out) return YQ_ERR_INVAL;
     if (!path || path[0] == '\0') return YQ_ERR_INVAL;
     if (opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
+
+    /* Validate path length */
+    if (strlen(path) >= YQ_MAX_PATH) return YQ_ERR_INVAL;
 
     int rc = validate_opts(opts);
     if (rc != YQ_OK) return rc;
@@ -240,6 +249,10 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     db->db_file = yq_file_open(db_path_buf, create_file, db->write_enabled ? 1 : 0);
     if (!db->db_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
 
+    /* Validate file size */
+    uint64_t fsize = yq_file_size(db->db_file);
+    if (fsize > SIZE_MAX) { free_db(db); return YQ_ERR_IO; }
+
     uint64_t fsize = yq_file_size(db->db_file);
 
     /*
@@ -257,6 +270,10 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     memcpy(shm_path + plen, ".shm", 5);
     db->shm_file = yq_file_open(shm_path, 1, 1);
     if (!db->shm_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
+
+    /* Validate SHM file size */
+    uint64_t shm_size = yq_file_size(db->shm_file);
+    if (shm_size > SIZE_MAX) { free_db(db); return YQ_ERR_IO; }
 
     char lock_path[YQ_MAX_PATH];
     memcpy(lock_path, db_path_buf, plen);
