@@ -838,7 +838,6 @@ int yq_cur_close(yq_cur *c) {
  */
 static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
     char tmp_db[YQ_MAX_PATH + 32];
-    char tmp_log[YQ_MAX_PATH + 32];
     char cur_log[YQ_MAX_PATH + 32];
 
     size_t plen = strlen(db->path);
@@ -872,12 +871,13 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
 
     yq_wal_close(tmp);
 
+    /* tmp_db is no longer needed after the WAL write above, so extend it in
+     * place into the "<db>.ckpt-tmp.log" path used for the remove/rename. */
     size_t tmp_len = strlen(tmp_db);
-    memcpy(tmp_log, tmp_db, tmp_len);
-    memcpy(tmp_log + tmp_len, ".log", 5);
+    memcpy(tmp_db + tmp_len, ".log", 5);
 
     if (rc != YQ_OK) {
-        remove(tmp_log);
+        remove(tmp_db);
         return rc;
     }
 
@@ -896,9 +896,9 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
     yq_wal *old_wal = db->wal;
     db->wal = NULL;
 
-    rc = yq_file_rename(tmp_log, cur_log);
+    rc = yq_file_rename(tmp_db, cur_log);
     if (rc != YQ_OK) {
-        remove(tmp_log);
+        remove(tmp_db);
         /*
          * 重命名失败：新日志没顶上，但旧日志文件仍在原位且内容完好，
          * 于是把旧句柄恢复回去继续用，而不是让 db->wal 停在 NULL ——
