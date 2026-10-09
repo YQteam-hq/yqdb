@@ -715,13 +715,7 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
     /* Position the memtable iterator at the first key >= target. */
     int mt_found = 0;
     if (c->mt_iter) {
-        int rc = yq_memtable_iter_first(c->mt_iter);
-        while (rc == YQ_OK) {
-            yq_slice k;
-            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
-            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
-            rc = yq_memtable_iter_next(c->mt_iter);
-        }
+        if (yq_memtable_iter_seek(c->mt_iter, &key) == YQ_OK) mt_found = 1;
     }
 
     /* Merge order visits the memtable first, then the tree; pick the first
@@ -746,13 +740,7 @@ int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
     /* Position the memtable iterator at the first key >= target. */
     int mt_found = 0;
     if (c->mt_iter) {
-        int rc = yq_memtable_iter_first(c->mt_iter);
-        while (rc == YQ_OK) {
-            yq_slice k;
-            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
-            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
-            rc = yq_memtable_iter_next(c->mt_iter);
-        }
+        if (yq_memtable_iter_seek(c->mt_iter, &key) == YQ_OK) mt_found = 1;
     }
 
     /* Success requires an exact match on the iterator chosen by merge order

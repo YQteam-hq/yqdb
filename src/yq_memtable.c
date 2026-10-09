@@ -255,6 +255,43 @@ int yq_memtable_iter_first(yq_memtable_iter *it) {
     return YQ_OK;
 }
 
+/*
+ * Position the iterator at the first *live* entry whose key is >= target
+ * (lower bound). The entry array is kept sorted by yq_memtable_put/del, so a
+ * binary search finds the bound in O(log n); tombstones are then skipped
+ * linearly (usually zero or one step). This replaces the previous
+ * yq_memtable_iter_first() + yq_memtable_iter_next() linear scan, which was
+ * O(n) on every cursor seek and dominated seek latency once the memtable holds
+ * more than a few thousand keys.
+ */
+int yq_memtable_iter_seek(yq_memtable_iter *it, const yq_slice *key) {
+    if (!it || !it->mt || !key) return YQ_ERR_INVAL;
+
+    yq_memtable *mt = it->mt;
+    uint8_t *base = (uint8_t *)yq_memblk_base(mt->arena);
+
+    size_t lo = 0, hi = mt->num_entries;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const mt_entry *e = &mt->entries[mid];
+        yq_slice es;
+        yq_slice_set(&es, base + e->key_offset, e->key_len);
+        int cmp = yq_slice_compare(key, &es);
+        if (cmp <= 0) hi = mid;   /* target <= entries[mid] -> bound is at or before mid */
+        else lo = mid + 1;
+    }
+
+    it->pos = lo;
+    while (it->pos < mt->num_entries && mt->entries[it->pos].tombstone) {
+        it->pos++;
+    }
+
+    if (it->pos >= mt->num_entries) {
+        return YQ_ERR_NOTFOUND;
+    }
+    return YQ_OK;
+}
+
 int yq_memtable_iter_next(yq_memtable_iter *it) {
     if (!it || !it->mt) return YQ_ERR_INVAL;
 

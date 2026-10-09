@@ -19,6 +19,8 @@ int yq_memtable_iter_open(yq_memtable *mt, yq_memtable_iter **out);
 void yq_memtable_iter_close(yq_memtable_iter *it);
 int yq_memtable_iter_first(yq_memtable_iter *it);
 int yq_memtable_iter_next(yq_memtable_iter *it);
+/* Position at the first live entry with key >= target (lower bound). O(log n). */
+int yq_memtable_iter_seek(yq_memtable_iter *it, const yq_slice *key);
 int yq_memtable_iter_last(yq_memtable_iter *it);
 int yq_memtable_iter_prev(yq_memtable_iter *it);
 int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out);
