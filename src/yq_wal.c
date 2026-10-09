@@ -8,13 +8,13 @@
 #define YQ_WAL_HEADER_SIZE 29
 #define YQ_WAL_MAX_KEY_SIZE 1024
 #define YQ_WAL_VARINT_MAX   10
-#define YQ_WAL_STACK_ENC    512
+#define YQ_WAL_STACK_ENC    2048
 
 /*
- * yq_wal_append_put() 的栈缓冲上限：payload 小于它就走栈，否则走堆。
- * 取 2 KiB 是为了覆盖"小 key + 小 value"这一热路径，同时不至于把栈压大。
+ * yq_wal_append_put() 的栈缓冲上限：payload 不超过 YQ_WAL_STACK_ENC (2 KiB)
+ * 就走栈缓冲，否则回退到堆分配。取 2 KiB 是为了覆盖"小 key + 小 value"这一
+ * 热路径，同时不至于把栈压得过大。
  */
-#define YQ_WAL_SMALL_PAYLOAD 2048
 
 #define WAL_TYPE_BEGIN   1
 #define WAL_TYPE_PUT     2
@@ -155,11 +155,9 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
  * key 上限 1024 字节、val 上限 1 GiB（见 yq_put），所以 payload 不适合放在
  * 栈上定长数组里：旧实现用 uint8_t enc_buf[2048] 且 memcpy 前不做边界检查，
  * 任何 > ~2KB 的 value 都会写爆栈（ASan: stack-buffer-overflow @ yq_wal.c）。
- * 这里改为按需小缓冲：小 payload 走栈上的 2 KiB 缓冲避免堆分配，
+ * 这里改为按需小缓冲：小 payload 走 YQ_WAL_STACK_ENC (2 KiB) 栈缓冲避免堆分配，
  * 大 payload 回退到堆缓冲，两条路径都不再有溢出可能。
  */
-#define YQ_WAL_SMALL_PAYLOAD 2048
-
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
     if (!wal) return YQ_ERR_INVAL;
     if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
