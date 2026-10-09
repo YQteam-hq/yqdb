@@ -7,6 +7,7 @@
 #include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -39,6 +40,8 @@ struct yq_db {
     yq_memtable *memtable;
     void *mmap_base;
     size_t mmap_len;
+    void *btree_arena;       /* set only when yq_open malloc'd it */
+    int btree_arena_owned;
     int write_enabled;
     int closed;
 };
@@ -77,9 +80,9 @@ struct yq_cur {
 #define YQ_TXN_STATE_ABORTED   2
 
 int yq_version(int *major, int *minor, int *patch) {
-    if (major) *major = 1;
-    if (minor) *minor = 0;
-    if (patch) *patch = 0;
+    if (major) *major = YQ_VERSION_MAJOR;
+    if (minor) *minor = YQ_VERSION_MINOR;
+    if (patch) *patch = YQ_VERSION_PATCH;
     return YQ_OK;
 }
 
@@ -120,6 +123,41 @@ static void set_io_err(int err) {
     if (err != 0) g_last_io_err = err;
 }
 
+/* Bitwise OR of every YQ_OPEN_* flag defined in yq.h. */
+#define YQ_OPEN_KNOWN_FLAGS 0x0000001Fu
+
+/*
+ * Enforce the contract documented on yq_opts before any file is touched.
+ * Everything rejected here is stated as a hard requirement in yq.h, and all of
+ * it used to be accepted silently: a non power-of-two page_size corrupts page
+ * arithmetic, a too-small map_size leaves the meta pages outside the mapping,
+ * and a non-zero reserved[] breaks forward compatibility (those words are
+ * reserved so a future version can give them meaning).
+ */
+static int validate_opts(const yq_opts *opts) {
+    if (opts->flags & ~YQ_OPEN_KNOWN_FLAGS) return YQ_ERR_INVAL;
+
+    if (opts->page_size != 0) {
+        if (opts->page_size < 4096 || opts->page_size > 65536) return YQ_ERR_INVAL;
+        if ((opts->page_size & (opts->page_size - 1)) != 0) return YQ_ERR_INVAL;
+    }
+
+    if (opts->sync_mode > YQ_SYNC_FULL) return YQ_ERR_INVAL;
+    if (opts->max_readers > 65535u) return YQ_ERR_INVAL;
+
+    /* The two meta pages live at the start of the mapping. */
+    if (opts->map_size != 0) {
+        uint64_t min_map = 2ull * (opts->page_size ? (uint64_t)opts->page_size : 4096ull);
+        if (opts->map_size < min_map) return YQ_ERR_INVAL;
+    }
+
+    for (size_t i = 0; i < sizeof(opts->reserved) / sizeof(opts->reserved[0]); i++) {
+        if (opts->reserved[i] != 0) return YQ_ERR_INVAL;
+    }
+
+    return YQ_OK;
+}
+
 static int apply_defaults(yq_opts *opts) {
     if (opts->page_size == 0) opts->page_size = 4096;
     else if (opts->page_size < 4096 || opts->page_size > 65536) return YQ_ERR_INVAL;
@@ -137,8 +175,13 @@ static void free_db(yq_db *db) {
         yq_file_munmap(db->mmap_base, db->mmap_len);
     }
     if (db->memtable) yq_memtable_destroy(db->memtable);
-    if (db->btree) {
-    }
+    /*
+     * The handle goes first: it only borrows the arena, which is released
+     * below when yq_open allocated it (otherwise it is the mmap window
+     * unmapped above).
+     */
+    if (db->btree) yq_btree_destroy(db->btree);
+    if (db->btree_arena_owned) free(db->btree_arena);
     if (db->wal) yq_wal_close(db->wal);
     if (db->mvcc) yq_mvcc_close(db->mvcc);
     if (db->lock_file) yq_file_close(db->lock_file);
@@ -153,9 +196,19 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     if (!opts || opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
     if (!path || path[0] == '\0') return YQ_ERR_INVAL;
 
-    yq_opts def = *opts;
-    int rc = apply_defaults(&def);
+    int rc = validate_opts(opts);
     if (rc != YQ_OK) return rc;
+
+    yq_opts def = *opts;
+    rc = apply_defaults(&def);
+    if (rc != YQ_OK) return rc;
+
+    /* YQ_OPEN_NOSYNC is documented as "equivalent to YQ_SYNC_OFF, for
+     * discardable data": honour it by forcing the strongest no-sync mode.
+     * This takes precedence over any explicit sync_mode the caller passed. */
+    if (def.flags & YQ_OPEN_NOSYNC) {
+        def.sync_mode = YQ_SYNC_OFF;
+    }
 
     yq_db *db = calloc(1, sizeof(yq_db));
     if (!db) return YQ_ERR_NOMEM;
@@ -175,6 +228,16 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     if (!db->db_file) { set_io_err(errno); free_db(db); return YQ_ERR_IO; }
 
     uint64_t fsize = yq_file_size(db->db_file);
+
+    /*
+     * YQ_OPEN_EXCL: fail if the database already exists. Checked before any
+     * auxiliary file is created so a rejected open leaves nothing behind, and
+     * before recovery runs so an existing database is never modified.
+     */
+    if ((def.flags & YQ_OPEN_EXCL) && fsize > 0) {
+        free_db(db);
+        return YQ_ERR_EXISTS;
+    }
 
     char shm_path[1024];
     snprintf(shm_path, sizeof(shm_path), "%s.shm", db_path_buf);
@@ -228,10 +291,16 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
         yq_btree_set_root(db->btree, root_page);
     } else {
         void *arena = db->mmap_base;
-        if (!arena) arena = malloc(def.map_size);
-        if (!arena) { free_db(db); return YQ_ERR_NOMEM; }
+        if (!arena) {
+            /* No file contents to map: the tree lives in a heap arena that
+             * free_db() must release, since nothing else owns it. */
+            arena = malloc(def.map_size);
+            if (!arena) { free_db(db); return YQ_ERR_NOMEM; }
+            db->btree_arena = arena;
+            db->btree_arena_owned = 1;
+        }
         db->btree = yq_btree_create(arena, def.page_size);
-        if (!db->btree) { if (!db->mmap_base) free(arena); free_db(db); return YQ_ERR_NOMEM; }
+        if (!db->btree) { free_db(db); return YQ_ERR_NOMEM; }
     }
 
     db->memtable = yq_memtable_create((size_t)def.memtable_bytes);
@@ -329,6 +398,12 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     *out = NULL;
     if (db->closed) return YQ_ERR_CORRUPT;
 
+    /* A handle opened with YQ_OPEN_READONLY must not hand out write
+     * transactions: yq_put()/yq_del() guard on the transaction flag, but
+     * nothing stopped yq_txn_begin(YQ_TXN_READWRITE) on such a handle, and
+     * the commit path then writes the meta pages and the log regardless. */
+    if ((flags & YQ_TXN_READWRITE) && !db->write_enabled) return YQ_ERR_READONLY;
+
     yq_txn *txn = calloc(1, sizeof(yq_txn));
     if (!txn) return YQ_ERR_NOMEM;
 
@@ -339,19 +414,18 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     txn->first_write = (flags & YQ_TXN_READWRITE) ? 1 : 0;
 
     /*
-     * YQ_TXN_READONLY is 0x0000, so `flags & YQ_TXN_READONLY` is always 0 and
-     * can never be used to select this branch. Read-only is the default and
-     * must be recognised as "no YQ_TXN_READWRITE bit": otherwise a read-only
-     * transaction silently ends up with no MVCC snapshot at all (slot_idx
-     * stays -1), so it is never registered as a reader and is invisible to
-     * yq_mvcc_reclaim_watermark().
+     * YQ_TXN_READONLY is 0, so `flags & YQ_TXN_READONLY` is always false and
+     * cannot be used to select this branch -- read-write must be tested for
+     * and read-only treated as the fallback. Getting this wrong silently
+     * skipped snapshot registration for every read-only transaction, i.e. the
+     * reader table never learned about them and MVCC had nothing to protect.
      */
     if (!(flags & YQ_TXN_READWRITE)) {
         uint64_t txn_id = 0, root = 0;
         yq_mvcc_meta_read(db->mvcc, &txn_id, &root, NULL, NULL, NULL);
         int rc = yq_mvcc_acquire_snapshot(db->mvcc, txn_id, root, &txn->snapshot_txn, &txn->snapshot_root, &txn->slot_idx);
         if (rc != YQ_OK) { free(txn); return rc; }
-    } else if (flags & YQ_TXN_READWRITE) {
+    } else {
         int got = 0;
         int rc = yq_mvcc_elect_writer(db->mvcc, (int)db->opts.lock_timeout_ms, &got);
         if (rc != YQ_OK) { free(txn); return rc; }
@@ -437,7 +511,7 @@ int yq_txn_abort(yq_txn *txn) {
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the absence of YQ_TXN_READWRITE. */
+    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
@@ -470,7 +544,7 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 int yq_del(yq_txn *txn, yq_slice key) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the absence of YQ_TXN_READWRITE. */
+    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
 
@@ -856,7 +930,10 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
 
 int yq_checkpoint(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
-    if (!db->write_enabled) return YQ_ERR_CORRUPT;
+    /* ERRORS.md: YQ_ERR_READONLY is "a read-only handle ... attempts to
+     * write". YQ_ERR_CORRUPT means a CRC/format failure instead, and
+     * reporting corruption for a healthy read-only open is misleading. */
+    if (!db->write_enabled) return YQ_ERR_READONLY;
 
     /*
      * 先 flush 再取 wal_sz：yq_wal_size() 读的是文件实际长度，尚未 flush 的
@@ -901,7 +978,8 @@ int yq_checkpoint(yq_db *db) {
 
 int yq_sync(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
-    if (!db->write_enabled) return YQ_ERR_CORRUPT;
+    /* See the note in yq_checkpoint(). */
+    if (!db->write_enabled) return YQ_ERR_READONLY;
     yq_wal_flush(db->wal);
     if (db->db_file) yq_file_sync(db->db_file);
     return YQ_OK;
@@ -922,5 +1000,149 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
     out->free_pages = free_head;
     out->log_bytes = yq_wal_size(db->wal);
     out->active_readers = yq_mvcc_active_readers(db->mvcc);
+    return YQ_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Batch operations
+ *
+ * yq_batch_put() applies a heterogeneous list of PUT/DELETE operations in one
+ * call. It validates every entry up front so a malformed batch is rejected
+ * before any mutation reaches the memtable; the caller still owns the single
+ * transaction, so the batch becomes visible atomically on commit.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * 统计口径（评审要求保证自洽）：
+ *   entries_ok + entries_failed == entries_total 恒成立。
+ * 校验阶段失败时整批不落盘，此时把这批全部计为 failed（而不是只 failed++ 
+ * 却把 total 固定成 count），否则调用方会从 "total=5, ok=0, failed=1" 
+ * 误以为另外 4 条成功了。
+ */
+static void yq_batch_result_init(yq_batch_result *result, uint32_t total, int first_error) {
+    if (!result) return;
+    result->struct_size = sizeof(yq_batch_result);
+    result->entries_total = total;
+    result->entries_ok = 0;
+    result->entries_failed = 0;
+    result->first_error = first_error;
+    memset(result->reserved, 0, sizeof(result->reserved));
+}
+
+int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
+                 yq_batch_result *result) {
+    /* result 可选：不传就不上报统计（与头文件契约一致） */
+    if (!txn || !entries || count == 0) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+    if (txn->state != YQ_TXN_STATE_ACTIVE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
+        return YQ_ERR_TXN_CLOSED;
+    }
+    if (txn->flags & YQ_TXN_READONLY) {
+        yq_batch_result_init(result, 0, YQ_ERR_READONLY);
+        return YQ_ERR_READONLY;
+    }
+    /* count 超过 uint32 时统计字段无法表达，提前拒绝而不是静默截断 */
+    if (count > 0xFFFFFFFFu) {
+        yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
+        return YQ_ERR_TOOBIG;
+    }
+
+    uint32_t total = (uint32_t)count;
+    yq_batch_result_init(result, total, YQ_OK);
+
+    /* 第一遍：先校验全部 entry，避免半批写入 */
+    int bad = 0;
+    for (size_t i = 0; i < count; i++) {
+        const yq_batch_entry *e = &entries[i];
+        int entry_bad = 0;
+        if (e->key.data == NULL || e->key.size == 0 || e->key.size > 1024) {
+            entry_bad = 1;
+        } else if (e->op == 0 && e->val.data == NULL && e->val.size != 0) {
+            entry_bad = 1;
+        }
+        if (entry_bad) bad = 1;
+    }
+
+    if (bad) {
+        /* 整批拒绝（未做任何变更）：全部计入 failed，保持 total == ok + failed */
+        if (result) {
+            result->first_error = YQ_ERR_INVAL;
+            result->entries_ok = 0;
+            result->entries_failed = total;
+        }
+        return YQ_ERR_INVAL;
+    }
+
+    /* 第二遍：执行。逐条记录结果，不做提前返回，保证计数完整。 */
+    int first_error = YQ_OK;
+    uint32_t ok = 0, failed = 0;
+    for (size_t i = 0; i < count; i++) {
+        const yq_batch_entry *e = &entries[i];
+        int rc = (e->op == 0) ? yq_put(txn, e->key, e->val, e->flags)
+                              : yq_del(txn, e->key);
+        if (rc == YQ_OK) {
+            ok++;
+        } else {
+            failed++;
+            if (first_error == YQ_OK) first_error = rc;
+        }
+    }
+
+    if (result) {
+        result->entries_ok = ok;
+        result->entries_failed = failed;
+        result->first_error = first_error;
+    }
+    return first_error;
+}
+
+int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_batch_result *result) {
+    if (!txn || !keys || count == 0) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+    /* count * sizeof(*entries) 为 size_t 运算，先挡回绕再分配 */
+    if (count > SIZE_MAX / sizeof(yq_batch_entry)) {
+        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
+        return YQ_ERR_NOMEM;
+    }
+
+    yq_batch_entry *entries = malloc(count * sizeof(*entries));
+    if (!entries) {
+        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
+        return YQ_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+        entries[i].key = keys[i];
+        entries[i].val = (yq_slice){NULL, 0};
+        entries[i].op = 1; /* DELETE */
+        entries[i].flags = 0;
+    }
+
+    int rc = yq_batch_put(txn, entries, count, result);
+    free(entries);
+    return rc;
+}
+
+int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_slice *values, size_t *found_count) {
+    if (!txn || !keys || count == 0 || !values || !found_count) return YQ_ERR_INVAL;
+    if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+
+    size_t found = 0;
+    for (size_t i = 0; i < count; i++) {
+        int rc = yq_get(txn, keys[i], &values[i]);
+        if (rc == YQ_OK) {
+            found++;
+        } else {
+            values[i].data = NULL;
+            values[i].size = 0;
+        }
+    }
+    *found_count = found;
     return YQ_OK;
 }
