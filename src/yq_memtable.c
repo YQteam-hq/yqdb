@@ -3,6 +3,7 @@
 #include "yq_enc.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define TOMBSTONE_VAL 0xFF
 
@@ -17,10 +18,10 @@ typedef struct mt_entry {
 struct yq_memtable {
     yq_memblk *arena;
     mt_entry *entries;
-    size_t num_entries;
-    size_t cap_entries;
+    volatile atomic_size_t num_entries;
+    volatile atomic_size_t cap_entries;
     size_t max_bytes;
-    size_t used_bytes;
+    volatile atomic_size_t used_bytes;
 };
 
 struct yq_memtable_iter {
@@ -112,19 +113,22 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
         e->val_offset = voff;
         e->val_len = val.size;
         e->tombstone = 0;
-        mt->used_bytes += cost;
+        atomic_fetch_add(&mt->used_bytes, cost);
         return YQ_OK;
     }
 
-    if (mt->num_entries >= mt->cap_entries) {
-        size_t new_cap = mt->cap_entries * 2;
-        if (new_cap < mt->cap_entries || new_cap > SIZE_MAX / sizeof(mt_entry)) {
+    size_t num_entries = atomic_load(&mt->num_entries);
+    size_t cap_entries = atomic_load(&mt->cap_entries);
+    
+    if (num_entries >= cap_entries) {
+        size_t new_cap = cap_entries * 2;
+        if (new_cap < cap_entries || new_cap > SIZE_MAX / sizeof(mt_entry)) {
             return YQ_ERR_NOMEM;
         }
         mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
         if (!new_entries) return YQ_ERR_NOMEM;
         mt->entries = new_entries;
-        mt->cap_entries = new_cap;
+        atomic_store(&mt->cap_entries, new_cap);
     }
 
     size_t koff = 0, voff = 0;
@@ -133,10 +137,11 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
     rc = alloc_copy(mt, val.data, val.size, &voff);
     if (rc != YQ_OK) return rc;
 
-    for (size_t i = mt->num_entries; i > idx; i--) {
+    size_t num_entries = atomic_load(&mt->num_entries);
+    for (size_t i = num_entries; i > idx; i--) {
         mt->entries[i] = mt->entries[i - 1];
     }
-    mt->num_entries++;
+    atomic_store(&mt->num_entries, num_entries + 1);
 
     mt_entry *e = &mt->entries[idx];
     e->key_offset = koff;
