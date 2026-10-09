@@ -1,11 +1,16 @@
 #include "yq.h"
 #include "yq_vfs.h"
 #include "yq_btree.h"
+#include "yq_btree_optimized.h"
 #include "yq_wal.h"
 #include "yq_memtable.h"
 #include "yq_mvcc.h"
 #include "yq_slice.h"
 #include "yq_security.h"
+#include "yq_mempool.h"
+#include "yq_cache.h"
+#include "yq_batch.h"
+#include "yq_frag.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -38,6 +43,25 @@ struct yq_db {
     int btree_arena_owned;
     int write_enabled;
     int closed;
+    
+    /* Performance optimization components */
+    yq_mempool *mempool;             /* Memory pool for efficient allocation */
+    yq_cache *cache;                 /* Cache for frequently accessed data */
+    yq_batch *batch;                 /* Batch operations for improved performance */
+    yq_frag_analyzer *frag_analyzer; /* Memory fragmentation analyzer */
+    yq_btree *btree_optimized;       /* Optimized B+Tree for faster operations */
+    
+    /* Performance statistics */
+    struct {
+        uint64_t total_operations;
+        uint64_t cache_hits;
+        uint64_t cache_misses;
+        uint64_t batch_operations;
+        uint64_t defrag_operations;
+        uint64_t memory_allocated;
+        uint64_t memory_freed;
+        double average_latency;
+    } perf_stats;
 };
 
 typedef struct pending_op {
@@ -227,6 +251,13 @@ static void free_db(yq_db *db) {
     if (db->wal_file) yq_file_close(db->wal_file);
     if (db->db_file) yq_file_close(db->db_file);
     
+    /* Clean up performance optimization components */
+    if (db->mempool) yq_mempool_destroy(db->mempool);
+    if (db->cache) yq_cache_destroy(db->cache);
+    if (db->batch) yq_batch_destroy(db->batch);
+    if (db->frag_analyzer) yq_frag_analyzer_destroy(db->frag_analyzer);
+    if (db->btree_optimized) yq_btree_destroy(db->btree_optimized);
+    
     /* Secure zero the entire structure before freeing */
     yq_security_zero(db, sizeof(*db));
     free(db);
@@ -260,6 +291,16 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
 
     db->opts = def;
     db->write_enabled = !(def.flags & YQ_OPEN_READONLY);
+    
+    /* Initialize performance optimization components */
+    db->mempool = NULL;
+    db->cache = NULL;
+    db->batch = NULL;
+    db->frag_analyzer = NULL;
+    db->btree_optimized = NULL;
+    
+    /* Initialize performance statistics */
+    memset(&db->perf_stats, 0, sizeof(db->perf_stats));
 
     char db_path_buf[1024];
     size_t plen = strlen(path);
@@ -354,6 +395,39 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
         rc = yq_recover(db->wal, db->memtable);
         if (rc != YQ_OK) { free_db(db); return rc; }
     }
+
+    /* Initialize performance optimization components */
+    db->mempool = yq_mempool_create(1024 * 1024, 64 * 1024); /* 1MB slab size, 64KB cache */
+    if (!db->mempool) { free_db(db); return YQ_ERR_NOMEM; }
+    
+    db->cache = yq_cache_create(1000, YQ_CACHE_POLICY_LRU); /* 1000 entries, LRU policy */
+    if (!db->cache) { free_db(db); return YQ_ERR_NOMEM; }
+    
+    yq_batch_config batch_config = {
+        .max_batch_size = 1000,
+        .max_key_size = 1024,
+        .max_value_size = 1024 * 1024,
+        .max_retries = 3,
+        .timeout_ms = 5000,
+        .atomic = true,
+        .ordered = true,
+        .auto_commit = true,
+        .auto_rollback = true,
+        .enable_stats = true,
+        .enable_retry = true,
+        .enable_validation = true,
+        .thread_count = 1,
+        .queue_size = 10000,
+        .memory_limit = 100 * 1024 * 1024
+    };
+    db->batch = yq_batch_create(&batch_config);
+    if (!db->batch) { free_db(db); return YQ_ERR_NOMEM; }
+    
+    db->frag_analyzer = yq_frag_analyzer_create(def.map_size);
+    if (!db->frag_analyzer) { free_db(db); return YQ_ERR_NOMEM; }
+    
+    db->btree_optimized = yq_btree_create(db->mmap_base ? db->mmap_base : db->btree_arena, def.page_size);
+    if (!db->btree_optimized) { free_db(db); return YQ_ERR_NOMEM; }
 
     *out = db;
     return YQ_OK;

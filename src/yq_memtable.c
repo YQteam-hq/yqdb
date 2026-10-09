@@ -24,6 +24,15 @@ typedef struct mt_entry {
     int tombstone;
 } mt_entry;
 
+/* Performance optimization: cache-friendly index for iteration */
+typedef struct memtable_index {
+    mt_entry **entry_pointers;  /* Array of pointers for sequential access */
+    size_t *key_offsets;        /* Precomputed key offsets for sorting */
+    size_t sorted_count;        /* Number of valid entries in index */
+    size_t capacity;           /* Current capacity of index arrays */
+    uint32_t generation;        /* Generation counter for cache invalidation */
+} memtable_index;
+
 struct yq_memtable {
     yq_memblk *arena;
     mt_entry *entries;
@@ -33,6 +42,10 @@ struct yq_memtable {
     atomic_size_t used_bytes;
     volatile uint32_t generation;
     volatile uint32_t active_writers;
+    
+    /* Performance optimization: iteration index */
+    memtable_index index;
+    int index_valid;            /* Flag to track index validity */
 };
 
 struct yq_memtable_iter {
@@ -152,6 +165,7 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
         current_used += cost;
         atomic_store(&mt->used_bytes, current_used);
         mt->generation++;
+        invalidate_memtable_index(mt);  /* Invalidate index on modification */
         memory_barrier();
         atomic_fetch_add(&mt->active_writers, -1);
         return YQ_OK;
@@ -200,6 +214,7 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
         current_used += cost;
         atomic_store(&mt->used_bytes, current_used);
         mt->generation++;
+        invalidate_memtable_index(mt);  /* Invalidate index on modification */
         memory_barrier();
         atomic_fetch_add(&mt->active_writers, -1);
         return YQ_OK;
@@ -536,6 +551,88 @@ void yq_memtable_reset(yq_memtable *mt) {
     atomic_store(&mt->num_entries, 0);
     atomic_store(&mt->used_bytes, 0);
     mt->generation++;
+    mt->index_valid = 0;  /* Invalidate index on reset */
     memory_barrier();
     atomic_fetch_add(&mt->active_writers, -1);
+}
+
+/* Performance optimization: comparison function for sorting entries */
+static int compare_entries_by_key(const void *a, const void *b) {
+    const mt_entry *entry_a = *(const mt_entry **)a;
+    const mt_entry *entry_b = *(const mt_entry **)b;
+    uint8_t *base = (uint8_t *)yq_memblk_base(((yq_memtable *)entry_a)->arena);
+    
+    size_t offset_a = entry_a->key_offset;
+    size_t offset_b = entry_b->key_offset;
+    size_t len_a = entry_a->key_len;
+    size_t len_b = entry_b->key_len;
+    
+    /* Compare by key content */
+    size_t min_len = len_a < len_b ? len_a : len_b;
+    int cmp = memcmp(base + offset_a, base + offset_b, min_len);
+    if (cmp != 0) return cmp;
+    return (int)len_a - (int)len_b;
+}
+
+/* Performance optimization: build index for efficient iteration */
+static void build_memtable_index(yq_memtable *mt) {
+    size_t num_entries = atomic_load(&mt->num_entries);
+    
+    if (num_entries == 0) {
+        mt->index.sorted_count = 0;
+        mt->index_valid = 1;
+        return;
+    }
+    
+    /* Resize index arrays if needed */
+    if (num_entries > mt->index.capacity) {
+        size_t new_capacity = num_entries * 2;
+        
+        mt_entry **new_pointers = realloc(mt->index.entry_pointers, 
+                                        new_capacity * sizeof(mt_entry *));
+        size_t *new_offsets = realloc(mt->index.key_offsets,
+                                    new_capacity * sizeof(size_t));
+        
+        if (!new_pointers || !new_offsets) {
+            /* Allocation failed, keep old index */
+            return;
+        }
+        
+        mt->index.entry_pointers = new_pointers;
+        mt->index.key_offsets = new_offsets;
+        mt->index.capacity = new_capacity;
+    }
+    
+    /* Build index arrays */
+    for (size_t i = 0; i < num_entries; i++) {
+        mt->index.entry_pointers[i] = &mt->entries[i];
+        mt->index.key_offsets[i] = mt->entries[i].key_offset;
+    }
+    
+    /* Sort entries by key for sequential access */
+    qsort(mt->index.entry_pointers, num_entries, sizeof(mt_entry *), 
+          compare_entries_by_key);
+    
+    mt->index.sorted_count = num_entries;
+    mt->index.generation = mt->generation;
+    mt->index_valid = 1;
+}
+
+/* Performance optimization: invalidate index when entries are modified */
+static void invalidate_memtable_index(yq_memtable *mt) {
+    mt->index_valid = 0;
+}
+
+/* Performance optimization: get entry from sorted index */
+static mt_entry* get_indexed_entry(yq_memtable *mt, size_t index) {
+    if (!mt->index_valid || index >= mt->index.sorted_count) {
+        return NULL;
+    }
+    
+    /* Check if index is still valid */
+    if (mt->index.generation != mt->generation) {
+        return NULL;
+    }
+    
+    return mt->index.entry_pointers[index];
 }
