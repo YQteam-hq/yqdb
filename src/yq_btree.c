@@ -4,6 +4,15 @@
 #include <string.h>
 #include <stdio.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#define memory_barrier() MemoryBarrier()
+#else
+#include <stdatomic.h>
+#include <unistd.h>
+#define memory_barrier() __sync_synchronize()
+#endif
+
 #define YQ_PAGE_TYPE_LEAF     1
 #define YQ_PAGE_TYPE_INTERNAL 2
 #define YQ_PAGE_TYPE_OVERFLOW 3

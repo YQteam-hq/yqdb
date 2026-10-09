@@ -18,16 +18,12 @@
 #if defined(_WIN32)
 #include <windows.h>
 #define memory_barrier() MemoryBarrier()
-#define atomic_load(ptr) (*(volatile typeof(*ptr)*)(ptr))
-#define atomic_store(ptr, val) (*(volatile typeof(*ptr)*)(ptr) = (val))
 static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)GetCurrentProcessId(); }
 static uint32_t yq_mvcc_current_tid(void) { return (uint32_t)GetCurrentThreadId(); }
 #else
 #include <stdatomic.h>
 #include <unistd.h>
 #define memory_barrier() __sync_synchronize()
-#define atomic_load(ptr) atomic_load_explicit((volatile typeof(*ptr)*)(ptr), memory_order_relaxed)
-#define atomic_store(ptr, val) atomic_store_explicit((volatile typeof(*ptr)*)(ptr), (val), memory_order_relaxed)
 static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)getpid(); }
 static uint32_t yq_mvcc_current_tid(void) { return 0; }
 #endif

@@ -5,6 +5,8 @@
 #include <string.h>
 #include <stdint.h>
 
+#define YQ_VAL_MAX_SIZE (1ULL << 20) /* 1MB limit */
+
 /*
  * P4: recovery replay acceleration.
  *

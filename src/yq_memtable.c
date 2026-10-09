@@ -8,31 +8,10 @@
 #if defined(_WIN32)
 #include <windows.h>
 #define memory_barrier() MemoryBarrier()
-#define atomic_load(ptr) (*(volatile typeof(*ptr)*)(ptr))
-#define atomic_store(ptr, val) (*(volatile typeof(*ptr)*)(ptr) = (val))
-#define atomic_fetch_add(ptr, val) _InterlockedExchangeAdd((volatile long*)(ptr), (val))
-static inline uint32_t atomic_compare_exchange_strong(volatile uint32_t *ptr, uint32_t expected, uint32_t desired) {
-    return _InterlockedCompareExchange((volatile long*)ptr, (long)desired, (long)expected) == (long)expected;
-}
-static inline uint64_t atomic_compare_exchange_strong64(volatile uint64_t *ptr, uint64_t expected, uint64_t desired) {
-    return _InterlockedCompareExchange64((volatile long long*)ptr, (long long)desired, (long long)expected) == (long long)expected;
-}
 #else
 #include <stdatomic.h>
 #include <unistd.h>
 #define memory_barrier() __sync_synchronize()
-#define atomic_load(ptr) atomic_load_explicit((volatile typeof(*ptr)*)(ptr), memory_order_relaxed)
-#define atomic_store(ptr, val) atomic_store_explicit((volatile typeof(*ptr)*)(ptr), (val), memory_order_relaxed)
-#define atomic_fetch_add(ptr, val) atomic_fetch_add_explicit((volatile typeof(*ptr)*)(ptr), (val), memory_order_relaxed)
-static inline int atomic_compare_exchange_strong_ptr(volatile void **ptr, void *expected, void *desired) {
-    return atomic_compare_exchange_strong_explicit((volatile void**)ptr, expected, desired, memory_order_relaxed);
-}
-static inline uint32_t atomic_compare_exchange_strong(volatile uint32_t *ptr, uint32_t expected, uint32_t desired) {
-    return atomic_compare_exchange_strong_explicit((volatile uint32_t*)ptr, expected, desired, memory_order_relaxed);
-}
-static inline uint64_t atomic_compare_exchange_strong64(volatile uint64_t *ptr, uint64_t expected, uint64_t desired) {
-    return atomic_compare_exchange_strong_explicit((volatile uint64_t*)ptr, expected, desired, memory_order_relaxed);
-}
 #endif
 
 #define TOMBSTONE_VAL 0xFF
