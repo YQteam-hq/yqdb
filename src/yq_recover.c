@@ -145,8 +145,14 @@ static int arena_put(uint8_t **buf, size_t *used, size_t *cap,
 static int ctx_push_op(recover_ctx *ctx, uint64_t txn_id, int type,
                        const uint8_t *key, size_t klen,
                        const uint8_t *val, size_t vlen) {
+    if (!ctx) return YQ_ERR_INVAL;
+    if (type != 2 && type != 3) return YQ_ERR_INVAL;
+    if (!key || klen == 0 || klen > 1024) return YQ_ERR_INVAL;
+    if (type == 2 && (!val || vlen > 1024 * 1024)) return YQ_ERR_INVAL;
+    
     if (ctx->ops_count >= ctx->ops_cap) {
         size_t ncap = ctx->ops_cap ? ctx->ops_cap * 2 : 128;
+        if (ncap > SIZE_MAX / sizeof(rec_op)) return YQ_ERR_NOMEM;
         rec_op *na = (rec_op *)realloc(ctx->ops, ncap * sizeof(rec_op));
         if (!na) return YQ_ERR_NOMEM;
         ctx->ops = na;
@@ -184,6 +190,7 @@ static int recovery_visitor(void *ctx_arg, uint64_t lsn, uint64_t txn_id, int re
     }
 
     if (rec_type == 2) {
+        if (!payload || paylen == 0) return YQ_ERR_CORRUPT;
         size_t kpos = 0;
         uint64_t klen = 0;
         if (yq_varint_decode(payload, paylen, &klen, &kpos) != YQ_OK) return YQ_ERR_CORRUPT;
@@ -193,11 +200,13 @@ static int recovery_visitor(void *ctx_arg, uint64_t lsn, uint64_t txn_id, int re
         if (yq_varint_decode(payload + kpos + klen, paylen - kpos - klen, &vlen, &vpos_rel) != YQ_OK) return YQ_ERR_CORRUPT;
         size_t vstart = kpos + klen + vpos_rel;
         if (vstart + vlen > paylen) return YQ_ERR_CORRUPT;
+        if (vlen > 1024 * 1024) return YQ_ERR_CORRUPT;
         return ctx_push_op(ctx, txn_id, 2, payload + kpos, (size_t)klen,
                            payload + vstart, (size_t)vlen);
     }
 
     if (rec_type == 3) {
+        if (!payload || paylen == 0) return YQ_ERR_CORRUPT;
         size_t kpos = 0;
         uint64_t klen = 0;
         if (yq_varint_decode(payload, paylen, &klen, &kpos) != YQ_OK) return YQ_ERR_CORRUPT;
@@ -210,6 +219,7 @@ static int recovery_visitor(void *ctx_arg, uint64_t lsn, uint64_t txn_id, int re
 
 int yq_recover(yq_wal *wal, yq_memtable *mt) {
     if (!wal || !mt) return YQ_ERR_INVAL;
+    if (!wal->db || !mt->db) return YQ_ERR_INVAL;
     if (yq_wal_size(wal) == 0) return YQ_OK;
 
     recover_ctx ctx;
@@ -249,6 +259,27 @@ int yq_recover(yq_wal *wal, yq_memtable *mt) {
 }
 
 int yq_recover_replay(yq_recover_ctx *ctx) {
-    (void)ctx;
+    if (!ctx) return YQ_ERR_INVAL;
+    if (!ctx->mt) return YQ_ERR_INVAL;
+    
+    /* Replay all committed operations */
+    for (size_t i = 0; i < ctx->ops_count; i++) {
+        rec_op *op = &ctx->ops[i];
+        if (!rc_hash_contains(&ctx->committed, op->txn_id)) continue;
+        
+        yq_slice k;
+        k.data = ctx->keys ? ctx->keys + op->key_off : NULL;
+        k.size = op->key_len;
+        
+        if (op->type == 2) {
+            yq_slice v;
+            v.data = ctx->vals ? ctx->vals + op->val_off : NULL;
+            v.size = op->val_len;
+            yq_memtable_put(ctx->mt, k, v);
+        } else if (op->type == 3) {
+            yq_memtable_del(ctx->mt, k);
+        }
+    }
+    
     return YQ_OK;
 }
