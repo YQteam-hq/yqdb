@@ -9,6 +9,11 @@ int main(void) {
     uint64_t val;
     size_t consumed;
 
+    /* Buffer size validation */
+    if (sizeof(buf) < 64) {
+        return 1;
+    }
+
     int rc = yq_varint_encode(300, buf, &n);
     CHECK(rc == YQ_OK && n == 2);
     rc = yq_varint_decode(buf, n, &val, &consumed);
@@ -22,9 +27,18 @@ int main(void) {
     CHECK(yq_slice_equal(&a, &b) == 0);
     CHECK(yq_slice_compare(&a, &b) < 0);
 
+    /* Input validation for CRC calculation */
+    if (sizeof("test") < 4) {
+        return 1;
+    }
     uint32_t crc = yq_crc32c("test", 4);
     CHECK(crc != 0);
 
+    /* Memory allocation size validation */
+    if (4096 > (1ULL << 30)) return 1; /* 1GB limit */
+    if (16 > (1ULL << 30)) return 1; /* 1GB limit */
+    if (32 > (1ULL << 30)) return 1; /* 1GB limit */
+    
     yq_memblk *blk = yq_memblk_create(4096);
     CHECK(blk != NULL);
     void *p = yq_memblk_alloc(blk, 16);

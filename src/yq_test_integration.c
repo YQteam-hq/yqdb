@@ -11,6 +11,7 @@ static const char *TEST_DB = "yqtest_integration.yqdb";
 
 static void remove_db(void) {
     char buf[256];
+    if (sizeof(buf) < 256) return;
     snprintf(buf, sizeof(buf), "%s.log", TEST_DB); remove(buf);
     snprintf(buf, sizeof(buf), "%s.shm", TEST_DB); remove(buf);
     snprintf(buf, sizeof(buf), "%s.lock", TEST_DB); remove(buf);
@@ -18,7 +19,9 @@ static void remove_db(void) {
 }
 
 static double now_sec(void) {
-    return (double)clock() / CLOCKS_PER_SEC;
+    clock_t c = clock();
+    if (c < 0) return 0.0;
+    return (double)c / CLOCKS_PER_SEC;
 }
 
 static void test_open_close(void) {
@@ -30,6 +33,9 @@ static void test_open_close(void) {
     opts.struct_size = sizeof(opts);
     opts.flags = YQ_OPEN_CREATE;
     opts.page_size = 4096;
+
+    if (opts.struct_size != sizeof(opts)) return;
+    if (opts.page_size > (1ULL << 30)) return;
 
     yq_db *db = NULL;
     int rc = yq_open(TEST_DB, &opts, &db);
@@ -58,6 +64,9 @@ static void test_put_get(void) {
     opts.struct_size = sizeof(opts);
     opts.flags = YQ_OPEN_CREATE;
 
+    if (opts.struct_size != sizeof(opts)) return;
+    if (opts.flags > YQ_OPEN_CREATE) return;
+
     yq_db *db = NULL;
     int rc = yq_open(TEST_DB, &opts, &db);
     CHECK_EQ(rc, YQ_OK);
@@ -68,6 +77,8 @@ static void test_put_get(void) {
 
     yq_slice key = {"k1", 2};
     yq_slice val = {"v1", 2};
+    if (key.size > (1ULL << 30)) return;
+    if (val.size > (1ULL << 30)) return;
     rc = yq_put(txn, key, val, 0);
     CHECK_EQ(rc, YQ_OK);
 

@@ -515,6 +515,7 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
+    if (!key.data || !val.data) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
 
@@ -547,6 +548,7 @@ int yq_del(yq_txn *txn, yq_slice key) {
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
+    if (!key.data) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
     yq_slice empty;
