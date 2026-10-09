@@ -465,7 +465,23 @@ int yq_txn_commit(yq_txn *txn) {
             free(txn);
             return rc;
         }
-        yq_wal_flush(db->wal);
+        /*
+         * The commit record must actually reach the file before the commit
+         * is reported as successful. yq_wal_flush() failing means this
+         * commit (and everything still buffered before it) never made it to
+         * disk, so the transaction is not durable: fail it exactly like the
+         * append above instead of returning YQ_OK and silently losing the
+         * writes on the next reopen.
+         */
+        rc = yq_wal_flush(db->wal);
+        if (rc != YQ_OK) {
+            txn->state = YQ_TXN_STATE_ABORTED;
+            pending_free(txn);
+            yq_mvcc_release_writer(db->mvcc);
+            if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+            free(txn);
+            return rc;
+        }
         if (db->opts.sync_mode == YQ_SYNC_FULL && db->db_file) yq_file_sync(db->db_file);
 
         int rc_apply = pending_apply(txn);
@@ -494,6 +510,14 @@ int yq_txn_commit(yq_txn *txn) {
         rc2 = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
 
         yq_mvcc_release_writer(db->mvcc);
+        if (rc2 != YQ_OK) {
+            /* The log is durable, but the meta page did not take the new
+             * txn id / root. Report the failure rather than a silent OK. */
+            txn->state = YQ_TXN_STATE_ABORTED;
+            if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+            free(txn);
+            return rc2;
+        }
     }
 
     txn->state = YQ_TXN_STATE_COMMITTED;
@@ -555,7 +579,9 @@ int yq_del(yq_txn *txn, yq_slice key) {
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
+    /* Mirror yq_put(): ERRORS.md 4.2 maps a key outside 1..1024 bytes to
+     * YQ_ERR_TOOBIG, not YQ_ERR_INVAL. */
+    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
 
     yq_db *db = txn->db;
     yq_slice empty;
@@ -974,7 +1000,8 @@ int yq_checkpoint(yq_db *db) {
         cur_npages = yq_btree_npages(db->btree);
     }
 
-    yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    rc = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    if (rc != YQ_OK) return rc;
 
     /*
      * The log can only be rewritten while it is the sole durable copy of the
@@ -996,8 +1023,13 @@ int yq_sync(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
     /* See the note in yq_checkpoint(). */
     if (!db->write_enabled) return YQ_ERR_READONLY;
-    yq_wal_flush(db->wal);
-    if (db->db_file) yq_file_sync(db->db_file);
+    /* yq_sync() exists to report flush success, so surface its failures. */
+    int rc = yq_wal_flush(db->wal);
+    if (rc != YQ_OK) return rc;
+    if (db->db_file) {
+        rc = yq_file_sync(db->db_file);
+        if (rc != YQ_OK) return rc;
+    }
     return YQ_OK;
 }
 

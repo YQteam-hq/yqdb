@@ -1385,6 +1385,46 @@ static void test_checkpoint_large_value(void) {
     printf("OK\n");
 }
 
+/*
+ * Key/value limits must be reported with YQ_ERR_TOOBIG on every write path
+ * (ERRORS.md 4.2). yq_put() did, but yq_del() answered YQ_ERR_INVAL for the
+ * same oversized key, so callers could not distinguish "too big" from
+ * "bad argument" without consulting the size again.
+ */
+static void test_key_value_limits(void) {
+    printf("test_key_value_limits... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    yq_txn *txn = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+
+    static uint8_t big[1025];
+    memset(big, 'x', sizeof(big));
+    yq_slice big_key = { big, sizeof(big) };
+    yq_slice empty_key = { "", 0 };
+
+    CHECK_EQ(yq_put(txn, big_key, big_key, 0), YQ_ERR_TOOBIG);
+    CHECK_EQ(yq_put(txn, empty_key, big_key, 0), YQ_ERR_TOOBIG);
+    CHECK_EQ(yq_del(txn, big_key), YQ_ERR_TOOBIG);
+    CHECK_EQ(yq_del(txn, empty_key), YQ_ERR_TOOBIG);
+
+    /* A valid key right at the limit must still be accepted. */
+    yq_slice max_key = { big, 1024 };
+    CHECK_EQ(yq_put(txn, max_key, max_key, 0), YQ_OK);
+
+    CHECK_EQ(yq_txn_abort(txn), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -1414,6 +1454,7 @@ int main(void) {
     test_long_db_path();
 #endif
     test_checkpoint_large_value();
+    test_key_value_limits();
     test_nosync();
 
     printf("\n=== ALL TESTS PASSED ===\n");
