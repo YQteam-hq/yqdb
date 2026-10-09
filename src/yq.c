@@ -12,6 +12,11 @@
 #include <stdbool.h>
 #include <errno.h>
 
+#define YQ_MAX_KEY_SIZE 1024
+#define YQ_MAX_VALUE_SIZE (1ULL * 1024 * 1024 * 1024) /* 1GB */
+#define YQ_MAX_BATCH_SIZE (1ULL * 1024 * 1024) /* 1M entries */
+#define YQ_MAX_PATH_LENGTH 1024
+
 extern int yq_recover(yq_wal *wal, yq_memtable *mt);
 
 static _Thread_local int g_last_io_err = 0;
@@ -180,9 +185,13 @@ static void free_db(yq_db *db) {
 }
 
 int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
-    *out = NULL;
-    if (!opts || opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
+    /* Validate input parameters */
+    if (!opts || !out) return YQ_ERR_INVAL;
+    if (opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
     if (!path || path[0] == '\0') return YQ_ERR_INVAL;
+    
+    /* Validate path length */
+    if (strlen(path) >= YQ_MAX_PATH_LENGTH) return YQ_ERR_INVAL;
 
     int rc = validate_opts(opts);
     if (rc != YQ_OK) return rc;
@@ -303,8 +312,12 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
 }
 
 int yq_close(yq_db *db) {
+    /* Validate input parameters */
     if (!db) return YQ_OK;
+    
+    /* Check if already closed */
     if (db->closed) { free_db(db); return YQ_OK; }
+    
     db->closed = 1;
     if (db->write_enabled) yq_sync(db);
     free_db(db);
@@ -381,9 +394,17 @@ static int pending_apply(yq_txn *txn) {
 }
 
 int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
+    /* Validate input parameters */
     if (!db || !out) return YQ_ERR_INVAL;
     *out = NULL;
+    
+    /* Check if database is closed */
     if (db->closed) return YQ_ERR_CORRUPT;
+    
+    /* Validate transaction flags */
+    if ((flags & ~(YQ_TXN_READONLY | YQ_TXN_READWRITE)) != 0) {
+        return YQ_ERR_INVAL;
+    }
 
     /* A handle opened with YQ_OPEN_READONLY must not hand out write
      * transactions: yq_put()/yq_del() guard on the transaction flag, but
@@ -428,8 +449,14 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
 }
 
 int yq_txn_commit(yq_txn *txn) {
+    /* Validate input parameters */
     if (!txn) return YQ_ERR_INVAL;
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    
+    /* Validate database pointer */
+    if (!txn->db) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
 
@@ -481,8 +508,15 @@ int yq_txn_commit(yq_txn *txn) {
 }
 
 int yq_txn_abort(yq_txn *txn) {
+    /* Validate input parameters */
     if (!txn) return YQ_OK;
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    
+    /* Validate database pointer */
+    if (!txn->db) return YQ_ERR_INVAL;
+
     yq_db *db = txn->db;
     if (txn->flags & YQ_TXN_READWRITE) {
         yq_wal_append_abort(db->wal, txn->snapshot_txn);
@@ -496,13 +530,24 @@ int yq_txn_abort(yq_txn *txn) {
 }
 
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
+    /* Validate input parameters */
     if (!txn) return YQ_ERR_INVAL;
-    if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
-    if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
-    if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
     if (!key.data || !val.data) return YQ_ERR_INVAL;
+    
+    /* Check transaction state */
+    if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    
+    /* Check transaction type */
+    if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
+    
+    /* Validate key size */
+    if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_TOOBIG;
+    
+    /* Validate value size */
+    if (val.size > YQ_MAX_VALUE_SIZE) return YQ_ERR_TOOBIG;
+    
+    /* Validate put mode */
+    if (mode > YQ_PUT_NOOVERWRITE) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
 
@@ -530,12 +575,17 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 }
 
 int yq_del(yq_txn *txn, yq_slice key) {
-    if (!txn) return YQ_ERR_INVAL;
+    /* Validate input parameters */
+    if (!txn || !key.data) return YQ_ERR_INVAL;
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    
+    /* Check transaction type */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
-    if (!key.data) return YQ_ERR_INVAL;
+    
+    /* Validate key size */
+    if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
 
     yq_db *db = txn->db;
     yq_slice empty;
@@ -554,8 +604,16 @@ int yq_del(yq_txn *txn, yq_slice key) {
 }
 
 int yq_get(yq_txn *txn, yq_slice key, yq_slice *out) {
-    if (!txn || !out) return YQ_ERR_INVAL;
+    /* Validate input parameters */
+    if (!txn || !out || !key.data) return YQ_ERR_INVAL;
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    
+    /* Validate key size */
+    if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
+    
+    /* Initialize output */
     out->data = NULL;
     out->size = 0;
 
@@ -581,7 +639,10 @@ int yq_get(yq_txn *txn, yq_slice key, yq_slice *out) {
 }
 
 int yq_cur_open(yq_txn *txn, yq_cur **out) {
+    /* Validate input parameters */
     if (!txn || !out) return YQ_ERR_INVAL;
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
 
     yq_cur *c = calloc(1, sizeof(yq_cur));
@@ -606,7 +667,9 @@ int yq_cur_open(yq_txn *txn, yq_cur **out) {
 }
 
 int yq_cur_first(yq_cur *c) {
+    /* Validate input parameters */
     if (!c) return YQ_ERR_INVAL;
+    
     c->at_end = 0; c->state = 0;
     if (c->mt_iter) {
         int rc = yq_memtable_iter_first(c->mt_iter);
@@ -620,7 +683,9 @@ int yq_cur_first(yq_cur *c) {
 }
 
 int yq_cur_last(yq_cur *c) {
+    /* Validate input parameters */
     if (!c) return YQ_ERR_INVAL;
+    
     c->at_end = 0; c->state = 0;
     if (c->bt_cur) {
         int rc = yq_btree_cursor_last(c->bt_cur);
@@ -634,7 +699,9 @@ int yq_cur_last(yq_cur *c) {
 }
 
 int yq_cur_next(yq_cur *c) {
+    /* Validate input parameters */
     if (!c) return YQ_ERR_INVAL;
+    
     if (c->at_end) return YQ_ERR_NOTFOUND;
     if (c->state == 1) {
         if (c->mt_iter) {
@@ -658,7 +725,9 @@ int yq_cur_next(yq_cur *c) {
 }
 
 int yq_cur_prev(yq_cur *c) {
+    /* Validate input parameters */
     if (!c) return YQ_ERR_INVAL;
+    
     if (c->at_end) return yq_cur_last(c);
     if (c->state == 2) {
         if (c->bt_cur) {
@@ -682,7 +751,11 @@ int yq_cur_prev(yq_cur *c) {
 }
 
 int yq_cur_seek(yq_cur *c, yq_slice key) {
-    if (!c) return YQ_ERR_INVAL;
+    /* Validate input parameters */
+    if (!c || !key.data) return YQ_ERR_INVAL;
+    
+    /* Validate key size */
+    if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
 
     /* Position the tree cursor at the first key >= target (binary descent). */
     int tree_found = 0;
@@ -713,7 +786,11 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
 }
 
 int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
-    if (!c) return YQ_ERR_INVAL;
+    /* Validate input parameters */
+    if (!c || !key.data) return YQ_ERR_INVAL;
+    
+    /* Validate key size */
+    if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
 
     /* Position the tree cursor at the first key >= target (binary descent). */
     int tree_found = 0;
@@ -755,7 +832,11 @@ int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
 }
 
 int yq_cur_seek_le(yq_cur *c, yq_slice key) {
-    if (!c) return YQ_ERR_INVAL;
+    /* Validate input parameters */
+    if (!c || !key.data) return YQ_ERR_INVAL;
+    
+    /* Validate key size */
+    if (key.size == 0 || key.size > YQ_MAX_KEY_SIZE) return YQ_ERR_INVAL;
     int rc = yq_cur_seek(c, key);
     if (rc == YQ_OK) {
         yq_slice k;
@@ -770,12 +851,16 @@ int yq_cur_seek_le(yq_cur *c, yq_slice key) {
 }
 
 int yq_cur_valid(const yq_cur *c) {
+    /* Validate input parameters */
     if (!c) return 0;
     return c->state && !c->at_end;
 }
 
 int yq_cur_key(const yq_cur *c, yq_slice *out) {
+    /* Validate input parameters */
     if (!c || !out) return YQ_ERR_INVAL;
+    
+    /* Check cursor validity */
     if (!yq_cur_valid(c)) return YQ_ERR_CURSOR;
     if (c->state == 1 && c->mt_iter) return yq_memtable_iter_key(c->mt_iter, out);
     if (c->state == 2 && c->bt_cur) return yq_btree_cursor_key(c->bt_cur, out);
@@ -783,7 +868,10 @@ int yq_cur_key(const yq_cur *c, yq_slice *out) {
 }
 
 int yq_cur_val(const yq_cur *c, yq_slice *out) {
+    /* Validate input parameters */
     if (!c || !out) return YQ_ERR_INVAL;
+    
+    /* Check cursor validity */
     if (!yq_cur_valid(c)) return YQ_ERR_CURSOR;
     if (c->state == 1 && c->mt_iter) return yq_memtable_iter_val(c->mt_iter, out);
     if (c->state == 2 && c->bt_cur) return yq_btree_cursor_val(c->bt_cur, out);
@@ -791,7 +879,9 @@ int yq_cur_val(const yq_cur *c, yq_slice *out) {
 }
 
 int yq_cur_close(yq_cur *c) {
+    /* Validate input parameters */
     if (!c) return YQ_OK;
+    
     if (c->mt_iter) yq_memtable_iter_close(c->mt_iter);
     if (c->bt_cur) yq_btree_cursor_close(c->bt_cur);
     free(c);
@@ -799,7 +889,12 @@ int yq_cur_close(yq_cur *c) {
 }
 
 int yq_checkpoint(yq_db *db) {
+    /* Validate input parameters */
     if (!db) return YQ_ERR_INVAL;
+    
+    /* Check if database is closed */
+    if (db->closed) return YQ_ERR_CORRUPT;
+    
     /* ERRORS.md: YQ_ERR_READONLY is "a read-only handle ... attempts to
      * write". YQ_ERR_CORRUPT means a CRC/format failure instead, and
      * reporting corruption for a healthy read-only open is misleading. */
@@ -829,7 +924,12 @@ int yq_checkpoint(yq_db *db) {
 }
 
 int yq_sync(yq_db *db) {
+    /* Validate input parameters */
     if (!db) return YQ_ERR_INVAL;
+    
+    /* Check if database is closed */
+    if (db->closed) return YQ_ERR_CORRUPT;
+    
     /* See the note in yq_checkpoint(). */
     if (!db->write_enabled) return YQ_ERR_READONLY;
     yq_wal_flush(db->wal);
@@ -838,8 +938,15 @@ int yq_sync(yq_db *db) {
 }
 
 int yq_db_stat(yq_db *db, yq_stat *out) {
+    /* Validate input parameters */
     if (!db || !out) return YQ_ERR_INVAL;
+    
+    /* Check if database is closed */
+    if (db->closed) return YQ_ERR_CORRUPT;
+    
+    /* Validate struct size */
     if (out->struct_size != sizeof(yq_stat)) return YQ_ERR_INVAL;
+    
     memset(out, 0, sizeof(yq_stat));
     out->struct_size = sizeof(yq_stat);
     out->format_version = 1;
@@ -883,19 +990,30 @@ static void yq_batch_result_init(yq_batch_result *result, uint32_t total, int fi
 
 int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
                  yq_batch_result *result) {
-    /* result 可选：不传就不上报统计（与头文件契约一致） */
+    /* Validate input parameters */
     if (!txn || !entries || count == 0) {
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
     }
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) {
         yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
         return YQ_ERR_TXN_CLOSED;
     }
+    
+    /* Check transaction type */
     if (txn->flags & YQ_TXN_READONLY) {
         yq_batch_result_init(result, 0, YQ_ERR_READONLY);
         return YQ_ERR_READONLY;
     }
+    
+    /* Validate count bounds */
+    if (count > YQ_MAX_BATCH_SIZE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
+        return YQ_ERR_TOOBIG;
+    }
+    
     /* count 超过 uint32 时统计字段无法表达，提前拒绝而不是静默截断 */
     if (count > 0xFFFFFFFFu) {
         yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
@@ -953,10 +1071,30 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
 
 int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
                  yq_batch_result *result) {
+    /* Validate input parameters */
     if (!txn || !keys || count == 0) {
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
     }
+    
+    /* Check transaction state */
+    if (txn->state != YQ_TXN_STATE_ACTIVE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
+        return YQ_ERR_TXN_CLOSED;
+    }
+    
+    /* Check transaction type */
+    if (txn->flags & YQ_TXN_READONLY) {
+        yq_batch_result_init(result, 0, YQ_ERR_READONLY);
+        return YQ_ERR_READONLY;
+    }
+    
+    /* Validate count bounds */
+    if (count > YQ_MAX_BATCH_SIZE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
+        return YQ_ERR_TOOBIG;
+    }
+    
     /* count * sizeof(*entries) 为 size_t 运算，先挡回绕再分配 */
     if (count > SIZE_MAX / sizeof(yq_batch_entry)) {
         yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
@@ -982,8 +1120,14 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
 
 int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
                  yq_slice *values, size_t *found_count) {
+    /* Validate input parameters */
     if (!txn || !keys || count == 0 || !values || !found_count) return YQ_ERR_INVAL;
+    
+    /* Check transaction state */
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    
+    /* Validate count bounds */
+    if (count > YQ_MAX_BATCH_SIZE) return YQ_ERR_TOOBIG;
 
     size_t found = 0;
     for (size_t i = 0; i < count; i++) {
