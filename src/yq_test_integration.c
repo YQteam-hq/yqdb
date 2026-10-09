@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+#include "yq_test_check.h"
 #include <time.h>
 #include "yq.h"
 #include "yq_mempool.h"
@@ -32,17 +32,17 @@ static void test_open_close(void) {
 
     yq_db *db = NULL;
     int rc = yq_open(TEST_DB, &opts, &db);
-    assert(rc == YQ_OK);
-    assert(db != NULL);
+    CHECK_EQ(rc, YQ_OK);
+    CHECK(db != NULL);
 
     rc = yq_close(db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_open(TEST_DB, &opts, &db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_close(db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     remove_db();
     printf("OK\n");
@@ -59,44 +59,44 @@ static void test_put_get(void) {
 
     yq_db *db = NULL;
     int rc = yq_open(TEST_DB, &opts, &db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     yq_txn *txn = NULL;
     rc = yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     yq_slice key = {"k1", 2};
     yq_slice val = {"v1", 2};
     rc = yq_put(txn, key, val, 0);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     yq_slice out = {0};
     rc = yq_get(txn, key, &out);
-    assert(rc == YQ_OK);
-    assert(out.size == 2);
-    assert(memcmp(out.data, "v1", 2) == 0);
+    CHECK_EQ(rc, YQ_OK);
+    CHECK(out.size == 2);
+    CHECK(memcmp(out.data, "v1", 2) == 0);
 
     rc = yq_txn_commit(txn);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_close(db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_open(TEST_DB, &opts, &db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_txn_begin(db, YQ_TXN_READONLY, &txn);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_get(txn, key, &out);
-    assert(rc == YQ_OK);
-    assert(out.size == 2);
+    CHECK_EQ(rc, YQ_OK);
+    CHECK(out.size == 2);
 
     rc = yq_txn_commit(txn);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_close(db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     remove_db();
     printf("OK\n");
@@ -122,11 +122,11 @@ static void test_delete(void) {
 
     yq_slice out = {0};
     int rc = yq_get(txn, k1, &out);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     yq_del(txn, k1);
     rc = yq_get(txn, k1, &out);
-    assert(rc == YQ_ERR_NOTFOUND);
+    CHECK(rc == YQ_ERR_NOTFOUND);
 
     yq_txn_commit(txn);
     yq_close(db);
@@ -165,18 +165,18 @@ static void test_cursor(void) {
 
     yq_cur *cur = NULL;
     int rc = yq_cur_open(txn, &cur);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     int count = 0;
     for (rc = yq_cur_first(cur); rc == YQ_OK; rc = yq_cur_next(cur)) {
         yq_slice k = {0}, v = {0};
         yq_cur_key(cur, &k);
         yq_cur_val(cur, &v);
-        assert(k.size > 0);
-        assert(v.size > 0);
+        CHECK(k.size > 0);
+        CHECK(v.size > 0);
         count++;
     }
-    assert(count == 20);
+    CHECK(count == 20);
 
     yq_cur_close(cur);
     yq_txn_commit(txn);
@@ -209,7 +209,7 @@ static void test_txn_abort(void) {
     yq_txn_begin(db, YQ_TXN_READONLY, &txn);
     yq_slice out = {0};
     int rc = yq_get(txn, k1, &out);
-    assert(rc == YQ_ERR_NOTFOUND);
+    CHECK(rc == YQ_ERR_NOTFOUND);
     yq_txn_commit(txn);
 
     yq_close(db);
@@ -235,12 +235,12 @@ static void test_nooverwrite(void) {
     yq_slice k1 = {"key1", 4}, v1 = {"val1", 4}, v2 = {"val2", 4};
     yq_put(txn, k1, v1, YQ_PUT_NOOVERWRITE);
     int rc = yq_put(txn, k1, v2, YQ_PUT_NOOVERWRITE);
-    assert(rc == YQ_ERR_EXISTS);
+    CHECK(rc == YQ_ERR_EXISTS);
 
     yq_slice out = {0};
     yq_get(txn, k1, &out);
-    assert(out.size == 4);
-    assert(memcmp(out.data, "val1", 4) == 0);
+    CHECK(out.size == 4);
+    CHECK(memcmp(out.data, "val1", 4) == 0);
 
     yq_txn_commit(txn);
     yq_close(db);
@@ -274,10 +274,10 @@ static void test_checkpoint(void) {
     yq_txn_commit(txn);
 
     int rc = yq_checkpoint(db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     rc = yq_sync(db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     yq_txn_begin(db, YQ_TXN_READONLY, &txn);
     int count = 0;
@@ -288,7 +288,7 @@ static void test_checkpoint(void) {
     }
     yq_cur_close(cur);
     yq_txn_commit(txn);
-    assert(count == 100);
+    CHECK(count == 100);
 
     yq_close(db);
     remove_db();
@@ -323,7 +323,7 @@ static void test_batch(void) {
     }
 
     int rc = yq_txn_commit(txn);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     double t1 = now_sec();
     printf("(%.1f keys/sec) ", 1000.0 / (t1 - t0));
@@ -338,7 +338,7 @@ static void test_batch(void) {
         if (yq_get(txn, key, &out) == YQ_OK) count++;
     }
     yq_txn_commit(txn);
-    assert(count == 1000);
+    CHECK(count == 1000);
 
     double t2 = now_sec();
     printf("(%.1f gets/sec) ", 1000.0 / (t2 - t1));
@@ -595,7 +595,7 @@ static void test_concurrent_readers(void) {
             yq_txn_commit(rtxn);
         }
     }
-    assert(total_got == 250);
+    CHECK(total_got == 250);
 
     yq_close(db);
     remove_db();
@@ -619,10 +619,10 @@ static void test_stat(void) {
     st.struct_size = sizeof(st);
 
     int rc = yq_db_stat(db, &st);
-    assert(rc == YQ_OK);
-    assert(st.struct_size == sizeof(yq_stat));
-    assert(st.format_version == 1);
-    assert(st.page_size == 4096);
+    CHECK_EQ(rc, YQ_OK);
+    CHECK(st.struct_size == sizeof(yq_stat));
+    CHECK(st.format_version == 1);
+    CHECK(st.page_size == 4096);
 
     yq_close(db);
     remove_db();
@@ -682,10 +682,10 @@ static void test_nosync(void) {
 
 static void test_strerror(void) {
     printf("test_strerror... ");
-    assert(strcmp(yq_strerror(YQ_OK), "success") == 0);
-    assert(strcmp(yq_strerror(YQ_ERR_NOMEM), "out of memory") == 0);
-    assert(strcmp(yq_strerror(YQ_ERR_NOTFOUND), "key not found") == 0);
-    assert(strcmp(yq_strerror(99), "unknown error") == 0);
+    CHECK(strcmp(yq_strerror(YQ_OK), "success") == 0);
+    CHECK(strcmp(yq_strerror(YQ_ERR_NOMEM), "out of memory") == 0);
+    CHECK(strcmp(yq_strerror(YQ_ERR_NOTFOUND), "key not found") == 0);
+    CHECK(strcmp(yq_strerror(99), "unknown error") == 0);
     printf("OK\n");
 }
 
@@ -693,10 +693,10 @@ static void test_version(void) {
     printf("test_version... ");
     int major = -1, minor = -1, patch = -1;
     int rc = yq_version(&major, &minor, &patch);
-    assert(rc == YQ_OK);
-    assert(major == 1);
-    assert(minor == 0);
-    assert(patch == 0);
+    CHECK_EQ(rc, YQ_OK);
+    CHECK(major == 1);
+    CHECK(minor == 0);
+    CHECK(patch == 0);
     printf("OK\n");
 }
 
@@ -720,36 +720,36 @@ static void test_reader_slots(void) {
 
     yq_db *db = NULL;
     int rc = yq_open(TEST_DB, &opts, &db);
-    assert(rc == YQ_OK);
+    CHECK_EQ(rc, YQ_OK);
 
     yq_stat st;
     memset(&st, 0, sizeof(st));
     st.struct_size = sizeof(st);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.max_readers == 2);
-    assert(st.active_readers == 0);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.max_readers == 2);
+    CHECK(st.active_readers == 0);
 
     /* A read-write transaction must be able to claim a slot and write. */
     yq_txn *w = NULL;
-    assert(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 1);
+    CHECK(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 1);
 
     yq_slice k = {"rk", 2};
     yq_slice v = {"rv", 2};
-    assert(yq_put(w, k, v, YQ_PUT_UPSERT) == YQ_OK);
-    assert(yq_txn_commit(w) == YQ_OK);
+    CHECK(yq_put(w, k, v, YQ_PUT_UPSERT) == YQ_OK);
+    CHECK(yq_txn_commit(w) == YQ_OK);
 
     /* Committing releases the slot, so the next transaction can claim one. */
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 0);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 0);
 
-    assert(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
-    assert(yq_txn_abort(w) == YQ_OK);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 0);
+    CHECK(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
+    CHECK(yq_txn_abort(w) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 0);
 
-    assert(yq_close(db) == YQ_OK);
+    CHECK(yq_close(db) == YQ_OK);
     remove_db();
     printf("OK\n");
 }
@@ -774,15 +774,15 @@ static void test_readonly_snapshot(void) {
     opts.max_readers = 2;
 
     yq_db *db = NULL;
-    assert(yq_open(TEST_DB, &opts, &db) == YQ_OK);
+    CHECK(yq_open(TEST_DB, &opts, &db) == YQ_OK);
 
     /* Seed one key with a write transaction. */
     yq_txn *w = NULL;
-    assert(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
+    CHECK(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
     yq_slice k = {"rk", 2};
     yq_slice v = {"rv", 2};
-    assert(yq_put(w, k, v, YQ_PUT_UPSERT) == YQ_OK);
-    assert(yq_txn_commit(w) == YQ_OK);
+    CHECK(yq_put(w, k, v, YQ_PUT_UPSERT) == YQ_OK);
+    CHECK(yq_txn_commit(w) == YQ_OK);
 
     yq_stat st;
     memset(&st, 0, sizeof(st));
@@ -790,38 +790,38 @@ static void test_readonly_snapshot(void) {
 
     /* Each read-only transaction must claim exactly one reader slot. */
     yq_txn *a = NULL, *b = NULL, *c = NULL;
-    assert(yq_txn_begin(db, YQ_TXN_READONLY, &a) == YQ_OK);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 1);
+    CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &a) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 1);
 
-    assert(yq_txn_begin(db, YQ_TXN_READONLY, &b) == YQ_OK);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 2);
+    CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &b) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 2);
 
     /* Slots exhausted: the next reader is rejected rather than going
      * unregistered, which is what makes the reclaim watermark correct. */
     int rc = yq_txn_begin(db, YQ_TXN_READONLY, &c);
-    assert(rc == YQ_ERR_READER_FULL);
-    assert(c == NULL);
+    CHECK(rc == YQ_ERR_READER_FULL);
+    CHECK(c == NULL);
 
     /* A read-only snapshot sees committed data, and cannot write. */
     yq_slice out = {0};
-    assert(yq_get(a, k, &out) == YQ_OK);
-    assert(out.size == 2 && memcmp(out.data, "rv", 2) == 0);
-    assert(yq_put(a, k, v, YQ_PUT_UPSERT) == YQ_ERR_READONLY);
-    assert(yq_del(a, k) == YQ_ERR_READONLY);
+    CHECK(yq_get(a, k, &out) == YQ_OK);
+    CHECK(out.size == 2 && memcmp(out.data, "rv", 2) == 0);
+    CHECK(yq_put(a, k, v, YQ_PUT_UPSERT) == YQ_ERR_READONLY);
+    CHECK(yq_del(a, k) == YQ_ERR_READONLY);
 
-    assert(yq_txn_commit(a) == YQ_OK);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 1);
+    CHECK(yq_txn_commit(a) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 1);
 
-    assert(yq_txn_begin(db, YQ_TXN_READONLY, &c) == YQ_OK);
-    assert(yq_txn_commit(b) == YQ_OK);
-    assert(yq_txn_abort(c) == YQ_OK);
-    assert(yq_db_stat(db, &st) == YQ_OK);
-    assert(st.active_readers == 0);
+    CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &c) == YQ_OK);
+    CHECK(yq_txn_commit(b) == YQ_OK);
+    CHECK(yq_txn_abort(c) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.active_readers == 0);
 
-    assert(yq_close(db) == YQ_OK);
+    CHECK(yq_close(db) == YQ_OK);
     remove_db();
     printf("OK\n");
 }
