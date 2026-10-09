@@ -118,6 +118,9 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
 
     if (mt->num_entries >= mt->cap_entries) {
         size_t new_cap = mt->cap_entries * 2;
+        if (new_cap < mt->cap_entries || new_cap > SIZE_MAX / sizeof(mt_entry)) {
+            return YQ_ERR_NOMEM;
+        }
         mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
         if (!new_entries) return YQ_ERR_NOMEM;
         mt->entries = new_entries;
@@ -297,6 +300,9 @@ int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out) {
     if (!it || !it->mt || it->pos >= it->mt->num_entries) {
         return YQ_ERR_CURSOR;
     }
+    if (!out) {
+        return YQ_ERR_INVAL;
+    }
 
     mt_entry *e = &it->mt->entries[it->pos];
     uint8_t *base = (uint8_t *)yq_memblk_base(it->mt->arena);
@@ -307,6 +313,9 @@ int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out) {
 int yq_memtable_iter_val(yq_memtable_iter *it, yq_slice *out) {
     if (!it || !it->mt || it->pos >= it->mt->num_entries) {
         return YQ_ERR_CURSOR;
+    }
+    if (!out) {
+        return YQ_ERR_INVAL;
     }
 
     mt_entry *e = &it->mt->entries[it->pos];

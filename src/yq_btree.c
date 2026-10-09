@@ -110,6 +110,15 @@ static uint8_t *alloc_page(yq_btree *bt, int is_leaf) {
     return page;
 }
 
+static void free_page(yq_btree *bt, uint8_t *page) {
+    if (!page) return;
+    if (bt->page_free) {
+        bt->page_free(bt->page_provider_ctx, 0);
+    } else if (!bt->arena) {
+        free(page);
+    }
+}
+
 static int cell_size(const uint8_t *page, uint16_t slot_idx, uint32_t page_size) {
     uint16_t offset = get_slot(page, slot_idx);
     uint8_t *cell = (uint8_t *)page + offset;
@@ -531,12 +540,19 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
             uint8_t key_buf[1025];
             size_t key_len = 0;
             read_key_from_slot(right_page, 0, key_buf, &key_len, bt->page_size);
+            if (key_len > 1024) {
+                free_page(bt, right_page);
+                return YQ_ERR_CORRUPT;
+            }
             median_key.data = key_buf;
             median_key.size = key_len;
 
             if (path_len == 0) {
                 uint8_t *new_root = alloc_page(bt, 0);
-                if (!new_root) return YQ_ERR_NOMEM;
+                if (!new_root) {
+                    free_page(bt, right_page);
+                    return YQ_ERR_NOMEM;
+                }
                 yq_page_header new_root_hdr = {0};
                 new_root_hdr.page_type = YQ_PAGE_TYPE_INTERNAL;
                 new_root_hdr.nkeys = 1;
@@ -627,6 +643,7 @@ int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
             if (yq_varint_decode(cell + pos, ps - offset - pos, &val_len, &n) != 0) return YQ_ERR_CORRUPT;
             pos += n;
 
+            if (!out) return YQ_ERR_INVAL;
             if (val_len <= YQ_INLINE_MAX(ps)) {
                 out->data = cell + pos;
                 out->size = (size_t)val_len;
@@ -895,6 +912,7 @@ int yq_btree_cursor_prev(yq_btree_cursor *c) {
 
 int yq_btree_cursor_key(yq_btree_cursor *c, yq_slice *out) {
     if (!c->valid) return YQ_ERR_CURSOR;
+    if (!out) return YQ_ERR_INVAL;
     yq_btree *bt = c->bt;
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
@@ -911,6 +929,7 @@ int yq_btree_cursor_key(yq_btree_cursor *c, yq_slice *out) {
 
 int yq_btree_cursor_val(yq_btree_cursor *c, yq_slice *out) {
     if (!c->valid) return YQ_ERR_CURSOR;
+    if (!out) return YQ_ERR_INVAL;
     yq_btree *bt = c->bt;
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
