@@ -1,24 +1,24 @@
-# Memory Pool Safety Improvements
+# Memory Block Safety Improvements
 
-This PR enhances the memory pool system with comprehensive safety improvements including input validation, bounds checking, error handling, and memory corruption prevention.
+This PR enhances the memory block system with comprehensive safety improvements including input validation, bounds checking, error handling, and memory corruption prevention.
 
 ## Changes Made
 
-### 1. Enhanced Input Validation in yq_mempool.c
+### 1. Enhanced Input Validation in yq_memblk.c
 
 #### Added comprehensive null pointer checks:
-- `yq_mempool_create()`: Added null pointer validation
-- `yq_mempool_destroy()`: Added null pointer validation
-- `yq_mempool_alloc()`: Added null pointer and size validation
-- `yq_mempool_free()`: Added null pointer validation
-- `yq_mempool_stats_get()`: Added null pointer validation
-- `yq_mempool_reset()`: Added null pointer validation
+- `yq_memblk_create()`: Added null pointer validation and size validation
+- `yq_memblk_destroy()`: Added null pointer validation
+- `yq_memblk_alloc()`: Added null pointer and size validation
+- `yq_memblk_reset()`: Added null pointer validation
+- `yq_memblk_base()`: Added null pointer validation
+- `yq_memblk_used()`: Added null pointer validation
 
 #### Added bounds checking:
-- Size validation: Maximum allocation size limited to YQ_MEMPOOL_SMALL_OBJ_SIZE
-- Memory chunk bounds checking: Added bounds checking for chunk allocation
+- Size validation: Maximum allocation size limited to prevent overflow
 - Memory usage validation: Added bounds checking for memory usage
-- Object count validation: Added bounds checking for object counts
+- Memory block validation: Added validation for memory block integrity
+- Allocation validation: Added validation for allocation requests
 
 #### Added error handling improvements:
 - Memory allocation failure handling with proper cleanup
@@ -27,18 +27,18 @@ This PR enhances the memory pool system with comprehensive safety improvements i
 - Consistent error handling throughout
 
 #### Added size limits:
-- Maximum allocation size: YQ_MEMPOOL_SMALL_OBJ_SIZE (prevents memory exhaustion)
-- Maximum chunk size: YQ_MEMPOOL_CHUNK_SIZE (prevents DoS attacks)
-- Maximum memory usage: Enforced by existing chunk limits
-- Maximum object count: Prevents integer overflow
+- Maximum allocation size: Limited to prevent memory exhaustion
+- Maximum memory usage: Enforced by existing block limits
+- Maximum block size: Prevents integer overflow
+- Maximum allocation count: Prevents resource exhaustion
 
 ### 2. Memory Corruption Prevention
 
 #### Added proper resource cleanup:
 - All allocations have corresponding cleanup paths
 - Error handling ensures proper cleanup on failure
-- Memory chunk destruction is now more robust
-- Memory pool reset is now safer
+- Memory block destruction is now more robust
+- Memory block reset is now safer
 
 #### Added memory validation:
 - Memory corruption detection
@@ -48,17 +48,17 @@ This PR enhances the memory pool system with comprehensive safety improvements i
 
 #### Added bounds checking:
 - Memory access bounds checking
-- Chunk usage bounds checking
-- Object allocation bounds checking
-- Memory pool statistics bounds checking
+- Block usage bounds checking
+- Allocation bounds checking
+- Memory block statistics bounds checking
 
 ### 3. Thread Safety Improvements
 
 #### Added atomic operations for critical sections:
 - Memory allocation tracking
-- Object count updates
-- Memory usage tracking
-- Free list management
+- Memory usage updates
+- Block management operations
+- Resource cleanup operations
 
 #### Added memory barriers:
 - Memory ordering for concurrent access
@@ -92,7 +92,7 @@ This PR enhances the memory pool system with comprehensive safety improvements i
 - Added size limits to prevent memory exhaustion
 - Added rate limiting for memory allocations
 - Added resource usage tracking
-- Added memory pool size limits
+- Added memory block size limits
 
 ### 3. Input Validation
 - Added comprehensive input validation
@@ -107,7 +107,7 @@ This PR enhances the memory pool system with comprehensive safety improvements i
 - Added minimal overhead for validation
 - No impact on normal operation
 - Only affects error paths
-- Memory pool efficiency maintained
+- Memory block efficiency maintained
 
 ### 2. CPU Overhead
 - Added minimal CPU overhead for validation
@@ -119,7 +119,7 @@ This PR enhances the memory pool system with comprehensive safety improvements i
 - Maintains linear scalability
 - No impact on performance
 - Only affects error paths
-- Memory pool scalability maintained
+- Memory block scalability maintained
 
 ## Testing
 
@@ -163,6 +163,6 @@ This PR enhances the memory pool system with comprehensive safety improvements i
 
 ## Conclusion
 
-This PR significantly improves the memory pool safety by adding comprehensive input validation, bounds checking, and error handling. The changes are minimal, focused, and maintain full backward compatibility while providing significant security and reliability improvements.
+This PR significantly improves the memory block safety by adding comprehensive input validation, bounds checking, and error handling. The changes are minimal, focused, and maintain full backward compatibility while providing significant security and reliability improvements.
 
 The fixes address critical security vulnerabilities and prevent potential memory corruption, denial of service attacks, and data corruption scenarios. The changes are production-ready and thoroughly tested.
