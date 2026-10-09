@@ -197,7 +197,8 @@ static void writer_unregister(yq_mvcc *mvcc) {
 #endif /* _WIN32 */
 
 int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file,
-                 uint32_t max_readers, uint32_t page_size) {
+                  uint32_t max_readers, uint32_t page_size) {
+    int rc = YQ_OK;
     yq_mvcc *mvcc = calloc(1, sizeof(yq_mvcc));
     if (!mvcc) return YQ_ERR_NOMEM;
 
@@ -225,14 +226,14 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
 
     if (fsize == 0) {
         shm_created = 1;
-        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) { free(mvcc); return YQ_ERR_IO; }
+        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) goto fail;
     } else if ((size_t)fsize < shm_size) {
-        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) { free(mvcc); return YQ_ERR_IO; }
+        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) goto fail;
     }
 
     mvcc->shm_size = shm_size;
     mvcc->shm_base = yq_file_mmap(shm_file, 0, shm_size);
-    if (!mvcc->shm_base) { free(mvcc); return YQ_ERR_IO; }
+    if (!mvcc->shm_base) goto fail;
 
     if (shm_created) {
         shm_header *hdr = (shm_header *)mvcc->shm_base;
@@ -253,9 +254,28 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
         }
     } else {
         shm_header *hdr = (shm_header *)mvcc->shm_base;
-        if (hdr->shm_magic != YQ_SHM_MAGIC) { yq_file_munmap(mvcc->shm_base, mvcc->shm_size); free(mvcc); return YQ_ERR_CORRUPT; }
-        if (hdr->shm_version != YQ_SHM_VERSION) { yq_file_munmap(mvcc->shm_base, mvcc->shm_size); free(mvcc); return YQ_ERR_VERSION; }
+        if (hdr->shm_magic != YQ_SHM_MAGIC) { rc = YQ_ERR_CORRUPT; goto fail; }
+        if (hdr->shm_version != YQ_SHM_VERSION) { rc = YQ_ERR_VERSION; goto fail; }
     }
+
+    *out = mvcc;
+    return YQ_OK;
+
+fail:
+    /*
+     * One cleanup path for every failure above: the scratch buffers
+     * (meta_buf, io_buf) are already allocated by this point and the shm
+     * may or may not be mapped, so release whatever is set before freeing
+     * the mvcc itself. The previous per-path "free(mvcc); return rc;"
+     * leaked both buffers on truncate, mmap and shm-header failures
+     * (gcc -fanalyzer, CWE-401) and leaked nothing new on the success
+     * path because it is only reached from the errors.
+     */
+    if (mvcc->shm_base) yq_file_munmap(mvcc->shm_base, mvcc->shm_size);
+    free(mvcc->meta_buf);
+    free(mvcc->io_buf);
+    free(mvcc);
+    return rc;
 
     *out = mvcc;
     return YQ_OK;
