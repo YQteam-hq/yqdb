@@ -16,10 +16,10 @@ static void crc32c_init_table(void) {
 }
 
 static void crc32c_init_table_once(void) {
-    static int initialized = 0;
+    static volatile int initialized = 0;
     if (!initialized) {
         crc32c_init_table();
-        initialized = 1;
+        __atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
     }
 }
 
