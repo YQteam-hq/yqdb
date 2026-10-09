@@ -133,6 +133,7 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
     rc = alloc_copy(mt, val.data, val.size, &voff);
     if (rc != YQ_OK) return rc;
 
+    if (idx > mt->num_entries) return YQ_ERR_INVAL;
     for (size_t i = mt->num_entries; i > idx; i--) {
         mt->entries[i] = mt->entries[i - 1];
     }
