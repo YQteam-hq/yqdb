@@ -222,6 +222,7 @@ int yq_recover(yq_wal *wal, yq_memtable *mt) {
     rc = yq_wal_scan(wal, 0, recovery_visitor, &ctx);
 
     if (rc == YQ_OK || rc == YQ_ERR_CORRUPT) {
+        int replay_rc = YQ_OK;
         for (size_t i = 0; i < ctx.ops_count; i++) {
             rec_op *op = &ctx.ops[i];
             if (!rc_hash_contains(&ctx.committed, op->txn_id)) continue;
@@ -232,12 +233,18 @@ int yq_recover(yq_wal *wal, yq_memtable *mt) {
                 yq_slice v;
                 v.data = ctx.vals ? ctx.vals + op->val_off : NULL;
                 v.size = op->val_len;
-                yq_memtable_put(mt, k, v);
+                int op_rc = yq_memtable_put(mt, k, v);
+                if (op_rc != YQ_OK) { replay_rc = op_rc; break; }
             } else if (op->type == 3) {
-                yq_memtable_del(mt, k);
+                int op_rc = yq_memtable_del(mt, k);
+                if (op_rc != YQ_OK) { replay_rc = op_rc; break; }
             }
         }
-        rc = YQ_OK;
+        if (replay_rc != YQ_OK) {
+            rc = replay_rc;
+        } else if (rc == YQ_ERR_CORRUPT) {
+            rc = YQ_OK;
+        }
     }
 
     rc_hash_destroy(&ctx.committed);
