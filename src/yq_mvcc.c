@@ -166,14 +166,11 @@ int yq_mvcc_acquire_snapshot(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
 #else
         /*
          * atomic_compare_exchange_strong returns a bool telling whether the
-         * swap happened -- it does NOT return the previous value. Comparing
-         * that bool against `expected` (which still holds the pre-swap value
-         * 0 on success) inverted the test, so the success branch was never
-         * entered and every snapshot acquisition fell through to
-         * YQ_ERR_READER_FULL.
+         * swap happened -- it does NOT return the previous value. So we
+         * check if the swap happened (true means success).
          */
         acquired = atomic_compare_exchange_strong((volatile atomic_uint *)&slots[i].active,
-                                                  &expected, 1) ? 1 : 0;
+                                                  &expected, 1);
 #endif
         if (acquired) {
             slots[i].pid = yq_mvcc_current_pid();

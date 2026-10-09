@@ -1,8 +1,10 @@
 #include "yq_wal.h"
 #include "yq_enc.h"
+#include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #define YQ_WAL_HEADER_SIZE 29
 #define YQ_WAL_MAX_KEY_SIZE 1024
@@ -20,11 +22,11 @@
 struct yq_wal {
     yq_file *file;
     uint8_t *buf;
-    size_t buf_cap;
-    size_t buf_used;
+    volatile atomic_size_t buf_cap;
+    volatile atomic_size_t buf_used;
     uint64_t default_page_size;
-    uint64_t file_size;
-    uint64_t last_lsn;
+    volatile atomic_uint64_t file_size;
+    volatile atomic_uint64_t last_lsn;
     char log_path[512];
 };
 
@@ -84,10 +86,14 @@ int yq_wal_close(yq_wal *wal) {
 }
 
 static int ensure_buf_space(yq_wal *wal, size_t need) {
-    if (wal->buf_used + need <= wal->buf_cap) return YQ_OK;
+    size_t buf_used = atomic_load(&wal->buf_used);
+    size_t buf_cap = atomic_load(&wal->buf_cap);
+    
+    if (buf_used + need <= buf_cap) return YQ_OK;
 
-    size_t new_cap = wal->buf_cap;
-    while (new_cap < wal->buf_used + need) {
+    size_t new_cap = buf_cap;
+    while (new_cap < buf_used + need) {
+        if (new_cap > SIZE_MAX / 2) return YQ_ERR_NOMEM;
         new_cap *= 2;
     }
 
@@ -95,7 +101,7 @@ static int ensure_buf_space(yq_wal *wal, size_t need) {
     if (!new_buf) return YQ_ERR_NOMEM;
 
     wal->buf = new_buf;
-    wal->buf_cap = new_cap;
+    atomic_store(&wal->buf_cap, new_cap);
     return YQ_OK;
 }
 
@@ -235,14 +241,17 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
 }
 
 int yq_wal_flush(yq_wal *wal) {
-    if (!wal || wal->buf_used == 0) return YQ_OK;
+    if (!wal) return YQ_ERR_INVAL;
+    
+    size_t buf_used = atomic_load(&wal->buf_used);
+    if (buf_used == 0) return YQ_OK;
 
-    size_t offset = wal->file_size;
+    size_t offset = atomic_load(&wal->file_size);
     size_t pos = 0;
 
-    while (pos < wal->buf_used) {
+    while (pos < buf_used) {
         uint8_t *rec = wal->buf + pos;
-        uint64_t lsn = ++wal->last_lsn;
+        uint64_t lsn = atomic_fetch_add(&wal->last_lsn, 1) + 1;
         memcpy(rec + 0, &lsn, 8);
 
         uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
@@ -274,8 +283,8 @@ int yq_wal_flush(yq_wal *wal) {
     int rc = yq_file_sync(wal->file);
     if (rc != YQ_OK) return rc;
 
-    wal->file_size += wal->buf_used;
-    wal->buf_used = 0;
+    atomic_fetch_add(&wal->file_size, buf_used);
+    atomic_store(&wal->buf_used, 0);
 
     return YQ_OK;
 }
@@ -329,8 +338,8 @@ int yq_wal_truncate(yq_wal *wal, uint64_t lsn) {
     int rc = yq_file_truncate(wal->file, target_pos);
     if (rc != YQ_OK) return rc;
 
-    wal->file_size = target_pos;
-    wal->last_lsn = target_lsn;
+    atomic_store(&wal->file_size, target_pos);
+    atomic_store(&wal->last_lsn, target_lsn);
 
     return YQ_OK;
 }
