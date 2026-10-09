@@ -31,6 +31,7 @@ static size_t round_up(size_t n, size_t align) {
 
 yq_memblk *yq_memblk_create(size_t size) {
     if (size == 0) size = 4096;
+    if (size > (1ULL << 30)) return NULL; /* 1GB limit */
     size = round_up(size, 4096);
 #ifdef _WIN32
     void *p = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -56,6 +57,7 @@ yq_memblk *yq_memblk_create(size_t size) {
 }
 
 void yq_memblk_destroy(yq_memblk *b) {
+    if (!b) return;
     while (b) {
         yq_memblk *next = b->next;
         if (b->base) {
@@ -71,22 +73,30 @@ void yq_memblk_destroy(yq_memblk *b) {
 }
 
 void *yq_memblk_alloc(yq_memblk *b, size_t size) {
-    if (!b || size == 0) return NULL;
+    if (!b || !size) return NULL;
+    if (size > (1ULL << 20)) return NULL; /* 1MB limit */
     size_t aligned = round_up(size, 8);
     if (b->used + aligned > b->size) return NULL;
+    if (b->used > (1ULL << 30)) return NULL; /* Prevent overflow */
     void *ret = b->base + b->used;
     b->used += aligned;
     return ret;
 }
 
 void yq_memblk_reset(yq_memblk *b) {
-    if (b) b->used = 0;
+    if (!b) return;
+    if (b->size > (1ULL << 30)) return; /* Validate bounds */
+    b->used = 0;
 }
 
 void *yq_memblk_base(yq_memblk *b) {
-    return b ? b->base : NULL;
+    if (!b) return NULL;
+    if (b->size > (1ULL << 30)) return NULL; /* Validate bounds */
+    return b->base;
 }
 
 size_t yq_memblk_used(yq_memblk *b) {
-    return b ? b->used : 0;
+    if (!b) return 0;
+    if (b->size > (1ULL << 30)) return 0; /* Validate bounds */
+    return b->used;
 }
