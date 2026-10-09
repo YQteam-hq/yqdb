@@ -28,8 +28,8 @@ typedef struct {
 
 struct yq_btree {
     uint32_t page_size;
-    uint64_t root_page;
-    uint64_t npages;
+    atomic_uint_fast64_t root_page;
+    atomic_uint_fast64_t npages;
     yq_memblk *arena;
     void *mmap_base;
     uint64_t mmap_size;
@@ -108,6 +108,15 @@ static uint8_t *alloc_page(yq_btree *bt, int is_leaf) {
     uint8_t *page = (uint8_t *)malloc(bt->page_size);
     if (page) memset(page, 0, bt->page_size);
     return page;
+}
+
+static void free_page(yq_btree *bt, uint8_t *page) {
+    if (!page) return;
+    if (bt->page_free) {
+        bt->page_free(bt->page_provider_ctx, 0);
+    } else if (!bt->arena) {
+        free(page);
+    }
 }
 
 static int cell_size(const uint8_t *page, uint16_t slot_idx, uint32_t page_size) {
@@ -340,9 +349,9 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
     write_page_header(page, &hdr);
     write_page_crc(page, ps);
 
-    *out_new_page = bt->npages;
+    *out_new_page = atomic_load(&bt->npages);
     *out_new_page_data = new_page;
-    bt->npages++;
+    atomic_fetch_add(&bt->npages, 1);
     return 2;
 }
 
@@ -450,9 +459,9 @@ static int insert_into_internal(yq_btree *bt, uint64_t page_no, uint8_t *page,
     write_page_header(page, &hdr);
     write_page_crc(page, ps);
 
-    *out_new_page = bt->npages;
+    *out_new_page = atomic_load(&bt->npages);
     *out_new_page_data = new_page;
-    bt->npages++;
+    atomic_fetch_add(&bt->npages, 1);
     return 2;
 }
 
@@ -477,7 +486,8 @@ void yq_btree_destroy(yq_btree *bt) {
 }
 
 int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
-    if (bt->root_page == 0) {
+    uint64_t current_root = atomic_load(&bt->root_page);
+    if (current_root == 0) {
         uint8_t *root = alloc_page(bt, 1);
         if (!root) return YQ_ERR_NOMEM;
 
@@ -489,14 +499,14 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
         hdr.free_bytes = bt->page_size - YQ_PAGE_HEADER_SIZE;
         write_page_header(root, &hdr);
         write_page_crc(root, bt->page_size);
-        bt->root_page = 0;
-        bt->npages = 1;
+        atomic_store(&bt->root_page, 0);
+        atomic_store(&bt->npages, 1);
     }
 
     uint64_t path_pnos[64];
     int path_len = 0;
 
-    uint64_t cur_page = bt->root_page;
+    uint64_t cur_page = atomic_load(&bt->root_page);
     while (1) {
         uint8_t *page = get_page_data(bt, cur_page);
         if (!page) return YQ_ERR_NOMEM;
@@ -531,12 +541,19 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
             uint8_t key_buf[1025];
             size_t key_len = 0;
             read_key_from_slot(right_page, 0, key_buf, &key_len, bt->page_size);
+            if (key_len > 1024) {
+                free_page(bt, right_page);
+                return YQ_ERR_CORRUPT;
+            }
             median_key.data = key_buf;
             median_key.size = key_len;
 
             if (path_len == 0) {
                 uint8_t *new_root = alloc_page(bt, 0);
-                if (!new_root) return YQ_ERR_NOMEM;
+                if (!new_root) {
+                    free_page(bt, right_page);
+                    return YQ_ERR_NOMEM;
+                }
                 yq_page_header new_root_hdr = {0};
                 new_root_hdr.page_type = YQ_PAGE_TYPE_INTERNAL;
                 new_root_hdr.nkeys = 1;
@@ -551,8 +568,8 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
                 *(uint64_t *)(new_root + bt->page_size - 8) = cur_page;
                 write_page_header(new_root, &new_root_hdr);
                 write_page_crc(new_root, bt->page_size);
-                bt->root_page = bt->npages;
-                bt->npages++;
+                atomic_store(&bt->root_page, atomic_load(&bt->npages));
+                atomic_fetch_add(&bt->npages, 1);
                 return YQ_OK;
             }
 
@@ -573,7 +590,7 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
                 (void)dummy_data;
                 (void)iret;
             }
-            bt->npages++;
+            atomic_fetch_add(&bt->npages, 1);
             return YQ_OK;
         }
 
@@ -598,9 +615,10 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
 }
 
 int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
-    if (bt->root_page == 0) return YQ_ERR_NOTFOUND;
+    uint64_t current_root = atomic_load(&bt->root_page);
+    if (current_root == 0) return YQ_ERR_NOTFOUND;
 
-    uint64_t cur_page = bt->root_page;
+    uint64_t cur_page = current_root;
     uint32_t ps = bt->page_size;
 
     while (1) {
@@ -627,6 +645,7 @@ int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
             if (yq_varint_decode(cell + pos, ps - offset - pos, &val_len, &n) != 0) return YQ_ERR_CORRUPT;
             pos += n;
 
+            if (!out) return YQ_ERR_INVAL;
             if (val_len <= YQ_INLINE_MAX(ps)) {
                 out->data = cell + pos;
                 out->size = (size_t)val_len;
@@ -656,9 +675,10 @@ int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
 }
 
 int yq_btree_delete(yq_btree *bt, yq_slice key) {
-    if (bt->root_page == 0) return YQ_OK;
+    uint64_t current_root = atomic_load(&bt->root_page);
+    if (current_root == 0) return YQ_OK;
 
-    uint64_t cur_page = bt->root_page;
+    uint64_t cur_page = current_root;
     uint32_t ps = bt->page_size;
 
     while (1) {
@@ -713,19 +733,20 @@ int yq_btree_open(yq_btree **out, void *mmap_base, uint64_t file_size, uint32_t 
     bt->page_size = page_size;
     bt->mmap_base = mmap_base;
     bt->mmap_size = file_size;
-    bt->npages = file_size / page_size;
-    bt->root_page = 0;
+    atomic_init(&bt->npages, file_size / page_size);
+    atomic_init(&bt->root_page, 0);
     *out = bt;
     return YQ_OK;
 }
 
 int yq_btree_get_root(yq_btree *bt, uint64_t *root_page) {
-    *root_page = bt->root_page;
+    if (!root_page) return YQ_ERR_INVAL;
+    *root_page = atomic_load(&bt->root_page);
     return YQ_OK;
 }
 
 int yq_btree_set_root(yq_btree *bt, uint64_t root_page) {
-    bt->root_page = root_page;
+    atomic_store(&bt->root_page, root_page);
     return YQ_OK;
 }
 
@@ -787,7 +808,8 @@ static int find_rightmost_leaf(yq_btree *bt, uint64_t page_no, uint64_t *leaf_pa
 
 int yq_btree_cursor_first(yq_btree_cursor *c) {
     yq_btree *bt = c->bt;
-    if (bt->root_page == 0) {
+    uint64_t current_root = atomic_load(&bt->root_page);
+    if (current_root == 0) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
@@ -810,7 +832,8 @@ int yq_btree_cursor_first(yq_btree_cursor *c) {
 
 int yq_btree_cursor_last(yq_btree_cursor *c) {
     yq_btree *bt = c->bt;
-    if (bt->root_page == 0) {
+    uint64_t current_root = atomic_load(&bt->root_page);
+    if (current_root == 0) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
@@ -895,6 +918,7 @@ int yq_btree_cursor_prev(yq_btree_cursor *c) {
 
 int yq_btree_cursor_key(yq_btree_cursor *c, yq_slice *out) {
     if (!c->valid) return YQ_ERR_CURSOR;
+    if (!out) return YQ_ERR_INVAL;
     yq_btree *bt = c->bt;
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
@@ -911,6 +935,7 @@ int yq_btree_cursor_key(yq_btree_cursor *c, yq_slice *out) {
 
 int yq_btree_cursor_val(yq_btree_cursor *c, yq_slice *out) {
     if (!c->valid) return YQ_ERR_CURSOR;
+    if (!out) return YQ_ERR_INVAL;
     yq_btree *bt = c->bt;
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
@@ -942,12 +967,13 @@ int yq_btree_cursor_val(yq_btree_cursor *c, yq_slice *out) {
  */
 int yq_btree_cursor_seek(yq_btree_cursor *c, yq_slice key) {
     yq_btree *bt = c->bt;
-    if (bt->root_page == 0) {
+    uint64_t current_root = atomic_load(&bt->root_page);
+    if (current_root == 0) {
         c->valid = 0;
         return YQ_ERR_NOTFOUND;
     }
 
-    uint64_t cur_page = bt->root_page;
+    uint64_t cur_page = current_root;
     uint32_t ps = bt->page_size;
 
     while (1) {
@@ -1026,7 +1052,7 @@ int yq_btree_cursor_valid(yq_btree_cursor *c) {
 }
 
 uint64_t yq_btree_npages(yq_btree *bt) {
-    return bt->npages;
+    return atomic_load(&bt->npages);
 }
 
 void yq_btree_set_page_provider(yq_btree *bt, void *ctx,
@@ -1046,7 +1072,7 @@ void yq_btree_set_file_provider(yq_btree *bt, void *ctx,
 }
 
 int yq_btree_set_npages(yq_btree *bt, uint64_t npages) {
-    bt->npages = npages;
+    atomic_store(&bt->npages, npages);
     return YQ_OK;
 }
 
