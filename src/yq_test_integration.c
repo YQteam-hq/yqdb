@@ -1425,6 +1425,64 @@ static void test_key_value_limits(void) {
     remove_db();
     printf("OK\n");
 }
+/*
+ * The pool keeps one free list per size class (regression guard).
+ *
+ * The pool used to keep a single mixed-size free list: free() pushed any
+ * object onto it and alloc() popped any object off it, so a 256-byte
+ * request could be handed a slot that had been freed after a 64-byte
+ * allocation. Filling that object then ran past the slot into its
+ * neighbour. Both neighbours are filled with known patterns here and must
+ * survive any fill of the larger object.
+ */
+static void test_mempool_size_classes(void) {
+    printf("test_mempool_size_classes... ");
+
+    yq_mempool *pool = yq_mempool_create();
+    CHECK(pool != NULL);
+
+    unsigned char *a = (unsigned char *)yq_mempool_alloc(pool, 64);
+    unsigned char *b = (unsigned char *)yq_mempool_alloc(pool, 64);
+    CHECK(a != NULL && b != NULL);
+    memset(a, 0xAA, 64);
+    memset(b, 0xBB, 64);
+
+    yq_mempool_free(pool, a);
+
+    /* A 256-byte request must not be served the 64-byte slot. */
+    unsigned char *c = (unsigned char *)yq_mempool_alloc(pool, 256);
+    CHECK(c != NULL);
+    CHECK(c != a);
+    memset(c, 0xCC, 256);
+
+    int clobbered = 0;
+    for (int i = 0; i < 64; i++) {
+        if (b[i] != 0xBB) clobbered++;
+    }
+    CHECK(clobbered == 0);
+
+    /* Same-class reuse still works: the next 64-byte request takes the slot. */
+    unsigned char *d = (unsigned char *)yq_mempool_alloc(pool, 64);
+    CHECK(d == a);
+    memset(d, 0xDD, 64);
+    clobbered = 0;
+    for (int i = 0; i < 64; i++) {
+        if (b[i] != 0xBB) clobbered++;
+    }
+    CHECK(clobbered == 0);
+
+    yq_mempool_stats st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+    CHECK_EQ(yq_mempool_stats_get(pool, &st), YQ_OK);
+    CHECK(st.chunks_allocated == 1);
+    CHECK(st.objects_allocated == 3);
+    CHECK(st.objects_freed == 1);
+    CHECK(st.free_objects == 0);
+
+    yq_mempool_destroy(pool);
+    printf("OK\n");
+}
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -1456,6 +1514,7 @@ int main(void) {
     test_checkpoint_large_value();
     test_key_value_limits();
     test_nosync();
+    test_mempool_size_classes();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

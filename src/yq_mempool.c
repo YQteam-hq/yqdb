@@ -36,20 +36,48 @@ struct yq_freeobj {
 };
 
 /*
+ * Header stored in front of every pool object.
+ *
+ * The pool used to keep one mixed-size free list: free() pushed any object
+ * onto it and alloc() popped any object off it, regardless of the slot size
+ * the object originally occupied. A 256-byte request could therefore be
+ * served a 64-byte slot and the write silently ran past it into the
+ * neighbouring object. free() now reads the header back to learn the slot
+ * size and returns the object to the matching size class, and alloc() only
+ * ever reuses a slot of its own class.
+ */
+#define YQ_MEMPOOL_OBJ_MAGIC 0x59514F42u  /* "YQOB" */
+
+typedef struct {
+    uint32_t slot_size;         /* Usable bytes behind this header */
+    uint32_t magic;             /* YQ_MEMPOOL_OBJ_MAGIC */
+} yq_obj_header;
+
+/* Number of size classes: 8, 16, ... YQ_MEMPOOL_SMALL_OBJ_SIZE bytes. */
+#define YQ_MEMPOOL_CLASS_COUNT (YQ_MEMPOOL_SMALL_OBJ_SIZE / 8)
+
+#define YQ_MEMPOOL_HDR_SIZE (sizeof(yq_obj_header))
+
+/*
  * Memory pool implementation
  */
 struct yq_mempool {
-    struct yq_freeobj *free_list;    /* List of free small objects */
+    struct yq_freeobj *free_classes[YQ_MEMPOOL_CLASS_COUNT]; /* per-size free lists */
     struct yq_memchunk *chunks;      /* List of memory chunks */
     uint32_t chunks_count;          /* Number of chunks */
     uint32_t objects_allocated;      /* Current allocated objects */
     uint32_t objects_freed;         /* Lifetime freed objects */
-    uint32_t free_objects;          /* Objects in free list */
+    uint32_t free_objects;          /* Objects in all free lists */
 };
 
 /* Round up to alignment boundary */
 static size_t round_up(size_t n, size_t align) {
     return (n + align - 1) & ~(align - 1);
+}
+
+/* Size class index for an already rounded-up slot size (8..256). */
+static size_t size_class(size_t rounded) {
+    return rounded / 8 - 1;
 }
 
 /* Create a new memory chunk */
@@ -98,7 +126,9 @@ yq_mempool *yq_mempool_create(void) {
     yq_mempool *pool = malloc(sizeof(yq_mempool));
     if (!pool) return NULL;
     
-    pool->free_list = NULL;
+    for (size_t i = 0; i < YQ_MEMPOOL_CLASS_COUNT; i++) {
+        pool->free_classes[i] = NULL;
+    }
     pool->chunks = NULL;
     pool->chunks_count = 0;
     pool->objects_allocated = 0;
@@ -129,20 +159,24 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
     }
     
     /* Round up size to alignment boundary */
-    size = round_up(size, 8);
-    
-    /* First, try to get from free list */
-    if (pool->free_list) {
-        struct yq_freeobj *obj = pool->free_list;
-        pool->free_list = obj->next;
+    size_t rounded = round_up(size, 8);
+    size_t cls = size_class(rounded);
+
+    /* First, try to get an object of exactly this size class. A slot freed
+     * from another class is never handed out here: mixing them is what let
+     * a small slot be reused for a large request. */
+    if (pool->free_classes[cls]) {
+        struct yq_freeobj *obj = pool->free_classes[cls];
+        pool->free_classes[cls] = obj->next;
         pool->free_objects--;
         pool->objects_allocated++;
         memset(obj, 0, size);  /* Zero-fill for security */
         return obj;
     }
     
-    /* No free objects available, allocate from a new chunk */
-    if (pool->chunks == NULL || pool->chunks->used + size > YQ_MEMPOOL_CHUNK_SIZE) {
+    /* No free objects of this class, allocate from a chunk */
+    if (pool->chunks == NULL ||
+        pool->chunks->used + YQ_MEMPOOL_HDR_SIZE + rounded > YQ_MEMPOOL_CHUNK_SIZE) {
         /* Need a new chunk */
         struct yq_memchunk *new_chunk = memchunk_create();
         if (!new_chunk) return NULL;
@@ -153,9 +187,12 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
     }
     
     struct yq_memchunk *chunk = pool->chunks;
-    void *ptr = chunk->memory + chunk->used;
-    chunk->used += size;
-    
+    yq_obj_header *hdr = (yq_obj_header *)(chunk->memory + chunk->used);
+    hdr->slot_size = (uint32_t)rounded;
+    hdr->magic = YQ_MEMPOOL_OBJ_MAGIC;
+    chunk->used += YQ_MEMPOOL_HDR_SIZE + rounded;
+
+    void *ptr = (char *)hdr + YQ_MEMPOOL_HDR_SIZE;
     pool->objects_allocated++;
     memset(ptr, 0, size);  /* Zero-fill for security */
     return ptr;
@@ -164,10 +201,25 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
 void yq_mempool_free(yq_mempool *pool, void *ptr) {
     if (!pool || !ptr) return;
     
-    /* Add to free list */
+    /*
+     * Recover the slot size from the header in front of the object so it can
+     * go back to its own size class. A pointer that does not carry a pool
+     * header is not ours: silently queueing it used to corrupt the free list
+     * (and, with one mixed list, served wrong-sized slots), so ignore it.
+     */
+    yq_obj_header *hdr = (yq_obj_header *)((char *)ptr - YQ_MEMPOOL_HDR_SIZE);
+    if (hdr->magic != YQ_MEMPOOL_OBJ_MAGIC) return;
+    if (hdr->slot_size == 0 || hdr->slot_size > YQ_MEMPOOL_SMALL_OBJ_SIZE ||
+        (hdr->slot_size & 7u) != 0) {
+        return;
+    }
+
+    size_t cls = size_class(hdr->slot_size);
+    
+    /* Add to the free list of its size class */
     struct yq_freeobj *obj = (struct yq_freeobj *)ptr;
-    obj->next = pool->free_list;
-    pool->free_list = obj;
+    obj->next = pool->free_classes[cls];
+    pool->free_classes[cls] = obj;
     
     pool->objects_allocated--;
     pool->objects_freed++;
@@ -200,8 +252,10 @@ void yq_mempool_reset(yq_mempool *pool) {
         chunk = chunk->next;
     }
     
-    /* Reset free list and counters */
-    pool->free_list = NULL;
+    /* Reset every free list and the counters */
+    for (size_t i = 0; i < YQ_MEMPOOL_CLASS_COUNT; i++) {
+        pool->free_classes[i] = NULL;
+    }
     pool->objects_allocated = 0;
     pool->objects_freed = 0;
     pool->free_objects = 0;
