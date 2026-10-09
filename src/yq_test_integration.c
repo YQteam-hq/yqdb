@@ -700,6 +700,60 @@ static void test_version(void) {
     printf("OK\n");
 }
 
+/*
+ * Reader-slot acquisition / release.
+ *
+ * Regression guard for the shared-memory slot CAS: when the claim never
+ * reported success, every read-write yq_txn_begin() returned
+ * YQ_ERR_READER_FULL on POSIX while still marking every slot active.
+ */
+static void test_reader_slots(void) {
+    printf("test_reader_slots... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+    opts.max_readers = 2;
+
+    yq_db *db = NULL;
+    int rc = yq_open(TEST_DB, &opts, &db);
+    assert(rc == YQ_OK);
+
+    yq_stat st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.max_readers == 2);
+    assert(st.active_readers == 0);
+
+    /* A read-write transaction must be able to claim a slot and write. */
+    yq_txn *w = NULL;
+    assert(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 1);
+
+    yq_slice k = {"rk", 2};
+    yq_slice v = {"rv", 2};
+    assert(yq_put(w, k, v, YQ_PUT_UPSERT) == YQ_OK);
+    assert(yq_txn_commit(w) == YQ_OK);
+
+    /* Committing releases the slot, so the next transaction can claim one. */
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 0);
+
+    assert(yq_txn_begin(db, YQ_TXN_READWRITE, &w) == YQ_OK);
+    assert(yq_txn_abort(w) == YQ_OK);
+    assert(yq_db_stat(db, &st) == YQ_OK);
+    assert(st.active_readers == 0);
+
+    assert(yq_close(db) == YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -716,6 +770,7 @@ int main(void) {
     test_batch();
     test_batch_api();
     test_stat();
+    test_reader_slots();
     test_nosync();
 
     printf("\n=== ALL TESTS PASSED ===\n");
