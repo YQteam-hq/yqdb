@@ -65,6 +65,9 @@ struct yq_txn {
     pending_op *pending;
     size_t pending_count;
     size_t pending_cap;
+    /* Simple hash table for pending operations to speed up lookups */
+    pending_op **pending_hash;
+    size_t pending_hash_size;
 };
 
 struct yq_cur {
@@ -333,7 +336,27 @@ int yq_close(yq_db *db) {
     return YQ_OK;
 }
 
+/* Simple hash function for pending operations */
+static size_t pending_hash(yq_slice key, size_t table_size) {
+    size_t hash = 0;
+    for (size_t i = 0; i < key.size && i < 8; i++) {
+        hash = (hash << 5) + key.data[i];
+    }
+    return hash % table_size;
+}
+
 static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
+    /* Use hash table for faster lookups when available */
+    if (txn->pending_hash && txn->pending_hash_size > 0) {
+        size_t hash_idx = pending_hash(key, txn->pending_hash_size);
+        pending_op *op = txn->pending_hash[hash_idx];
+        if (op && op->key_len == key.size && memcmp(op->key, key.data, key.size) == 0) {
+            if (idx_out) *idx_out = (size_t)-1; /* Not used with hash table */
+            return op;
+        }
+    }
+    
+    /* Fall back to linear search for compatibility */
     for (size_t i = txn->pending_count; i > 0; i--) {
         pending_op *op = &txn->pending[i - 1];
         if (op->key_len == key.size && memcmp(op->key, key.data, key.size) == 0) {
@@ -373,6 +396,27 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
         op->val_len = val.size;
     }
     txn->pending_count++;
+    
+    /* Update hash table for faster lookups */
+    if (!txn->pending_hash && txn->pending_count > 16) {
+        /* Initialize hash table when we have enough operations */
+        size_t hash_size = txn->pending_count;
+        txn->pending_hash = calloc(hash_size, sizeof(pending_op *));
+        if (!txn->pending_hash) return YQ_OK; /* Continue without hash table */
+        txn->pending_hash_size = hash_size;
+        
+        /* Populate hash table */
+        for (size_t i = 0; i < txn->pending_count; i++) {
+            pending_op *p = &txn->pending[i];
+            size_t hash_idx = pending_hash((yq_slice){p->key, p->key_len}, hash_size);
+            txn->pending_hash[hash_idx] = p;
+        }
+    } else if (txn->pending_hash) {
+        /* Update existing hash table */
+        size_t hash_idx = pending_hash(key, txn->pending_hash_size);
+        txn->pending_hash[hash_idx] = op;
+    }
+    
     return YQ_OK;
 }
 
@@ -386,6 +430,11 @@ static void pending_free(yq_txn *txn) {
     txn->pending = NULL;
     txn->pending_count = 0;
     txn->pending_cap = 0;
+    
+    /* Clean up hash table */
+    free(txn->pending_hash);
+    txn->pending_hash = NULL;
+    txn->pending_hash_size = 0;
 }
 
 static int pending_apply(yq_txn *txn) {
