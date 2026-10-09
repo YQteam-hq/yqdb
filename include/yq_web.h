@@ -24,10 +24,10 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <pthread.h>
 #include <time.h>
 
 #include "yq.h"
+#include "yq_thread.h"   /* 跨平台线程原语，替代原先直接依赖 <pthread.h> */
 
 #ifdef __cplusplus
 extern "C" {

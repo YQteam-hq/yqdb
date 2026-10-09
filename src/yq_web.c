@@ -7,16 +7,15 @@
 
 #include "yq_web.h"
 #include "yq.h"
+#include "yq_thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <time.h>
+#if !defined(_WIN32)
 #include <sys/time.h>
+#endif
+#include <time.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -24,7 +23,9 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <signal.h>
+#if !defined(_WIN32)
 #include <strings.h>
+#endif
 
 /* Internal web server state */
 static struct {
@@ -34,8 +35,8 @@ static struct {
     yq_web_stats stats;
     yq_web_session *sessions;
     yq_web_user *users;
-    pthread_mutex_t mutex;
-    pthread_t *threads;
+    yq_mutex_t mutex;
+    yq_thread_t *threads;
     uint32_t thread_count;
 } g_web_server = {0};
 
@@ -344,36 +345,29 @@ int yq_web_init(yq_web_config *config, int *out_server_fd) {
     memcpy(&g_web_server.config, config, sizeof(yq_web_config));
     
     /* Initialize mutex */
-    pthread_mutex_init(&g_web_server.mutex, NULL);
+    yq_mutex_init(&g_web_server.mutex);
     
     /* Create server socket */
-    g_web_server.server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    g_web_server.server_fd = yq_sock_open();
     if (g_web_server.server_fd < 0) {
         return YQ_WEB_ERR_CONN;
     }
     
     /* Set socket options */
-    int opt = 1;
-    if (setsockopt(g_web_server.server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        close(g_web_server.server_fd);
+    if (yq_sock_set_reuseaddr(g_web_server.server_fd) < 0) {
+        yq_sock_close(g_web_server.server_fd);
         return YQ_WEB_ERR_CONN;
     }
-    
-    /* Bind socket */
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(g_web_server.config.port);
-    
-    if (bind(g_web_server.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(g_web_server.server_fd);
+
+    /* Bind socket（地址结构由 yq_sock_bind 内部按平台组装） */
+    if (yq_sock_bind(g_web_server.server_fd, (uint16_t)g_web_server.config.port) < 0) {
+        yq_sock_close(g_web_server.server_fd);
         return YQ_WEB_ERR_CONN;
     }
     
     /* Listen for connections */
-    if (listen(g_web_server.server_fd, g_web_server.config.max_connections) < 0) {
-        close(g_web_server.server_fd);
+    if (yq_sock_listen(g_web_server.server_fd, g_web_server.config.max_connections) < 0) {
+        yq_sock_close(g_web_server.server_fd);
         return YQ_WEB_ERR_CONN;
     }
     
@@ -384,7 +378,7 @@ int yq_web_init(yq_web_config *config, int *out_server_fd) {
     /* Initialize admin user */
     g_web_server.users = malloc(sizeof(yq_web_user));
     if (!g_web_server.users) {
-        close(g_web_server.server_fd);
+        yq_sock_close(g_web_server.server_fd);
         return YQ_WEB_ERR_NOMEM;
     }
     
@@ -428,10 +422,10 @@ int yq_web_shutdown(int server_fd) {
     g_web_server.running = 0;
     
     /* Close server socket */
-    close(g_web_server.server_fd);
+    yq_sock_close(g_web_server.server_fd);
     
     /* Cleanup sessions */
-    pthread_mutex_lock(&g_web_server.mutex);
+    yq_mutex_lock(&g_web_server.mutex);
     yq_web_session *session = g_web_server.sessions;
     while (session) {
         yq_web_session *next = session->next;
@@ -449,7 +443,7 @@ int yq_web_shutdown(int server_fd) {
     }
     g_web_server.users = NULL;
     
-    pthread_mutex_unlock(&g_web_server.mutex);
+    yq_mutex_unlock(&g_web_server.mutex);
     
     /* Cleanup threads */
     if (g_web_server.threads) {
@@ -458,7 +452,7 @@ int yq_web_shutdown(int server_fd) {
     }
     
     /* Destroy mutex */
-    pthread_mutex_destroy(&g_web_server.mutex);
+    yq_mutex_destroy(&g_web_server.mutex);
     
     yq_web_log("Web server shutdown");
     
@@ -482,7 +476,7 @@ static ssize_t yq_web_recv_line(int fd, char *out, size_t cap) {
     size_t n = 0;
     while (n + 1 < cap) {
         char c;
-        ssize_t r = recv(fd, &c, 1, 0);
+        int r = yq_sock_recv(fd, &c, 1);
         if (r <= 0) break;
         if (c == '\n') break;
         if (c == '\r') continue;
@@ -528,14 +522,14 @@ static void *yq_web_worker_thread(void *arg) {
     (void)arg;
 
     while (1) {
-        pthread_mutex_lock(&g_web_server.mutex);
+        yq_mutex_lock(&g_web_server.mutex);
         int running = g_web_server.running;
         int listen_fd = g_web_server.server_fd;
-        pthread_mutex_unlock(&g_web_server.mutex);
+        yq_mutex_unlock(&g_web_server.mutex);
 
         if (!running || listen_fd < 0) break;
 
-        int client_fd = accept(listen_fd, NULL, NULL);
+        yq_socket_t client_fd = yq_sock_accept(listen_fd);
         if (client_fd < 0) {
             /* 被信号打断或 stop() 关闭了监听套接字，都不是错误。 */
             if (errno == EINTR || errno == EBADF || errno == EINVAL) break;
@@ -567,7 +561,7 @@ static void *yq_web_worker_thread(void *arg) {
                 if (want > sizeof(request.body) - 1) want = sizeof(request.body) - 1;
                 size_t got = 0;
                 while (got < want) {
-                    ssize_t r = recv(client_fd, request.body + got, want - got, 0);
+                    int r = yq_sock_recv(client_fd, request.body + got, (int)(want - got));
                     if (r <= 0) break;
                     got += (size_t)r;
                 }
@@ -577,17 +571,17 @@ static void *yq_web_worker_thread(void *arg) {
 
             yq_web_process_request(&request, &response);
 
-            pthread_mutex_lock(&g_web_server.mutex);
+            yq_mutex_lock(&g_web_server.mutex);
             g_web_server.stats.total_requests++;
             if (response.status < 400) g_web_server.stats.successful_requests++;
             else                       g_web_server.stats.failed_requests++;
-            pthread_mutex_unlock(&g_web_server.mutex);
+            yq_mutex_unlock(&g_web_server.mutex);
         } else {
             yq_web_send_error(client_fd, YQ_WEB_STATUS_BAD_REQUEST, "Malformed request");
         }
 
         yq_web_send_response(client_fd, &response);
-        close(client_fd);
+        yq_sock_close(client_fd);
     }
 
     return NULL;
@@ -601,13 +595,13 @@ int yq_web_start(int server_fd) {
     g_web_server.running = 1;
     
     /* Create worker threads */
-    g_web_server.threads = malloc(g_web_server.config.max_threads * sizeof(pthread_t));
+    g_web_server.threads = malloc(g_web_server.config.max_threads * sizeof(yq_thread_t));
     if (!g_web_server.threads) {
         return YQ_WEB_ERR_NOMEM;
     }
     
     for (uint32_t i = 0; i < g_web_server.config.max_threads; i++) {
-        if (pthread_create(&g_web_server.threads[i], NULL, yq_web_worker_thread, NULL) != 0) {
+        if (yq_thread_create(&g_web_server.threads[i], yq_web_worker_thread, NULL) != 0) {
             yq_web_log("Failed to create worker thread %d", i);
             return YQ_WEB_ERR_BUSY;
         }
@@ -629,7 +623,7 @@ int yq_web_stop(int server_fd) {
     /* Wait for all threads to finish */
     for (uint32_t i = 0; i < g_web_server.config.max_threads; i++) {
         if (g_web_server.threads[i]) {
-            pthread_join(g_web_server.threads[i], NULL);
+            yq_thread_join(g_web_server.threads[i]);
         }
     }
     
@@ -761,11 +755,11 @@ static void yq_web_send_response(int client_fd, yq_web_response *response) {
     pos += snprintf(buffer + pos, sizeof(buffer) - pos, "\r\n");
     
     /* Send headers */
-    send(client_fd, buffer, pos, 0);
+    yq_sock_send(client_fd, buffer, (int)pos);
     
     /* Send body */
     if (response->content_length > 0) {
-        send(client_fd, response->body, response->content_length, 0);
+        yq_sock_send(client_fd, response->body, (int)response->content_length);
     }
 }
 
@@ -835,13 +829,13 @@ int yq_web_endpoint_login(yq_web_request *request, yq_web_response *response) {
         if (arc == YQ_WEB_OK) {
             yq_web_session *session = authed;
             /* Add to session list */
-            pthread_mutex_lock(&g_web_server.mutex);
+            yq_mutex_lock(&g_web_server.mutex);
             session->next = g_web_server.sessions;
             if (g_web_server.sessions) {
                 g_web_server.sessions->prev = session;
             }
             g_web_server.sessions = session;
-            pthread_mutex_unlock(&g_web_server.mutex);
+            yq_mutex_unlock(&g_web_server.mutex);
             
             /* Set session cookie */
             yq_web_response_set_cookie(response, "session_id", session->session_id_str, 3600);
@@ -979,7 +973,7 @@ int yq_web_auth_init(const char *admin_username, const char *admin_password) {
     char digest[64];
     yq_web_derive_password(admin_password, salt, digest, sizeof(digest));
 
-    pthread_mutex_lock(&g_web_server.mutex);
+    yq_mutex_lock(&g_web_server.mutex);
     memset(g_web_server.users->username, 0, sizeof(g_web_server.users->username));
     strncpy(g_web_server.users->username, admin_username,
             sizeof(g_web_server.users->username) - 1);
@@ -992,7 +986,7 @@ int yq_web_auth_init(const char *admin_username, const char *admin_password) {
     strncpy(g_web_server.users->password_hash, digest,
             sizeof(g_web_server.users->password_hash) - 1);
     g_web_server.users->password_hash[sizeof(g_web_server.users->password_hash) - 1] = '\0';
-    pthread_mutex_unlock(&g_web_server.mutex);
+    yq_mutex_unlock(&g_web_server.mutex);
 
     return YQ_WEB_OK;
 }
@@ -1048,7 +1042,7 @@ int yq_web_auth_logout(yq_web_session *session) {
     if (!session) return YQ_WEB_ERR_INVAL;
     
     /* Remove session from list */
-    pthread_mutex_lock(&g_web_server.mutex);
+    yq_mutex_lock(&g_web_server.mutex);
     
     if (session->prev) {
         session->prev->next = session->next;
@@ -1060,7 +1054,7 @@ int yq_web_auth_logout(yq_web_session *session) {
         session->next->prev = session->prev;
     }
     
-    pthread_mutex_unlock(&g_web_server.mutex);
+    yq_mutex_unlock(&g_web_server.mutex);
     
     free(session);
     return YQ_WEB_OK;
@@ -1081,7 +1075,7 @@ int yq_web_auth_validate(yq_web_request *request, yq_web_session **out_session) 
             session_id_str[len] = '\0';
             
             /* Find session */
-            pthread_mutex_lock(&g_web_server.mutex);
+            yq_mutex_lock(&g_web_server.mutex);
             yq_web_session *session = g_web_server.sessions;
             while (session) {
                 if (strcmp(session->session_id_str, session_id_str) == 0) {
@@ -1092,12 +1086,12 @@ int yq_web_auth_validate(yq_web_request *request, yq_web_session **out_session) 
                         *out_session = session;
                     }
                     
-                    pthread_mutex_unlock(&g_web_server.mutex);
+                    yq_mutex_unlock(&g_web_server.mutex);
                     return YQ_WEB_OK;
                 }
                 session = session->next;
             }
-            pthread_mutex_unlock(&g_web_server.mutex);
+            yq_mutex_unlock(&g_web_server.mutex);
         }
     }
     

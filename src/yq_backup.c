@@ -6,13 +6,9 @@
  */
 
 /*
- * pthread_timedjoin_np / usleep 属于 POSIX 扩展而非 ISO C，
- * 在 glibc 下需要显式打开 _GNU_SOURCE，且必须在任何头文件之前定义，
- * 否则 clang 会以 -Wimplicit-function-declaration 报错。
+ * 线程与睡眠原语统一走 yq_thread.h 的封装（POSIX / Win32 双实现），
+ * 因此这里不再需要 _GNU_SOURCE、也不再直接依赖 pthread 或 unistd 的扩展接口。
  */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 
 #include "yq_backup.h"
 #include <stdio.h>
@@ -22,8 +18,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
-#include <pthread.h>
-#include <unistd.h>
+#include "yq_thread.h"
 
 #if YQ_ENABLE_BACKUP
 
@@ -35,7 +30,7 @@ struct yq_backup {
     yq_backup_config config;
     yq_remote_config remote_config;
     yq_backup_stats stats;
-    pthread_mutex_t mutex;
+    yq_mutex_t mutex;
     int initialized;
 };
 
@@ -49,7 +44,7 @@ struct yq_backup_job {
     uint32_t type;
     uint64_t size_bytes;
     uint32_t file_count;
-    pthread_t thread;
+    yq_thread_t thread;
     int running;
     struct yq_backup_job *next;
 };
@@ -63,7 +58,7 @@ struct yq_restore_job {
     uint32_t progress;
     uint32_t overwrite;
     uint32_t verify_data;
-    pthread_t thread;
+    yq_thread_t thread;
     int running;
     struct yq_restore_job *next;
 };
@@ -109,12 +104,12 @@ static int yq_create_directory(const char *path) {
     while (*p) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, 0755);
+            yq_mkdir(tmp, 0755);
             *p = '/';
         }
         p++;
     }
-    mkdir(tmp, 0755);
+    yq_mkdir(tmp, 0755);
     return 0;
 }
 
@@ -188,7 +183,7 @@ static void *yq_backup_job_thread(void *arg) {
     // Simulate backup process
     for (int i = 0; i <= 100; i += 10) {
         job->progress = i;
-        usleep(100000); // Simulate work
+        yq_sleep_ms(100) /* was usleep(100000) */; // Simulate work
     }
     
     // Calculate actual backup size
@@ -236,7 +231,7 @@ static void *yq_restore_job_thread(void *arg) {
     // Simulate restore process
     for (int i = 0; i <= 100; i += 10) {
         job->progress = i;
-        usleep(100000); // Simulate work
+        yq_sleep_ms(100) /* was usleep(100000) */; // Simulate work
     }
     
     job->end_time = yq_current_timestamp_ms();
@@ -288,7 +283,7 @@ int yq_backup_init(yq_backup_config *config, yq_backup **out) {
     (*out)->stats.failed_backups = 0;
     
     // Initialize mutex
-    pthread_mutex_init(&(*out)->mutex, NULL);
+    yq_mutex_init(&(*out)->mutex);
     (*out)->initialized = 1;
     
     yq_log_debug(*out, "Backup system initialized");
@@ -298,7 +293,7 @@ int yq_backup_init(yq_backup_config *config, yq_backup **out) {
 int yq_backup_close(yq_backup *backup) {
     if (!backup) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_destroy(&backup->mutex);
+    yq_mutex_destroy(&backup->mutex);
     free(backup);
     
     return YQ_BACKUP_OK;
@@ -307,11 +302,11 @@ int yq_backup_close(yq_backup *backup) {
 int yq_backup_configure(yq_backup *backup, yq_backup_config *config) {
     if (!backup || !config) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     memcpy(&backup->config, config, sizeof(yq_backup_config));
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     yq_log_debug(backup, "Backup configuration updated");
     return YQ_BACKUP_OK;
@@ -320,11 +315,11 @@ int yq_backup_configure(yq_backup *backup, yq_backup_config *config) {
 int yq_backup_configure_remote(yq_backup *backup, yq_remote_config *config) {
     if (!backup || !config) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     memcpy(&backup->remote_config, config, sizeof(yq_remote_config));
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     yq_log_debug(backup, "Remote storage configuration updated");
     return YQ_BACKUP_OK;
@@ -333,11 +328,11 @@ int yq_backup_configure_remote(yq_backup *backup, yq_remote_config *config) {
 int yq_backup_get_stats(yq_backup *backup, yq_backup_stats *stats) {
     if (!backup || !stats) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     memcpy(stats, &backup->stats, sizeof(yq_backup_stats));
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return YQ_BACKUP_OK;
 }
@@ -345,11 +340,11 @@ int yq_backup_get_stats(yq_backup *backup, yq_backup_stats *stats) {
 int yq_backup_set_enabled(yq_backup *backup, uint32_t enabled) {
     if (!backup) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     backup->config.enabled = enabled;
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return YQ_BACKUP_OK;
 }
@@ -357,11 +352,11 @@ int yq_backup_set_enabled(yq_backup *backup, uint32_t enabled) {
 int yq_backup_is_enabled(yq_backup *backup, uint32_t *enabled) {
     if (!backup || !enabled) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     *enabled = backup->config.enabled;
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return YQ_BACKUP_OK;
 }
@@ -369,13 +364,13 @@ int yq_backup_is_enabled(yq_backup *backup, uint32_t *enabled) {
 int yq_backup_create(yq_backup *backup, yq_backup_job **job) {
     if (!backup) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     // Create backup job with default parameters
     int result = yq_create_backup_job(backup, "default_backup", "/tmp/backup.yq", 
                                      YQ_BACKUP_TYPE_FULL, job);
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return result;
 }
@@ -383,25 +378,25 @@ int yq_backup_create(yq_backup *backup, yq_backup_job **job) {
 int yq_backup_start(yq_backup *backup, yq_backup_job *job) {
     if (!backup || !job) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (job->running) {
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_ERR;
     }
     
     job->running = 1;
     
     // Start backup thread
-    if (pthread_create(&job->thread, NULL, yq_backup_job_thread, job) != 0) {
+    if (yq_thread_create(&job->thread, yq_backup_job_thread, job) != 0) {
         job->running = 0;
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_ERR;
     }
     
     backup->stats.total_backups++;
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     yq_log_debug(backup, "Backup job started: %s", job->name);
     return YQ_BACKUP_OK;
@@ -410,10 +405,10 @@ int yq_backup_start(yq_backup *backup, yq_backup_job *job) {
 int yq_backup_stop(yq_backup *backup, yq_backup_job *job) {
     if (!backup || !job) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (!job->running) {
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_OK;
     }
     
@@ -422,7 +417,7 @@ int yq_backup_stop(yq_backup *backup, yq_backup_job *job) {
     job->running = 0;
     job->status = YQ_BACKUP_STATUS_CANCELLED;
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     yq_log_debug(backup, "Backup job stopped: %s", job->name);
     return YQ_BACKUP_OK;
@@ -435,29 +430,27 @@ int yq_backup_cancel(yq_backup *backup, yq_backup_job *job) {
 int yq_backup_wait(yq_backup *backup, yq_backup_job *job, uint32_t timeout_ms) {
     if (!backup || !job) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (!job->running) {
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_OK;
     }
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     // Wait for job completion
     if (timeout_ms > 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-        ts.tv_sec += timeout_ms / 1000 + ts.tv_nsec / 1000000000;
-        ts.tv_nsec %= 1000000000;
-        
-        pthread_timedjoin_np(job->thread, NULL, &ts);
+        /* 超时换算交给 yq_thread.h：POSIX 下换算成 cond_timedwait 需要的
+         * 绝对时间点，Win32 下换算成毫秒。原先这里直接拼 struct timespec
+         * 并调用 pthread_timedjoin_np，Windows 上不存在该函数。 */
+        yq_timespec ts;
+        yq_thread_timedjoin(job->thread, yq_timeout_from_ms((uint32_t)timeout_ms, &ts));
     } else {
-        pthread_join(job->thread, NULL);
+        yq_thread_join(job->thread);
     }
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (job->status == YQ_BACKUP_STATUS_COMPLETED) {
         backup->stats.successful_backups++;
@@ -465,7 +458,7 @@ int yq_backup_wait(yq_backup *backup, yq_backup_job *job, uint32_t timeout_ms) {
         backup->stats.failed_backups++;
     }
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return YQ_BACKUP_OK;
 }
@@ -473,7 +466,7 @@ int yq_backup_wait(yq_backup *backup, yq_backup_job *job, uint32_t timeout_ms) {
 int yq_backup_get_job_status(yq_backup *backup, yq_backup_job *job, yq_backup_info *info) {
     if (!backup || !job || !info) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     memset(info, 0, sizeof(yq_backup_info));
     info->struct_size = sizeof(yq_backup_info);
@@ -488,7 +481,7 @@ int yq_backup_get_job_status(yq_backup *backup, yq_backup_job *job, yq_backup_in
     info->duration_ms = job->end_time - job->start_time;
     info->file_count = job->file_count;
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return YQ_BACKUP_OK;
 }
@@ -496,7 +489,7 @@ int yq_backup_get_job_status(yq_backup *backup, yq_backup_job *job, yq_backup_in
 int yq_backup_create_full(yq_backup *backup, const char *filename, yq_backup_job **job) {
     if (!backup || !filename) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     char timestamp[32];
     time_t now = time(NULL);
@@ -508,7 +501,7 @@ int yq_backup_create_full(yq_backup *backup, const char *filename, yq_backup_job
     int result = yq_create_backup_job(backup, backup_name, filename, 
                                      YQ_BACKUP_TYPE_FULL, job);
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return result;
 }
@@ -516,7 +509,7 @@ int yq_backup_create_full(yq_backup *backup, const char *filename, yq_backup_job
 int yq_backup_create_incremental(yq_backup *backup, const char *filename, yq_backup_job **job) {
     if (!backup || !filename) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     char timestamp[32];
     time_t now = time(NULL);
@@ -528,7 +521,7 @@ int yq_backup_create_incremental(yq_backup *backup, const char *filename, yq_bac
     int result = yq_create_backup_job(backup, backup_name, filename, 
                                      YQ_BACKUP_TYPE_INCREMENTAL, job);
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return result;
 }
@@ -536,7 +529,7 @@ int yq_backup_create_incremental(yq_backup *backup, const char *filename, yq_bac
 int yq_backup_create_snapshot(yq_backup *backup, const char *filename, yq_backup_job **job) {
     if (!backup || !filename) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     char timestamp[32];
     time_t now = time(NULL);
@@ -548,7 +541,7 @@ int yq_backup_create_snapshot(yq_backup *backup, const char *filename, yq_backup
     int result = yq_create_backup_job(backup, backup_name, filename, 
                                      YQ_BACKUP_TYPE_SNAPSHOT, job);
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return result;
 }
@@ -556,11 +549,11 @@ int yq_backup_create_snapshot(yq_backup *backup, const char *filename, yq_backup
 int yq_restore_create(yq_backup *backup, const char *filename, yq_restore_job **job) {
     if (!backup || !filename) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     int result = yq_create_restore_job(backup, filename, "/tmp", 0, 1, job);
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return result;
 }
@@ -568,23 +561,23 @@ int yq_restore_create(yq_backup *backup, const char *filename, yq_restore_job **
 int yq_restore_start(yq_backup *backup, yq_restore_job *job) {
     if (!backup || !job) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (job->running) {
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_ERR;
     }
     
     job->running = 1;
     
     // Start restore thread
-    if (pthread_create(&job->thread, NULL, yq_restore_job_thread, job) != 0) {
+    if (yq_thread_create(&job->thread, yq_restore_job_thread, job) != 0) {
         job->running = 0;
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_ERR;
     }
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     yq_log_debug(backup, "Restore job started: %s", job->filename);
     return YQ_BACKUP_OK;
@@ -593,29 +586,27 @@ int yq_restore_start(yq_backup *backup, yq_restore_job *job) {
 int yq_restore_wait(yq_backup *backup, yq_restore_job *job, uint32_t timeout_ms) {
     if (!backup || !job) return YQ_BACKUP_ERR_INVAL;
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (!job->running) {
-        pthread_mutex_unlock(&backup->mutex);
+        yq_mutex_unlock(&backup->mutex);
         return YQ_BACKUP_OK;
     }
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     // Wait for job completion
     if (timeout_ms > 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-        ts.tv_sec += timeout_ms / 1000 + ts.tv_nsec / 1000000000;
-        ts.tv_nsec %= 1000000000;
-        
-        pthread_timedjoin_np(job->thread, NULL, &ts);
+        /* 超时换算交给 yq_thread.h：POSIX 下换算成 cond_timedwait 需要的
+         * 绝对时间点，Win32 下换算成毫秒。原先这里直接拼 struct timespec
+         * 并调用 pthread_timedjoin_np，Windows 上不存在该函数。 */
+        yq_timespec ts;
+        yq_thread_timedjoin(job->thread, yq_timeout_from_ms((uint32_t)timeout_ms, &ts));
     } else {
-        pthread_join(job->thread, NULL);
+        yq_thread_join(job->thread);
     }
     
-    pthread_mutex_lock(&backup->mutex);
+    yq_mutex_lock(&backup->mutex);
     
     if (job->status == YQ_BACKUP_STATUS_COMPLETED) {
         backup->stats.successful_restores++;
@@ -623,7 +614,7 @@ int yq_restore_wait(yq_backup *backup, yq_restore_job *job, uint32_t timeout_ms)
         backup->stats.failed_restores++;
     }
     
-    pthread_mutex_unlock(&backup->mutex);
+    yq_mutex_unlock(&backup->mutex);
     
     return YQ_BACKUP_OK;
 }

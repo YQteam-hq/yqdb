@@ -11,10 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
+#include "yq_thread.h"
 #include <time.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -157,7 +154,7 @@ int yq_cluster_init(yq_cluster_config *config, struct yq_cluster **out) {
     (*out)->stats.failed_ops = 0;
     
     /* Initialize mutex */
-    pthread_mutex_init(&(*out)->mutex, NULL);
+    yq_mutex_init(&(*out)->mutex);
     
     /* Initialize node array */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
@@ -181,9 +178,9 @@ int yq_cluster_init(yq_cluster_config *config, struct yq_cluster **out) {
     (*out)->running = 1;
     
     /* Start cluster threads */
-    pthread_create(&(*out)->election_thread, NULL, yq_cluster_election_thread, *out);
-    pthread_create(&(*out)->health_thread, NULL, yq_cluster_health_thread, *out);
-    pthread_create(&(*out)->sync_thread, NULL, yq_cluster_sync_thread, *out);
+    yq_thread_create(&(*out)->election_thread, yq_cluster_election_thread, *out);
+    yq_thread_create(&(*out)->health_thread, yq_cluster_health_thread, *out);
+    yq_thread_create(&(*out)->sync_thread, yq_cluster_sync_thread, *out);
     
     yq_cluster_log(*out, "Cluster initialized with node ID %u", (*out)->config.node_id);
     
@@ -195,7 +192,7 @@ int yq_cluster_init(yq_cluster_config *config, struct yq_cluster **out) {
 int yq_cluster_shutdown(struct yq_cluster *cluster) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Stop cluster threads */
     cluster->running = 0;
@@ -205,20 +202,20 @@ int yq_cluster_shutdown(struct yq_cluster *cluster) {
         if (cluster->nodes[i]) {
             cluster->nodes[i]->running = 0;
             if (cluster->nodes[i]->heartbeat_thread) {
-                pthread_cancel(cluster->nodes[i]->heartbeat_thread);
+                yq_thread_cancel(cluster->nodes[i]->heartbeat_thread);
             }
             if (cluster->nodes[i]->replication_thread) {
-                pthread_cancel(cluster->nodes[i]->replication_thread);
+                yq_thread_cancel(cluster->nodes[i]->replication_thread);
             }
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     /* Wait for threads to finish */
-    pthread_join(cluster->election_thread, NULL);
-    pthread_join(cluster->health_thread, NULL);
-    pthread_join(cluster->sync_thread, NULL);
+    yq_thread_join(cluster->election_thread);
+    yq_thread_join(cluster->health_thread);
+    yq_thread_join(cluster->sync_thread);
     
     /* Close local database */
     if (cluster->local_db) {
@@ -226,7 +223,7 @@ int yq_cluster_shutdown(struct yq_cluster *cluster) {
     }
     
     /* Cleanup */
-    pthread_mutex_destroy(&cluster->mutex);
+    yq_mutex_destroy(&cluster->mutex);
     free(cluster);
     
     g_cluster = NULL;
@@ -238,12 +235,12 @@ int yq_cluster_shutdown(struct yq_cluster *cluster) {
 int yq_cluster_get_info(struct yq_cluster *cluster, yq_cluster_config *config) {
     if (!cluster || !config) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Copy configuration */
     memcpy(config, &cluster->config, sizeof(yq_cluster_config));
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -252,12 +249,12 @@ int yq_cluster_get_info(struct yq_cluster *cluster, yq_cluster_config *config) {
 int yq_cluster_get_stats(struct yq_cluster *cluster, yq_cluster_stats *stats) {
     if (!cluster || !stats) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Copy statistics */
     memcpy(stats, &cluster->stats, sizeof(yq_cluster_stats));
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -266,12 +263,12 @@ int yq_cluster_get_stats(struct yq_cluster *cluster, yq_cluster_stats *stats) {
 int yq_cluster_add_node(struct yq_cluster *cluster, const char *address, uint32_t port, uint32_t node_id) {
     if (!cluster || !address) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Check if node already exists */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
         if (cluster->nodes[i] && cluster->nodes[i]->node_id == node_id) {
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
         }
     }
@@ -286,14 +283,14 @@ int yq_cluster_add_node(struct yq_cluster *cluster, const char *address, uint32_
     }
     
     if (slot == -1) {
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_ERR_NOMEM;
     }
     
     /* Create node structure */
     cluster->nodes[slot] = malloc(sizeof(yq_cluster_node));
     if (!cluster->nodes[slot]) {
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_ERR_NOMEM;
     }
     
@@ -319,12 +316,12 @@ int yq_cluster_add_node(struct yq_cluster *cluster, const char *address, uint32_
     strncpy(cluster->nodes[slot]->role_str, "slave", sizeof(cluster->nodes[slot]->role_str) - 1);
     
     /* Initialize mutex */
-    pthread_mutex_init(&cluster->nodes[slot]->mutex, NULL);
+    yq_mutex_init(&cluster->nodes[slot]->mutex);
     
     /* Start node threads */
     cluster->nodes[slot]->running = 1;
-    pthread_create(&cluster->nodes[slot]->heartbeat_thread, NULL, yq_cluster_node_heartbeat_thread, cluster->nodes[slot]);
-    pthread_create(&cluster->nodes[slot]->replication_thread, NULL, yq_cluster_node_replication_thread, cluster->nodes[slot]);
+    yq_thread_create(&cluster->nodes[slot]->heartbeat_thread, yq_cluster_node_heartbeat_thread, cluster->nodes[slot]);
+    yq_thread_create(&cluster->nodes[slot]->replication_thread, yq_cluster_node_replication_thread, cluster->nodes[slot]);
     
     /* Update statistics */
     cluster->stats.total_nodes++;
@@ -332,7 +329,7 @@ int yq_cluster_add_node(struct yq_cluster *cluster, const char *address, uint32_
     
     yq_cluster_log(cluster, "Added node %u at %s:%u", node_id, address, port);
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -341,7 +338,7 @@ int yq_cluster_add_node(struct yq_cluster *cluster, const char *address, uint32_
 int yq_cluster_remove_node(struct yq_cluster *cluster, uint32_t node_id) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     int slot = -1;
@@ -353,21 +350,21 @@ int yq_cluster_remove_node(struct yq_cluster *cluster, uint32_t node_id) {
     }
     
     if (slot == -1) {
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
     }
     
     /* Stop node threads */
     cluster->nodes[slot]->running = 0;
     if (cluster->nodes[slot]->heartbeat_thread) {
-        pthread_cancel(cluster->nodes[slot]->heartbeat_thread);
+        yq_thread_cancel(cluster->nodes[slot]->heartbeat_thread);
     }
     if (cluster->nodes[slot]->replication_thread) {
-        pthread_cancel(cluster->nodes[slot]->replication_thread);
+        yq_thread_cancel(cluster->nodes[slot]->replication_thread);
     }
     
     /* Cleanup node */
-    pthread_mutex_destroy(&cluster->nodes[slot]->mutex);
+    yq_mutex_destroy(&cluster->nodes[slot]->mutex);
     free(cluster->nodes[slot]);
     cluster->nodes[slot] = NULL;
     
@@ -379,7 +376,7 @@ int yq_cluster_remove_node(struct yq_cluster *cluster, uint32_t node_id) {
     
     yq_cluster_log(cluster, "Removed node %u", node_id);
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -388,19 +385,19 @@ int yq_cluster_remove_node(struct yq_cluster *cluster, uint32_t node_id) {
 int yq_cluster_get_node(struct yq_cluster *cluster, uint32_t node_id, yq_cluster_node *node) {
     if (!cluster || !node) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
         if (cluster->nodes[i] && cluster->nodes[i]->node_id == node_id) {
             /* Copy node information */
             memcpy(node, cluster->nodes[i], sizeof(yq_cluster_node));
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_OK;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
 }
 
@@ -408,7 +405,7 @@ int yq_cluster_get_node(struct yq_cluster *cluster, uint32_t node_id, yq_cluster
 int yq_cluster_get_nodes(struct yq_cluster *cluster, yq_cluster_node *nodes, uint32_t *count) {
     if (!cluster || !nodes || !count) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     uint32_t total = 0;
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
@@ -422,7 +419,7 @@ int yq_cluster_get_nodes(struct yq_cluster *cluster, yq_cluster_node *nodes, uin
     
     *count = total;
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -431,7 +428,7 @@ int yq_cluster_get_nodes(struct yq_cluster *cluster, yq_cluster_node *nodes, uin
 int yq_cluster_promote_node(struct yq_cluster *cluster, uint32_t node_id) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
@@ -444,12 +441,12 @@ int yq_cluster_promote_node(struct yq_cluster *cluster, uint32_t node_id) {
             
             yq_cluster_log(cluster, "Promoted node %u to master", node_id);
             
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_OK;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
 }
 
@@ -457,7 +454,7 @@ int yq_cluster_promote_node(struct yq_cluster *cluster, uint32_t node_id) {
 int yq_cluster_demote_node(struct yq_cluster *cluster, uint32_t node_id) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
@@ -467,12 +464,12 @@ int yq_cluster_demote_node(struct yq_cluster *cluster, uint32_t node_id) {
             
             yq_cluster_log(cluster, "Demoted node %u to slave", node_id);
             
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_OK;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
 }
 
@@ -480,7 +477,7 @@ int yq_cluster_demote_node(struct yq_cluster *cluster, uint32_t node_id) {
 int yq_cluster_replicate(struct yq_cluster *cluster, const char *key, const char *value, uint32_t value_size) {
     if (!cluster || !key || !value) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Update statistics */
     cluster->stats.total_operations++;
@@ -490,7 +487,7 @@ int yq_cluster_replicate(struct yq_cluster *cluster, const char *key, const char
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
         if (cluster->nodes[i] && cluster->nodes[i]->role == YQ_CLUSTER_NODE_ROLE_SLAVE) {
             /* Simulate replication */
-            usleep(1000); /* 1ms delay */
+            yq_sleep_ms(1) /* was usleep(1000) */; /* 1ms delay */
             success_count++;
         }
     }
@@ -498,11 +495,11 @@ int yq_cluster_replicate(struct yq_cluster *cluster, const char *key, const char
     /* Check quorum */
     if (success_count >= cluster->quorum_nodes) {
         cluster->stats.successful_ops++;
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_OK;
     } else {
         cluster->stats.failed_ops++;
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_ERR_QUORUM;
     }
 }
@@ -519,12 +516,12 @@ int yq_cluster_replicate_async(struct yq_cluster *cluster, const char *key, cons
 int yq_cluster_get_replication_status(struct yq_cluster *cluster, uint32_t *lag, uint32_t *pending) {
     if (!cluster || !lag || !pending) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     *lag = cluster->stats.replication_lag;
     *pending = 0; /* No pending operations for now */
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -537,11 +534,11 @@ int yq_cluster_set_consistency_level(struct yq_cluster *cluster, uint32_t level)
         return YQ_CLUSTER_ERR_INVAL;
     }
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     cluster->config.consistency_level = level;
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -550,7 +547,7 @@ int yq_cluster_set_consistency_level(struct yq_cluster *cluster, uint32_t level)
 int yq_cluster_trigger_failover(struct yq_cluster *cluster) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find best candidate for master */
     uint32_t best_node_id = 0;
@@ -573,7 +570,7 @@ int yq_cluster_trigger_failover(struct yq_cluster *cluster) {
         yq_cluster_log(cluster, "Failover completed, new master: %u", best_node_id);
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -582,11 +579,11 @@ int yq_cluster_trigger_failover(struct yq_cluster *cluster) {
 int yq_cluster_get_master_node(struct yq_cluster *cluster, uint32_t *node_id) {
     if (!cluster || !node_id) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     *node_id = cluster->master_node_id;
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -595,7 +592,7 @@ int yq_cluster_get_master_node(struct yq_cluster *cluster, uint32_t *node_id) {
 int yq_cluster_elect_master(struct yq_cluster *cluster) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node with highest priority */
     uint32_t best_node_id = 0;
@@ -617,7 +614,7 @@ int yq_cluster_elect_master(struct yq_cluster *cluster) {
         yq_cluster_log(cluster, "Elected master node: %u", best_node_id);
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -626,7 +623,7 @@ int yq_cluster_elect_master(struct yq_cluster *cluster) {
 int yq_cluster_rejoin_cluster(struct yq_cluster *cluster, uint32_t node_id) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
@@ -636,12 +633,12 @@ int yq_cluster_rejoin_cluster(struct yq_cluster *cluster, uint32_t node_id) {
             
             yq_cluster_log(cluster, "Node %u rejoined cluster", node_id);
             
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_OK;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
 }
 
@@ -649,7 +646,7 @@ int yq_cluster_rejoin_cluster(struct yq_cluster *cluster, uint32_t node_id) {
 int yq_cluster_select_node(struct yq_cluster *cluster, uint32_t *node_id) {
     if (!cluster || !node_id) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Simple round-robin load balancing */
     uint32_t current_node = 0;
@@ -663,7 +660,7 @@ int yq_cluster_select_node(struct yq_cluster *cluster, uint32_t *node_id) {
     
     *node_id = current_node;
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -672,18 +669,18 @@ int yq_cluster_select_node(struct yq_cluster *cluster, uint32_t *node_id) {
 int yq_cluster_get_node_load(struct yq_cluster *cluster, uint32_t node_id, uint32_t *load) {
     if (!cluster || !load) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
         if (cluster->nodes[i] && cluster->nodes[i]->node_id == node_id) {
             *load = rand() % 100; /* Random load for now */
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_OK;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
 }
 
@@ -691,12 +688,12 @@ int yq_cluster_get_node_load(struct yq_cluster *cluster, uint32_t node_id, uint3
 int yq_cluster_balance_load(struct yq_cluster *cluster) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Simple load balancing - just log */
     yq_cluster_log(cluster, "Load balancing across cluster");
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -705,7 +702,7 @@ int yq_cluster_balance_load(struct yq_cluster *cluster) {
 int yq_cluster_check_health(struct yq_cluster *cluster) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Count active nodes */
     uint32_t active_count = 0;
@@ -718,11 +715,11 @@ int yq_cluster_check_health(struct yq_cluster *cluster) {
     /* Check quorum */
     if (active_count < cluster->quorum_nodes) {
         yq_cluster_log(cluster, "Cluster health check failed - insufficient nodes for quorum");
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_ERR_QUORUM;
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -731,13 +728,13 @@ int yq_cluster_check_health(struct yq_cluster *cluster) {
 int yq_cluster_get_cluster_status(struct yq_cluster *cluster, uint32_t *status) {
     if (!cluster || !status) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Check health */
     int health = yq_cluster_check_health(cluster);
     *status = (health == YQ_CLUSTER_OK) ? 1 : 0;
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -746,7 +743,7 @@ int yq_cluster_get_cluster_status(struct yq_cluster *cluster, uint32_t *status) 
 int yq_cluster_detect_partition(struct yq_cluster *cluster) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Simple partition detection */
     uint32_t active_count = 0;
@@ -758,11 +755,11 @@ int yq_cluster_detect_partition(struct yq_cluster *cluster) {
     
     if (active_count < cluster->quorum_nodes) {
         yq_cluster_log(cluster, "Network partition detected - insufficient nodes for quorum");
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
         return YQ_CLUSTER_ERR_QUORUM;
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -771,12 +768,12 @@ int yq_cluster_detect_partition(struct yq_cluster *cluster) {
 int yq_cluster_set_event_callback(struct yq_cluster *cluster, yq_cluster_event_callback callback, void *user_data) {
     if (!cluster) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     cluster->event_callback = callback;
     cluster->user_data = user_data;
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -785,7 +782,7 @@ int yq_cluster_set_event_callback(struct yq_cluster *cluster, yq_cluster_event_c
 int yq_cluster_execute_on_master(struct yq_cluster *cluster, const char *key, const char *operation, const char *params) {
     if (!cluster || !key || !operation) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Execute on local database if this is master */
     if (cluster->config.node_id == cluster->master_node_id) {
@@ -793,7 +790,7 @@ int yq_cluster_execute_on_master(struct yq_cluster *cluster, const char *key, co
         yq_cluster_log(cluster, "Executing %s on master for key %s", operation, key);
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -802,7 +799,7 @@ int yq_cluster_execute_on_master(struct yq_cluster *cluster, const char *key, co
 int yq_cluster_execute_on_all(struct yq_cluster *cluster, const char *operation, const char *params) {
     if (!cluster || !operation) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Execute on all nodes */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
@@ -811,7 +808,7 @@ int yq_cluster_execute_on_all(struct yq_cluster *cluster, const char *operation,
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -820,18 +817,18 @@ int yq_cluster_execute_on_all(struct yq_cluster *cluster, const char *operation,
 int yq_cluster_execute_on_node(struct yq_cluster *cluster, uint32_t node_id, const char *operation, const char *params) {
     if (!cluster || !operation) return YQ_CLUSTER_ERR_INVAL;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Find node */
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
         if (cluster->nodes[i] && cluster->nodes[i]->node_id == node_id) {
             yq_cluster_log(cluster, "Executing %s on node %u", operation, node_id);
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return YQ_CLUSTER_OK;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return YQ_CLUSTER_ERR_NODE_NOT_FOUND;
 }
 
@@ -845,7 +842,7 @@ int yq_cluster_update_config(struct yq_cluster *cluster, yq_cluster_config *conf
         return result;
     }
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Update configuration */
     memcpy(&cluster->config, config, sizeof(yq_cluster_config));
@@ -853,7 +850,7 @@ int yq_cluster_update_config(struct yq_cluster *cluster, yq_cluster_config *conf
     /* Recalculate quorum */
     cluster->quorum_nodes = yq_cluster_calculate_quorum(cluster->config.min_nodes);
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     return YQ_CLUSTER_OK;
 }
@@ -867,7 +864,7 @@ int yq_cluster_save_config(struct yq_cluster *cluster, const char *filename) {
         return YQ_CLUSTER_ERR_CONFIG;
     }
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     /* Write configuration to file */
     fprintf(file, "# yq-DB Cluster Configuration\n");
@@ -894,7 +891,7 @@ int yq_cluster_save_config(struct yq_cluster *cluster, const char *filename) {
     fprintf(file, "failover_enabled=%u\n", cluster->config.failover_enabled);
     fprintf(file, "auto_rejoin=%u\n", cluster->config.auto_rejoin);
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     
     fclose(file);
     
@@ -980,17 +977,17 @@ int yq_cluster_load_config(struct yq_cluster *cluster, const char *filename) {
 int yq_cluster_is_node_available(struct yq_cluster *cluster, uint32_t node_id) {
     if (!cluster) return 0;
     
-    pthread_mutex_lock(&cluster->mutex);
+    yq_mutex_lock(&cluster->mutex);
     
     for (int i = 0; i < YQ_CLUSTER_MAX_NODES; i++) {
         if (cluster->nodes[i] && cluster->nodes[i]->node_id == node_id) {
             int available = (cluster->nodes[i]->state == YQ_CLUSTER_NODE_STATE_ACTIVE);
-            pthread_mutex_unlock(&cluster->mutex);
+            yq_mutex_unlock(&cluster->mutex);
             return available;
         }
     }
     
-    pthread_mutex_unlock(&cluster->mutex);
+    yq_mutex_unlock(&cluster->mutex);
     return 0;
 }
 
@@ -999,16 +996,16 @@ void *yq_cluster_election_thread(void *arg) {
     struct yq_cluster *cluster = (struct yq_cluster *)arg;
     
     while (cluster->running) {
-        sleep(cluster->config.election_timeout / 1000);
+        yq_sleep_ms(cluster->config.election_timeout) /* was sleep(cluster->config.election_timeout/1000) */;
         
-        pthread_mutex_lock(&cluster->mutex);
+        yq_mutex_lock(&cluster->mutex);
         
         /* Check if election is needed */
         if (cluster->master_node_id == 0 || cluster->stats.active_nodes < cluster->quorum_nodes) {
             yq_cluster_elect_master(cluster);
         }
         
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
     }
     
     return NULL;
@@ -1018,9 +1015,9 @@ void *yq_cluster_health_thread(void *arg) {
     struct yq_cluster *cluster = (struct yq_cluster *)arg;
     
     while (cluster->running) {
-        sleep(cluster->config.heartbeat / 1000);
+        yq_sleep_ms(cluster->config.heartbeat) /* was sleep(cluster->config.heartbeat/1000) */;
         
-        pthread_mutex_lock(&cluster->mutex);
+        yq_mutex_lock(&cluster->mutex);
         
         /* Check cluster health */
         yq_cluster_check_health(cluster);
@@ -1033,7 +1030,7 @@ void *yq_cluster_health_thread(void *arg) {
             }
         }
         
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
     }
     
     return NULL;
@@ -1043,9 +1040,9 @@ void *yq_cluster_sync_thread(void *arg) {
     struct yq_cluster *cluster = (struct yq_cluster *)arg;
     
     while (cluster->running) {
-        sleep(cluster->config.sync_interval / 1000);
+        yq_sleep_ms(cluster->config.sync_interval) /* was sleep(cluster->config.sync_interval/1000) */;
         
-        pthread_mutex_lock(&cluster->mutex);
+        yq_mutex_lock(&cluster->mutex);
         
         /* Sync cluster state */
         yq_cluster_log(cluster, "Syncing cluster state");
@@ -1053,7 +1050,7 @@ void *yq_cluster_sync_thread(void *arg) {
         /* Update replication statistics */
         cluster->stats.replication_lag = rand() % 100; /* Random lag for now */
         
-        pthread_mutex_unlock(&cluster->mutex);
+        yq_mutex_unlock(&cluster->mutex);
     }
     
     return NULL;
@@ -1063,7 +1060,7 @@ void *yq_cluster_node_heartbeat_thread(void *arg) {
     struct yq_cluster_node *node = (struct yq_cluster_node *)arg;
     
     while (node->running) {
-        sleep(node->cluster->config.heartbeat / 1000);
+        yq_sleep_ms(node->cluster->config.heartbeat) /* was sleep(node->cluster->config.heartbeat/1000) */;
         
         /* Send heartbeat to cluster */
         yq_cluster_log(node->cluster, "Node %u heartbeat", node->node_id);
@@ -1076,7 +1073,7 @@ void *yq_cluster_node_replication_thread(void *arg) {
     struct yq_cluster_node *node = (struct yq_cluster_node *)arg;
     
     while (node->running) {
-        sleep(1); /* Check every second */
+        yq_sleep_ms(1000u) /* was sleep(1) */; /* Check every second */
         
         /* Process replication backlog */
         yq_cluster_log(node->cluster, "Node %u replication processing", node->node_id);

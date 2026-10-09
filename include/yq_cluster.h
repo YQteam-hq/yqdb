@@ -22,7 +22,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <pthread.h>
+#include "yq_thread.h"   /* 跨平台线程原语，替代直接依赖 <pthread.h> */
 #include "yq.h"
 
 #ifdef __cplusplus
@@ -97,9 +97,9 @@ typedef struct yq_cluster_node {
     uint32_t reserved[5];     /* Must be 0 */
     int running;              /* Whether node is running */
     struct yq_cluster *cluster;  /* Reference to parent cluster */
-    pthread_mutex_t mutex;        /* Node mutex */
-    pthread_t heartbeat_thread;  /* Node heartbeat thread */
-    pthread_t replication_thread; /* Node replication thread */
+    yq_mutex_t mutex;        /* Node mutex */
+    yq_thread_t heartbeat_thread;  /* Node heartbeat thread */
+    yq_thread_t replication_thread; /* Node replication thread */
 } yq_cluster_node;
 
 /* Cluster configuration */
@@ -185,10 +185,10 @@ struct yq_cluster {
     uint32_t node_count;
     uint32_t master_node_id;
     uint32_t quorum_nodes;
-    pthread_mutex_t mutex;
-    pthread_t election_thread;
-    pthread_t health_thread;
-    pthread_t sync_thread;
+    yq_mutex_t mutex;
+    yq_thread_t election_thread;
+    yq_thread_t health_thread;
+    yq_thread_t sync_thread;
     int running;
     yq_cluster_event_callback event_callback;
     void *user_data;

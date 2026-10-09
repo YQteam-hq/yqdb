@@ -121,7 +121,7 @@ static int yq_cache_shard_init(yq_cache_shard *shard, yq_cache *cache, uint32_t 
     if (!shard->items) return YQ_CACHE_ERR_NOMEM;
     
     /* Initialize mutex */
-    pthread_mutex_init(&shard->mutex, NULL);
+    yq_mutex_init(&shard->mutex);
     
     /* Initialize LRU list */
     shard->lru_head = NULL;
@@ -134,7 +134,7 @@ static int yq_cache_shard_init(yq_cache_shard *shard, yq_cache *cache, uint32_t 
 static void yq_cache_shard_shutdown(yq_cache_shard *shard) {
     if (!shard) return;
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     /* Free all items */
     for (uint32_t i = 0; i < shard->capacity; i++) {
@@ -153,8 +153,8 @@ static void yq_cache_shard_shutdown(yq_cache_shard *shard) {
     shard->lru_head = NULL;
     shard->lru_tail = NULL;
     
-    pthread_mutex_unlock(&shard->mutex);
-    pthread_mutex_destroy(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
+    yq_mutex_destroy(&shard->mutex);
 }
 
 /* Find item in shard */
@@ -373,7 +373,7 @@ int yq_cache_init(yq_cache_config *config, const char *name, yq_cache **out) {
     }
     
     /* Initialize mutex */
-    pthread_mutex_init(&(*out)->mutex, NULL);
+    yq_mutex_init(&(*out)->mutex);
     
     (*out)->running = 1;
     (*out)->last_cleanup = time(NULL);
@@ -387,7 +387,7 @@ int yq_cache_init(yq_cache_config *config, const char *name, yq_cache **out) {
 int yq_cache_shutdown(yq_cache *cache) {
     if (!cache) return YQ_CACHE_ERR_INVAL;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     cache->running = 0;
     
@@ -400,8 +400,8 @@ int yq_cache_shutdown(yq_cache *cache) {
         }
     }
     
-    pthread_mutex_unlock(&cache->mutex);
-    pthread_mutex_destroy(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
+    yq_mutex_destroy(&cache->mutex);
     
     yq_cache_log(cache, "Cache shutdown");
     
@@ -412,7 +412,7 @@ int yq_cache_shutdown(yq_cache *cache) {
 int yq_cache_clear(yq_cache *cache) {
     if (!cache) return YQ_CACHE_ERR_INVAL;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     /* Clear all shards */
     for (uint32_t i = 0; i < cache->shard_count; i++) {
@@ -422,7 +422,7 @@ int yq_cache_clear(yq_cache *cache) {
         }
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     yq_cache_log(cache, "Cache cleared");
     
@@ -436,11 +436,11 @@ int yq_cache_get(yq_cache *cache, const char *key, size_t key_len, void **value,
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *item = yq_cache_shard_find(shard, key, key_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         cache->stats.misses++;
         cache->stats.last_miss = time(NULL);
         return YQ_CACHE_ERR_NOT_FOUND;
@@ -449,7 +449,7 @@ int yq_cache_get(yq_cache *cache, const char *key, size_t key_len, void **value,
     /* Check if expired */
     if (yq_cache_item_is_expired(item)) {
         yq_cache_shard_remove(shard, key, key_len);
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         cache->stats.expirations++;
         cache->stats.last_miss = time(NULL);
         return YQ_CACHE_ERR_EXPIRED;
@@ -462,13 +462,13 @@ int yq_cache_get(yq_cache *cache, const char *key, size_t key_len, void **value,
     /* Copy value */
     *value = malloc(item->value_len);
     if (!*value) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOMEM;
     }
     memcpy(*value, item->value, item->value_len);
     *value_len = item->value_len;
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     cache->stats.hits++;
     cache->stats.last_hit = time(NULL);
@@ -487,12 +487,12 @@ int yq_cache_put(yq_cache *cache, const char *key, size_t key_len, const void *v
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     /* Create new item */
     yq_cache_item *item = yq_cache_item_create(key, key_len, value, value_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOMEM;
     }
     
@@ -515,11 +515,11 @@ int yq_cache_put(yq_cache *cache, const char *key, size_t key_len, const void *v
     int result = yq_cache_shard_add(shard, item);
     if (result != YQ_CACHE_OK) {
         yq_cache_item_free(item);
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return result;
     }
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     cache->stats.total_items++;
     cache->stats.updates++;
@@ -534,11 +534,11 @@ int yq_cache_update(yq_cache *cache, const char *key, size_t key_len, const void
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *item = yq_cache_shard_find(shard, key, key_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOT_FOUND;
     }
     
@@ -549,7 +549,7 @@ int yq_cache_update(yq_cache *cache, const char *key, size_t key_len, const void
     
     item->value = malloc(value_len);
     if (!item->value) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOMEM;
     }
     
@@ -558,7 +558,7 @@ int yq_cache_update(yq_cache *cache, const char *key, size_t key_len, const void
     item->value_size = value_len;
     item->last_accessed = time(NULL);
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     cache->stats.updates++;
     
@@ -572,10 +572,10 @@ int yq_cache_delete(yq_cache *cache, const char *key, size_t key_len) {
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     int result = yq_cache_shard_remove(shard, key, key_len);
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     if (result == YQ_CACHE_OK) {
         cache->stats.total_items--;
@@ -592,23 +592,23 @@ int yq_cache_exists(yq_cache *cache, const char *key, size_t key_len) {
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *item = yq_cache_shard_find(shard, key, key_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOT_FOUND;
     }
     
     /* Check if expired */
     if (yq_cache_item_is_expired(item)) {
         yq_cache_shard_remove(shard, key, key_len);
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         cache->stats.expirations++;
         return YQ_CACHE_ERR_EXPIRED;
     }
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -617,7 +617,7 @@ int yq_cache_exists(yq_cache *cache, const char *key, size_t key_len) {
 int yq_cache_get_stats(yq_cache *cache, yq_cache_stats *stats) {
     if (!cache || !stats) return YQ_CACHE_ERR_INVAL;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     /* Aggregate statistics from all shards */
     memset(stats, 0, sizeof(yq_cache_stats));
@@ -625,10 +625,10 @@ int yq_cache_get_stats(yq_cache *cache, yq_cache_stats *stats) {
     
     for (uint32_t i = 0; i < cache->shard_count; i++) {
         yq_cache_shard *shard = cache->shards[i];
-        pthread_mutex_lock(&shard->mutex);
+        yq_mutex_lock(&shard->mutex);
         
         stats->total_items += shard->size;
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
     }
     
     /* Copy global stats */
@@ -650,7 +650,7 @@ int yq_cache_get_stats(yq_cache *cache, yq_cache_stats *stats) {
         stats->eviction_rate = (double)stats->evictions / (stats->hits + stats->misses);
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -702,13 +702,13 @@ int yq_cache_cleanup(yq_cache *cache) {
         return YQ_CACHE_OK; /* Not time yet */
     }
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     int cleaned_count = 0;
     
     for (uint32_t i = 0; i < cache->shard_count; i++) {
         yq_cache_shard *shard = cache->shards[i];
-        pthread_mutex_lock(&shard->mutex);
+        yq_mutex_lock(&shard->mutex);
         
         yq_cache_item **current = &shard->items[0];
         for (uint32_t j = 0; j < shard->capacity; j++) {
@@ -745,11 +745,11 @@ int yq_cache_cleanup(yq_cache *cache) {
             current = &shard->items[j + 1];
         }
         
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
     }
     
     cache->last_cleanup = now;
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     if (cleaned_count > 0) {
         yq_cache_log(cache, "Cleaned up %d expired items", cleaned_count);
@@ -827,7 +827,7 @@ int yq_cache_delete_multi(yq_cache *cache, const char **keys, size_t *key_lens, 
 int yq_cache_resize(yq_cache *cache, uint32_t new_size) {
     if (!cache) return YQ_CACHE_ERR_INVAL;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     uint32_t old_size = cache->config.max_size;
     cache->config.max_size = new_size;
@@ -838,7 +838,7 @@ int yq_cache_resize(yq_cache *cache, uint32_t new_size) {
         shard->capacity = new_size / cache->shard_count;
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     yq_cache_log(cache, "Cache resized from %u to %u items", old_size, new_size);
     
@@ -852,11 +852,11 @@ int yq_cache_set_ttl(yq_cache *cache, const char *key, size_t key_len, uint32_t 
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *item = yq_cache_shard_find(shard, key, key_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOT_FOUND;
     }
     
@@ -867,7 +867,7 @@ int yq_cache_set_ttl(yq_cache *cache, const char *key, size_t key_len, uint32_t 
         item->expires_at = 0; /* No expiration */
     }
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -879,11 +879,11 @@ int yq_cache_get_ttl(yq_cache *cache, const char *key, size_t key_len, uint32_t 
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *item = yq_cache_shard_find(shard, key, key_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOT_FOUND;
     }
     
@@ -895,7 +895,7 @@ int yq_cache_get_ttl(yq_cache *cache, const char *key, size_t key_len, uint32_t 
         *ttl = (now < item->expires_at) ? (uint32_t)(item->expires_at - now) : 0;
     }
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -914,18 +914,18 @@ int yq_cache_touch(yq_cache *cache, const char *key, size_t key_len) {
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *item = yq_cache_shard_find(shard, key, key_len);
     if (!item) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOT_FOUND;
     }
     
     yq_cache_item_update_access(item);
     yq_cache_item_to_head(shard, item);
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -937,11 +937,11 @@ int yq_cache_get_item_info(yq_cache *cache, const char *key, size_t key_len, yq_
     uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
     yq_cache_shard *shard = cache->shards[shard_id];
     
-    pthread_mutex_lock(&shard->mutex);
+    yq_mutex_lock(&shard->mutex);
     
     yq_cache_item *found = yq_cache_shard_find(shard, key, key_len);
     if (!found) {
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
         return YQ_CACHE_ERR_NOT_FOUND;
     }
     
@@ -962,7 +962,7 @@ int yq_cache_get_item_info(yq_cache *cache, const char *key, size_t key_len, yq_
         memcpy(item->key, found->key, item->key_len);
     }
     
-    pthread_mutex_unlock(&shard->mutex);
+    yq_mutex_unlock(&shard->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -975,19 +975,19 @@ int yq_cache_get_keys(yq_cache *cache, char **keys, size_t *key_lens, uint32_t m
     
     uint32_t count = 0;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     for (uint32_t i = 0; i < cache->shard_count && count < max_keys; i++) {
         yq_cache_shard *shard = cache->shards[i];
-        pthread_mutex_lock(&shard->mutex);
+        yq_mutex_lock(&shard->mutex);
         
         for (uint32_t j = 0; j < shard->capacity && count < max_keys; j++) {
             yq_cache_item *item = shard->items[j];
             while (item && count < max_keys) {
                 keys[count] = malloc(item->key_len + 1);
                 if (!keys[count]) {
-                    pthread_mutex_unlock(&shard->mutex);
-                    pthread_mutex_unlock(&cache->mutex);
+                    yq_mutex_unlock(&shard->mutex);
+                    yq_mutex_unlock(&cache->mutex);
                     return YQ_CACHE_ERR_NOMEM;
                 }
                 
@@ -1000,10 +1000,10 @@ int yq_cache_get_keys(yq_cache *cache, char **keys, size_t *key_lens, uint32_t m
             }
         }
         
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     return count;
 }
@@ -1017,7 +1017,7 @@ int yq_cache_update_config(yq_cache *cache, yq_cache_config *config) {
         return result;
     }
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     /* Update configuration */
     memcpy(&cache->config, config, sizeof(yq_cache_config));
@@ -1029,7 +1029,7 @@ int yq_cache_update_config(yq_cache *cache, yq_cache_config *config) {
         cache->shard_count = config->shard_count;
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     yq_cache_log(cache, "Configuration updated");
     
@@ -1043,7 +1043,7 @@ int yq_cache_save_config(yq_cache *cache, const char *filename) {
     FILE *file = fopen(filename, "w");
     if (!file) return YQ_CACHE_ERR_INVAL;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     /* Write configuration */
     fprintf(file, "# yq-DB Cache Configuration\n");
@@ -1062,7 +1062,7 @@ int yq_cache_save_config(yq_cache *cache, const char *filename) {
     fprintf(file, "monitoring=%u\n", cache->config.monitoring);
     fprintf(file, "warming=%u\n", cache->config.warming);
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     fclose(file);
     
@@ -1109,9 +1109,9 @@ int yq_cache_load_config(yq_cache *cache, const char *filename) {
         return result;
     }
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     memcpy(&cache->config, &config, sizeof(yq_cache_config));
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     return YQ_CACHE_OK;
 }
@@ -1123,7 +1123,7 @@ int yq_cache_save(yq_cache *cache, const char *filename) {
     FILE *file = fopen(filename, "wb");
     if (!file) return YQ_CACHE_ERR_INVAL;
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     /* Write header */
     fprintf(file, "YQ_CACHE\n");
@@ -1135,7 +1135,7 @@ int yq_cache_save(yq_cache *cache, const char *filename) {
     /* Write shard data */
     for (uint32_t i = 0; i < cache->shard_count; i++) {
         yq_cache_shard *shard = cache->shards[i];
-        pthread_mutex_lock(&shard->mutex);
+        yq_mutex_lock(&shard->mutex);
         
         fprintf(file, "\n[shard_%u]\n", i);
         fprintf(file, "size=%u\n", shard->size);
@@ -1157,10 +1157,10 @@ int yq_cache_save(yq_cache *cache, const char *filename) {
             }
         }
         
-        pthread_mutex_unlock(&shard->mutex);
+        yq_mutex_unlock(&shard->mutex);
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     fclose(file);
     
@@ -1180,7 +1180,7 @@ int yq_cache_load(yq_cache *cache, const char *filename) {
     char line[1024];
     char current_shard[64] = "";
     
-    pthread_mutex_lock(&cache->mutex);
+    yq_mutex_lock(&cache->mutex);
     
     while (fgets(line, sizeof(line), file)) {
         if (strncmp(line, "YQ_CACHE", 8) == 0) {
@@ -1250,9 +1250,9 @@ int yq_cache_load(yq_cache *cache, const char *filename) {
                             uint32_t shard_id = yq_cache_get_shard(cache, key, key_len);
                             yq_cache_shard *shard = cache->shards[shard_id];
                             
-                            pthread_mutex_lock(&shard->mutex);
+                            yq_mutex_lock(&shard->mutex);
                             yq_cache_shard_add(shard, item);
-                            pthread_mutex_unlock(&shard->mutex);
+                            yq_mutex_unlock(&shard->mutex);
                             
                             free(value);
                         }
@@ -1262,7 +1262,7 @@ int yq_cache_load(yq_cache *cache, const char *filename) {
         }
     }
     
-    pthread_mutex_unlock(&cache->mutex);
+    yq_mutex_unlock(&cache->mutex);
     
     fclose(file);
     

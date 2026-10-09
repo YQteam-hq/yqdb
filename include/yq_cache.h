@@ -22,7 +22,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <pthread.h>
+#include "yq_thread.h"   /* 跨平台线程原语，替代直接依赖 <pthread.h> */
 #include <time.h>
 
 #ifdef __cplusplus
@@ -130,7 +130,7 @@ typedef struct yq_cache_shard {
     yq_cache_item **items;         /* Hash table items */
     uint32_t capacity;             /* Hash table capacity */
     uint32_t size;                 /* Current size */
-    pthread_mutex_t mutex;         /* Shard mutex */
+    yq_mutex_t mutex;         /* Shard mutex */
     struct yq_cache_item *lru_head; /* LRU list head */
     struct yq_cache_item *lru_tail; /* LRU list tail */
     struct yq_cache *cache;       /* Reference to parent cache */
@@ -142,7 +142,7 @@ typedef struct yq_cache {
     yq_cache_stats stats;
     yq_cache_shard *shards[YQ_CACHE_DEFAULT_SHARDS];
     uint32_t shard_count;
-    pthread_mutex_t mutex;         /* Global mutex */
+    yq_mutex_t mutex;         /* Global mutex */
     int running;                  /* Whether cache is running */
     char name[YQ_CACHE_MAX_NAME_LEN]; /* Cache name */
     time_t last_cleanup;           /* Last cleanup timestamp */

@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <pthread.h>
+#include "yq_thread.h"
 #include <sys/time.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -45,7 +45,7 @@ typedef struct yq_internal_topic {
     char *name;
     yq_internal_message *message_list;
     uint32_t subscriber_count;
-    pthread_mutex_t mutex;
+    yq_mutex_t mutex;
     uint64_t message_count;
     uint64_t total_bytes;
     struct yq_internal_topic *next;
@@ -58,7 +58,7 @@ typedef struct yq_internal_subscriber {
     yq_message_callback message_cb;
     yq_error_callback error_cb;
     void *user_data;
-    pthread_t thread;
+    yq_thread_t thread;
     int running;
     struct yq_internal_message_queue *queue;
     struct yq_internal_subscriber *next;
@@ -71,9 +71,9 @@ typedef struct yq_internal_message_queue {
     size_t size;
     size_t head;
     size_t tail;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_not_empty;
-    pthread_cond_t cond_not_full;
+    yq_mutex_t mutex;
+    yq_cond_t cond_not_empty;
+    yq_cond_t cond_not_full;
 } yq_internal_message_queue;
 
 /* 内部Pub/Sub结构 */
@@ -81,7 +81,7 @@ struct yq_pubsub {
     yq_db *db;
     struct yq_internal_topic *topics;
     struct yq_internal_subscriber *subscribers;
-    pthread_mutex_t mutex;
+    yq_mutex_t mutex;
     uint64_t next_message_id;
     struct {
         uint64_t total_messages;
@@ -160,9 +160,9 @@ static struct yq_internal_message_queue *yq_internal_message_queue_create(size_t
     queue->size = 0;
     queue->head = 0;
     queue->tail = 0;
-    pthread_mutex_init(&queue->mutex, NULL);
-    pthread_cond_init(&queue->cond_not_empty, NULL);
-    pthread_cond_init(&queue->cond_not_full, NULL);
+    yq_mutex_init(&queue->mutex);
+    yq_cond_init(&queue->cond_not_empty);
+    yq_cond_init(&queue->cond_not_full);
 
     return queue;
 }
@@ -170,46 +170,43 @@ static struct yq_internal_message_queue *yq_internal_message_queue_create(size_t
 static void yq_internal_message_queue_free(struct yq_internal_message_queue *queue) {
     if (!queue) return;
 
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->cond_not_empty);
-    pthread_cond_destroy(&queue->cond_not_full);
+    yq_mutex_destroy(&queue->mutex);
+    yq_cond_destroy(&queue->cond_not_empty);
+    yq_cond_destroy(&queue->cond_not_full);
     free(queue->messages);
     free(queue);
 }
 
 static int yq_internal_message_queue_push(struct yq_internal_message_queue *queue, struct yq_internal_message *msg) {
-    pthread_mutex_lock(&queue->mutex);
+    yq_mutex_lock(&queue->mutex);
 
     while (queue->size >= queue->capacity) {
-        pthread_cond_wait(&queue->cond_not_full, &queue->mutex);
+        yq_cond_wait(&queue->cond_not_full, &queue->mutex);
     }
 
     queue->messages[queue->tail] = msg;
     queue->tail = (queue->tail + 1) % queue->capacity;
     queue->size++;
 
-    pthread_cond_signal(&queue->cond_not_empty);
-    pthread_mutex_unlock(&queue->mutex);
+    yq_cond_signal(&queue->cond_not_empty);
+    yq_mutex_unlock(&queue->mutex);
 
     return 0;
 }
 
 static struct yq_internal_message *yq_internal_message_queue_pop(struct yq_internal_message_queue *queue, uint32_t timeout_ms) {
-    pthread_mutex_lock(&queue->mutex);
+    yq_mutex_lock(&queue->mutex);
 
     while (queue->size == 0) {
         if (timeout_ms == 0) {
-            pthread_cond_wait(&queue->cond_not_empty, &queue->mutex);
+            yq_cond_wait(&queue->cond_not_empty, &queue->mutex);
         } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-            ts.tv_sec += timeout_ms / 1000 + ts.tv_nsec / 1000000000;
-            ts.tv_nsec %= 1000000000;
-
-            int ret = pthread_cond_timedwait(&queue->cond_not_empty, &queue->mutex, &ts);
+            /* 超时换算交给 yq_thread.h：POSIX 拼绝对时间点，Win32 换算毫秒。 */
+            yq_timespec ts;
+            int ret = yq_cond_timedwait(&queue->cond_not_empty, &queue->mutex,
+                                        yq_timeout_from_ms((uint32_t)timeout_ms, &ts));
             if (ret == ETIMEDOUT) {
-                pthread_mutex_unlock(&queue->mutex);
+                yq_mutex_unlock(&queue->mutex);
                 return NULL;
             }
         }
@@ -219,8 +216,8 @@ static struct yq_internal_message *yq_internal_message_queue_pop(struct yq_inter
     queue->head = (queue->head + 1) % queue->capacity;
     queue->size--;
 
-    pthread_cond_signal(&queue->cond_not_full);
-    pthread_mutex_unlock(&queue->mutex);
+    yq_cond_signal(&queue->cond_not_full);
+    yq_mutex_unlock(&queue->mutex);
 
     return msg;
 }
@@ -252,7 +249,7 @@ static struct yq_internal_topic *yq_internal_topic_create(struct yq_pubsub *pubs
 
     topic->message_list = NULL;
     topic->subscriber_count = 0;
-    pthread_mutex_init(&topic->mutex, NULL);
+    yq_mutex_init(&topic->mutex);
     topic->message_count = 0;
     topic->total_bytes = 0;
     topic->next = pubsub->topics;
@@ -264,7 +261,7 @@ static struct yq_internal_topic *yq_internal_topic_create(struct yq_pubsub *pubs
 static void yq_internal_topic_free(struct yq_internal_topic *topic) {
     if (!topic) return;
 
-    pthread_mutex_destroy(&topic->mutex);
+    yq_mutex_destroy(&topic->mutex);
     free(topic->name);
 
     struct yq_internal_message *msg = topic->message_list;
@@ -352,7 +349,7 @@ int yq_pubsub_init(yq_db *db, struct yq_pubsub **out) {
     pubsub->next_message_id = 1;
     pubsub->debug_enabled = 0;
 
-    pthread_mutex_init(&pubsub->mutex, NULL);
+    yq_mutex_init(&pubsub->mutex);
 
     *out = pubsub;
     yq_log_debug(pubsub, "Pub/Sub system initialized");
@@ -364,14 +361,14 @@ int yq_pubsub_close(struct yq_pubsub *pubsub) {
         return YQ_OK;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     /* 停止所有订阅者线程 */
     struct yq_internal_subscriber *sub = pubsub->subscribers;
     while (sub) {
         struct yq_internal_subscriber *next = sub->next;
         sub->running = 0;
-        pthread_join(sub->thread, NULL);
+        yq_thread_join(sub->thread);
         free(sub->topic_filter);
         free(sub);
         sub = next;
@@ -385,8 +382,8 @@ int yq_pubsub_close(struct yq_pubsub *pubsub) {
         topic = next;
     }
 
-    pthread_mutex_unlock(&pubsub->mutex);
-    pthread_mutex_destroy(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
+    yq_mutex_destroy(&pubsub->mutex);
     free(pubsub);
 
     return YQ_OK;
@@ -400,7 +397,7 @@ int yq_pubsub_get_stats(struct yq_pubsub *pubsub, yq_pubsub_stats *stats) {
     memset(stats, 0, sizeof(yq_pubsub_stats));
     stats->struct_size = sizeof(yq_pubsub_stats);
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     stats->total_messages = pubsub->stats.total_messages;
     stats->delivered_messages = pubsub->stats.delivered_messages;
@@ -421,7 +418,7 @@ int yq_pubsub_get_stats(struct yq_pubsub *pubsub, yq_pubsub_stats *stats) {
         sub = sub->next;
     }
 
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     return YQ_OK;
 }
@@ -431,22 +428,22 @@ int yq_topic_create(struct yq_pubsub *pubsub, const char *name, struct yq_topic 
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     struct yq_internal_topic *topic = yq_internal_topic_find(pubsub, name);
     if (topic) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_EXISTS;
     }
 
     topic = yq_internal_topic_create(pubsub, name);
     if (!topic) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
     *out = (struct yq_topic *)topic;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     yq_log_debug(pubsub, "Topic created: %s", name);
     return YQ_OK;
@@ -457,7 +454,7 @@ int yq_topic_delete(struct yq_pubsub *pubsub, const char *name) {
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     struct yq_internal_topic *prev = NULL;
     struct yq_internal_topic *topic = pubsub->topics;
@@ -469,7 +466,7 @@ int yq_topic_delete(struct yq_pubsub *pubsub, const char *name) {
                 pubsub->topics = topic->next;
             }
             yq_internal_topic_free(topic);
-            pthread_mutex_unlock(&pubsub->mutex);
+            yq_mutex_unlock(&pubsub->mutex);
             yq_log_debug(pubsub, "Topic deleted: %s", name);
             return YQ_OK;
         }
@@ -477,7 +474,7 @@ int yq_topic_delete(struct yq_pubsub *pubsub, const char *name) {
         topic = topic->next;
     }
 
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
     return YQ_ERR_NOTFOUND;
 }
 
@@ -486,16 +483,16 @@ int yq_topic_get(struct yq_pubsub *pubsub, const char *name, struct yq_topic **o
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     struct yq_internal_topic *topic = yq_internal_topic_find(pubsub, name);
     if (!topic) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOTFOUND;
     }
 
     *out = (struct yq_topic *)topic;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     return YQ_OK;
 }
@@ -505,7 +502,7 @@ int yq_topic_list(struct yq_pubsub *pubsub, char ***topics, uint32_t *count) {
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     /* 先计算主题数量 */
     uint32_t topic_count = 0;
@@ -518,14 +515,14 @@ int yq_topic_list(struct yq_pubsub *pubsub, char ***topics, uint32_t *count) {
     if (topic_count == 0) {
         *topics = NULL;
         *count = 0;
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_OK;
     }
 
     /* 分配字符串数组 */
     char **topic_list = malloc(sizeof(char *) * topic_count);
     if (!topic_list) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
@@ -539,7 +536,7 @@ int yq_topic_list(struct yq_pubsub *pubsub, char ***topics, uint32_t *count) {
                 free(topic_list[j]);
             }
             free(topic_list);
-            pthread_mutex_unlock(&pubsub->mutex);
+            yq_mutex_unlock(&pubsub->mutex);
             return YQ_ERR_NOMEM;
         }
         topic = topic->next;
@@ -547,7 +544,7 @@ int yq_topic_list(struct yq_pubsub *pubsub, char ***topics, uint32_t *count) {
 
     *topics = topic_list;
     *count = topic_count;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     return YQ_OK;
 }
@@ -561,13 +558,13 @@ int yq_topic_get_stats(struct yq_topic *topic, yq_topic_stats *stats) {
     stats->struct_size = sizeof(yq_topic_stats);
 
     struct yq_internal_topic *internal_topic = (struct yq_internal_topic *)topic;
-    pthread_mutex_lock(&internal_topic->mutex);
+    yq_mutex_lock(&internal_topic->mutex);
 
     stats->message_count = internal_topic->message_count;
     stats->subscriber_count = internal_topic->subscriber_count;
     stats->total_bytes = internal_topic->total_bytes;
 
-    pthread_mutex_unlock(&internal_topic->mutex);
+    yq_mutex_unlock(&internal_topic->mutex);
 
     return YQ_OK;
 }
@@ -580,19 +577,19 @@ int yq_publish(struct yq_pubsub *pubsub, const char *topic, const void *payload,
 
 int yq_publish_ex(struct yq_pubsub *pubsub, const char *topic, const void *payload, size_t payload_len,
                   const void *metadata, size_t metadata_len, uint32_t flags, 
-                  uint32_t priority, uint64_t *message_id) {
+                  yq_message_priority priority, uint64_t *message_id) {
     if (!pubsub || !topic || !payload || payload_len == 0 || !message_id) {
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     /* 创建或获取主题 */
     struct yq_internal_topic *internal_topic = yq_internal_topic_find(pubsub, topic);
     if (!internal_topic) {
         internal_topic = yq_internal_topic_create(pubsub, topic);
         if (!internal_topic) {
-            pthread_mutex_unlock(&pubsub->mutex);
+            yq_mutex_unlock(&pubsub->mutex);
             return YQ_ERR_NOMEM;
         }
     }
@@ -600,7 +597,7 @@ int yq_publish_ex(struct yq_pubsub *pubsub, const char *topic, const void *paylo
     /* 创建消息 */
     struct yq_internal_message *msg = malloc(sizeof(struct yq_internal_message));
     if (!msg) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
@@ -619,7 +616,7 @@ int yq_publish_ex(struct yq_pubsub *pubsub, const char *topic, const void *paylo
     msg->topic = malloc(msg->topic_len + 1);
     if (!msg->topic) {
         free(msg);
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
     strcpy(msg->topic, topic);
@@ -629,7 +626,7 @@ int yq_publish_ex(struct yq_pubsub *pubsub, const char *topic, const void *paylo
     if (!msg->payload) {
         free(msg->topic);
         free(msg);
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
     memcpy(msg->payload, payload, msg->payload_len);
@@ -641,7 +638,7 @@ int yq_publish_ex(struct yq_pubsub *pubsub, const char *topic, const void *paylo
             free(msg->topic);
             free(msg->payload);
             free(msg);
-            pthread_mutex_unlock(&pubsub->mutex);
+            yq_mutex_unlock(&pubsub->mutex);
             return YQ_ERR_NOMEM;
         }
         memcpy(msg->metadata, metadata, metadata_len);
@@ -691,7 +688,7 @@ int yq_publish_ex(struct yq_pubsub *pubsub, const char *topic, const void *paylo
     }
 
     *message_id = msg->message_id;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     yq_log_debug(pubsub, "Published message %lu to topic %s", msg->message_id, topic);
     return YQ_OK;
@@ -749,13 +746,13 @@ int yq_subscribe_filtered(struct yq_pubsub *pubsub, const yq_topic_filter *filte
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     /* 检查是否已经订阅过相同的过滤器 */
     struct yq_internal_subscriber *sub = pubsub->subscribers;
     while (sub) {
         if (strcmp(sub->topic_filter, filter->pattern) == 0) {
-            pthread_mutex_unlock(&pubsub->mutex);
+            yq_mutex_unlock(&pubsub->mutex);
             return YQ_ERR_EXISTS;
         }
         sub = sub->next;
@@ -764,7 +761,7 @@ int yq_subscribe_filtered(struct yq_pubsub *pubsub, const yq_topic_filter *filte
     /* 创建订阅者 */
     struct yq_internal_subscriber *internal_sub = malloc(sizeof(struct yq_internal_subscriber));
     if (!internal_sub) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
@@ -772,7 +769,7 @@ int yq_subscribe_filtered(struct yq_pubsub *pubsub, const yq_topic_filter *filte
     internal_sub->topic_filter = strdup(filter->pattern);
     if (!internal_sub->topic_filter) {
         free(internal_sub);
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
@@ -787,16 +784,16 @@ int yq_subscribe_filtered(struct yq_pubsub *pubsub, const yq_topic_filter *filte
     if (!internal_sub->queue) {
         free(internal_sub->topic_filter);
         free(internal_sub);
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
     /* 启动处理线程 */
-    if (pthread_create(&internal_sub->thread, NULL, yq_subscriber_thread, internal_sub) != 0) {
+    if (yq_thread_create(&internal_sub->thread, yq_subscriber_thread, internal_sub) != 0) {
         yq_internal_message_queue_free(internal_sub->queue);
         free(internal_sub->topic_filter);
         free(internal_sub);
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
@@ -805,7 +802,7 @@ int yq_subscribe_filtered(struct yq_pubsub *pubsub, const yq_topic_filter *filte
     pubsub->subscribers = internal_sub;
 
     *out = (struct yq_subscriber *)internal_sub;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     yq_log_debug(pubsub, "Subscribed to filter: %s", filter->pattern);
     return YQ_OK;
@@ -825,20 +822,20 @@ int yq_unsubscribe_all(struct yq_pubsub *pubsub) {
         return YQ_OK;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     struct yq_internal_subscriber *sub = pubsub->subscribers;
     while (sub) {
         struct yq_internal_subscriber *next = sub->next;
         sub->running = 0;
-        pthread_join(sub->thread, NULL);
+        yq_thread_join(sub->thread);
         free(sub->topic_filter);
         free(sub);
         sub = next;
     }
 
     pubsub->subscribers = NULL;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     yq_log_debug(pubsub, "Unsubscribed all subscribers");
     return YQ_OK;
@@ -963,20 +960,20 @@ int yq_message_queue_stats(struct yq_message_queue *queue, yq_queue_stats *stats
     stats->struct_size = sizeof(yq_queue_stats);
 
     struct yq_internal_message_queue *internal_queue = (struct yq_internal_message_queue *)queue;
-    pthread_mutex_lock(&internal_queue->mutex);
+    yq_mutex_lock(&internal_queue->mutex);
 
     stats->queue_size = internal_queue->capacity;
     stats->queue_usage = internal_queue->size;
     stats->pending_count = internal_queue->size;
 
-    pthread_mutex_unlock(&internal_queue->mutex);
+    yq_mutex_unlock(&internal_queue->mutex);
 
     return YQ_OK;
 }
 
 int yq_message_create(uint64_t message_id, const char *topic, const void *payload, size_t payload_len,
                       const void *metadata, size_t metadata_len, uint32_t flags,
-                      uint32_t priority, yq_message **out) {
+                      yq_message_priority priority, yq_message **out) {
     if (!topic || !payload || payload_len == 0 || !out) {
         return YQ_ERR_INVAL;
     }
@@ -1083,10 +1080,10 @@ int yq_pubsub_set_stats_callback(struct yq_pubsub *pubsub, yq_stats_callback cal
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
     pubsub->stats_callback = callback;
     pubsub->stats_user_data = user_data;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     return YQ_OK;
 }
@@ -1096,9 +1093,9 @@ int yq_pubsub_set_debug(struct yq_pubsub *pubsub, int enabled) {
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
     pubsub->debug_enabled = enabled ? 1 : 0;
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     yq_log_debug(pubsub, "Debug mode %s", enabled ? "enabled" : "disabled");
     return YQ_OK;
@@ -1109,7 +1106,7 @@ int yq_pubsub_get_debug_info(struct yq_pubsub *pubsub, char **debug_info) {
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     /* 生成调试信息 */
     char info[1024];
@@ -1133,12 +1130,12 @@ int yq_pubsub_get_debug_info(struct yq_pubsub *pubsub, char **debug_info) {
     size_t len = strlen(info) + 1;
     *debug_info = malloc(len);
     if (!*debug_info) {
-        pthread_mutex_unlock(&pubsub->mutex);
+        yq_mutex_unlock(&pubsub->mutex);
         return YQ_ERR_NOMEM;
     }
 
     strcpy(*debug_info, info);
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     return YQ_OK;
 }
@@ -1148,7 +1145,7 @@ int yq_pubsub_cleanup_expired(struct yq_pubsub *pubsub, uint64_t max_age_ms) {
         return YQ_ERR_INVAL;
     }
 
-    pthread_mutex_lock(&pubsub->mutex);
+    yq_mutex_lock(&pubsub->mutex);
 
     uint64_t cutoff_time = yq_current_timestamp_ms() - max_age_ms;
     struct yq_internal_topic *topic = pubsub->topics;
@@ -1177,7 +1174,7 @@ int yq_pubsub_cleanup_expired(struct yq_pubsub *pubsub, uint64_t max_age_ms) {
         topic = next_topic;
     }
 
-    pthread_mutex_unlock(&pubsub->mutex);
+    yq_mutex_unlock(&pubsub->mutex);
 
     yq_log_debug(pubsub, "Cleaned up expired messages older than %lu ms", max_age_ms);
     return YQ_OK;
