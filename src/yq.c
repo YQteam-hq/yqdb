@@ -7,6 +7,7 @@
 #include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -770,5 +771,149 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
     out->npages = npages;
     out->free_pages = free_head;
     out->log_bytes = yq_wal_size(db->wal);
+    return YQ_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Batch operations
+ *
+ * yq_batch_put() applies a heterogeneous list of PUT/DELETE operations in one
+ * call. It validates every entry up front so a malformed batch is rejected
+ * before any mutation reaches the memtable; the caller still owns the single
+ * transaction, so the batch becomes visible atomically on commit.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * 统计口径（评审要求保证自洽）：
+ *   entries_ok + entries_failed == entries_total 恒成立。
+ * 校验阶段失败时整批不落盘，此时把这批全部计为 failed（而不是只 failed++ 
+ * 却把 total 固定成 count），否则调用方会从 "total=5, ok=0, failed=1" 
+ * 误以为另外 4 条成功了。
+ */
+static void yq_batch_result_init(yq_batch_result *result, uint32_t total, int first_error) {
+    if (!result) return;
+    result->struct_size = sizeof(yq_batch_result);
+    result->entries_total = total;
+    result->entries_ok = 0;
+    result->entries_failed = 0;
+    result->first_error = first_error;
+    memset(result->reserved, 0, sizeof(result->reserved));
+}
+
+int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
+                 yq_batch_result *result) {
+    /* result 可选：不传就不上报统计（与头文件契约一致） */
+    if (!txn || !entries || count == 0) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+    if (txn->state != YQ_TXN_STATE_ACTIVE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
+        return YQ_ERR_TXN_CLOSED;
+    }
+    if (txn->flags & YQ_TXN_READONLY) {
+        yq_batch_result_init(result, 0, YQ_ERR_READONLY);
+        return YQ_ERR_READONLY;
+    }
+    /* count 超过 uint32 时统计字段无法表达，提前拒绝而不是静默截断 */
+    if (count > 0xFFFFFFFFu) {
+        yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
+        return YQ_ERR_TOOBIG;
+    }
+
+    uint32_t total = (uint32_t)count;
+    yq_batch_result_init(result, total, YQ_OK);
+
+    /* 第一遍：先校验全部 entry，避免半批写入 */
+    int bad = 0;
+    for (size_t i = 0; i < count; i++) {
+        const yq_batch_entry *e = &entries[i];
+        int entry_bad = 0;
+        if (e->key.data == NULL || e->key.size == 0 || e->key.size > 1024) {
+            entry_bad = 1;
+        } else if (e->op == 0 && e->val.data == NULL && e->val.size != 0) {
+            entry_bad = 1;
+        }
+        if (entry_bad) bad = 1;
+    }
+
+    if (bad) {
+        /* 整批拒绝（未做任何变更）：全部计入 failed，保持 total == ok + failed */
+        if (result) {
+            result->first_error = YQ_ERR_INVAL;
+            result->entries_ok = 0;
+            result->entries_failed = total;
+        }
+        return YQ_ERR_INVAL;
+    }
+
+    /* 第二遍：执行。逐条记录结果，不做提前返回，保证计数完整。 */
+    int first_error = YQ_OK;
+    uint32_t ok = 0, failed = 0;
+    for (size_t i = 0; i < count; i++) {
+        const yq_batch_entry *e = &entries[i];
+        int rc = (e->op == 0) ? yq_put(txn, e->key, e->val, e->flags)
+                              : yq_del(txn, e->key);
+        if (rc == YQ_OK) {
+            ok++;
+        } else {
+            failed++;
+            if (first_error == YQ_OK) first_error = rc;
+        }
+    }
+
+    if (result) {
+        result->entries_ok = ok;
+        result->entries_failed = failed;
+        result->first_error = first_error;
+    }
+    return first_error;
+}
+
+int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_batch_result *result) {
+    if (!txn || !keys || count == 0) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+    /* count * sizeof(*entries) 为 size_t 运算，先挡回绕再分配 */
+    if (count > SIZE_MAX / sizeof(yq_batch_entry)) {
+        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
+        return YQ_ERR_NOMEM;
+    }
+
+    yq_batch_entry *entries = malloc(count * sizeof(*entries));
+    if (!entries) {
+        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
+        return YQ_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+        entries[i].key = keys[i];
+        entries[i].val = (yq_slice){NULL, 0};
+        entries[i].op = 1; /* DELETE */
+        entries[i].flags = 0;
+    }
+
+    int rc = yq_batch_put(txn, entries, count, result);
+    free(entries);
+    return rc;
+}
+
+int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
+                 yq_slice *values, size_t *found_count) {
+    if (!txn || !keys || count == 0 || !values || !found_count) return YQ_ERR_INVAL;
+    if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+
+    size_t found = 0;
+    for (size_t i = 0; i < count; i++) {
+        int rc = yq_get(txn, keys[i], &values[i]);
+        if (rc == YQ_OK) {
+            found++;
+        } else {
+            values[i].data = NULL;
+            values[i].size = 0;
+        }
+    }
+    *found_count = found;
     return YQ_OK;
 }
