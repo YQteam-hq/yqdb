@@ -160,11 +160,17 @@ static int find_slot(const uint8_t *page, const uint8_t *key, size_t key_len, ui
 }
 
 static int read_key_from_slot(const uint8_t *page, uint16_t slot_idx, uint8_t *key_buf, size_t *key_len, uint32_t page_size) {
+    if (!page || !key_buf || !key_len) return -1;
+    if (slot_idx >= YQ_INLINE_MAX(page_size)) return -1;
+    
     uint16_t offset = get_slot(page, slot_idx);
+    if (offset >= page_size) return -1;
+    
     uint8_t *cell = (uint8_t *)page + offset;
     size_t n = 0;
     if (yq_varint_decode(cell, page_size - offset, key_len, &n) != 0) return -1;
-    if (*key_len > 1024) return -1;
+    if (*key_len > 1024 || *key_len > page_size - offset - n) return -1;
+    
     memcpy(key_buf, cell + n, *key_len);
     return 0;
 }
