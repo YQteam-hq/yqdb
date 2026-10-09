@@ -145,6 +145,10 @@ static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
         memcpy(p + YQ_WAL_HEADER_SIZE, payload, paylen);
     }
 
+    /* Check for integer overflow in buffer usage update */
+    if (wal->buf_used > SIZE_MAX - total) {
+        return YQ_ERR_NOMEM;
+    }
     wal->buf_used += total;
     return YQ_OK;
 }

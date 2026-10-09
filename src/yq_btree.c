@@ -202,8 +202,13 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
     }
 
     uint16_t needed = (uint16_t)cell_total;
+    
+    /* Check for integer overflow in needed calculation */
+    if ((size_t)needed != cell_total) return YQ_ERR_CORRUPT;
 
     if (hdr.free_bytes >= needed + YQ_PAGE_SLOT_SIZE) {
+        /* Check for integer overflow in offset calculation */
+        if (hdr.free_bytes < needed) return YQ_ERR_CORRUPT;
         uint16_t new_offset = hdr.free_bytes - needed;
         int slot = find_slot(page, (const uint8_t *)key.data, key.size, nkeys, ps);
         if (slot < 0) return YQ_ERR_CORRUPT;
@@ -533,7 +538,8 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
             yq_slice median_key;
             uint8_t key_buf[1025];
             size_t key_len = 0;
-            read_key_from_slot(right_page, 0, key_buf, &key_len, bt->page_size);
+            int rc = read_key_from_slot(right_page, 0, key_buf, &key_len, bt->page_size);
+            if (rc != 0) return YQ_ERR_CORRUPT;
             median_key.data = key_buf;
             median_key.size = key_len;
 
