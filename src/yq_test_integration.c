@@ -1,11 +1,33 @@
+/*
+ * _GNU_SOURCE must be defined before any libc header for mallinfo2().
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 #include "yq_test_check.h"
 #include <time.h>
 #include "yq.h"
 #include "yq_mempool.h"
+
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+/*
+ * mallinfo2() is glibc >= 2.33. When it is available the suite can assert
+ * that yq_close() really hands memory back, instead of only looking for
+ * wrong values.
+ */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+#define YQ_TEST_CAN_MEASURE_HEAP 1
+#endif
 
 static const char *TEST_DB = "yqtest_integration.yqdb";
 
@@ -922,6 +944,393 @@ static void test_checkpoint_compaction(void) {
 }
 
 /*
+ * Write-lock contention must honour lock_timeout_ms.
+ *
+ * Regression guard for the writer election: it used a blocking flock(), so a
+ * second writer hung in the kernel forever instead of returning YQ_ERR_BUSY
+ * (lock_timeout_ms == 0) or YQ_ERR_TIMEOUT (budget exhausted).
+ */
+static void test_writer_lock_contention(void) {
+    printf("test_writer_lock_contention... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+    opts.lock_timeout_ms = 0;
+
+    yq_db *a = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &a), YQ_OK);
+
+    yq_txn *ta = NULL;
+    CHECK_EQ(yq_txn_begin(a, YQ_TXN_READWRITE, &ta), YQ_OK);  /* holds the lock */
+
+    /* A second writer that does not wait must be rejected immediately. */
+    yq_db *b = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &b), YQ_OK);
+    yq_txn *tb = NULL;
+    CHECK_EQ(yq_txn_begin(b, YQ_TXN_READWRITE, &tb), YQ_ERR_BUSY);
+    CHECK_EQ(yq_close(b), YQ_OK);
+
+    /* With a budget it must give up with YQ_ERR_TIMEOUT, not hang. */
+    yq_opts waiting = opts;
+    waiting.lock_timeout_ms = 30;
+    yq_db *c = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &waiting, &c), YQ_OK);
+    yq_txn *tc = NULL;
+    CHECK_EQ(yq_txn_begin(c, YQ_TXN_READWRITE, &tc), YQ_ERR_TIMEOUT);
+
+    /* Readers are never blocked by the writer. */
+    yq_txn *ro = NULL;
+    CHECK_EQ(yq_txn_begin(c, YQ_TXN_READONLY, &ro), YQ_OK);
+    CHECK_EQ(yq_txn_commit(ro), YQ_OK);
+
+    /* Once the writer commits, the waiting handle can take the lock. */
+    CHECK_EQ(yq_txn_commit(ta), YQ_OK);
+    CHECK_EQ(yq_txn_begin(c, YQ_TXN_READWRITE, &tc), YQ_OK);
+    CHECK_EQ(yq_txn_commit(tc), YQ_OK);
+
+    CHECK_EQ(yq_close(c), YQ_OK);
+    CHECK_EQ(yq_close(a), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
+/*
+ * Values that do not fit in the WAL encode buffer.
+ *
+ * Regression guard for a stack buffer overflow: yq_wal_append_put() encoded
+ * the whole record into a 2048-byte stack buffer and memcpy()'d the value
+ * into it unchecked. yq_put() documents values of up to 1 GiB, so anything
+ * over ~2 KB wrote past the end of the frame. Sizes are chosen to sit on both
+ * sides of the old 2048-byte buffer.
+ */
+static void test_large_value(void) {
+    printf("test_large_value... ");
+    remove_db();
+
+    /* 2044 is the largest value that still fits next to a 1-byte key. */
+    const size_t sizes[] = { 2044, 2048, 8192, 65536 };
+    const int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+
+    uint8_t **vals = malloc(nsizes * sizeof(uint8_t *));
+    CHECK(vals != NULL);
+    for (int i = 0; i < nsizes; i++) {
+        vals[i] = malloc(sizes[i]);
+        CHECK(vals[i] != NULL);
+        memset(vals[i], 'a' + i, sizes[i]);
+    }
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    yq_txn *t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+    for (int i = 0; i < nsizes; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "big-%d", i);
+        yq_slice key = { k, strlen(k) };
+        yq_slice val = { vals[i], sizes[i] };
+        CHECK_EQ(yq_put(t, key, val, YQ_PUT_UPSERT), YQ_OK);
+    }
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    /* Reopen: the values must come back out of the WAL intact. */
+    db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+    for (int i = 0; i < nsizes; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "big-%d", i);
+        yq_slice key = { k, strlen(k) };
+        yq_slice out = {0};
+        CHECK_EQ(yq_get(t, key, &out), YQ_OK);
+        CHECK_EQ((int64_t)out.size, (int64_t)sizes[i]);
+        CHECK(memcmp(out.data, vals[i], sizes[i]) == 0);
+    }
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+
+    /* A checkpoint rewrites the log from the memtable; it must not lose or
+     * garble the large records either. */
+    CHECK_EQ(yq_checkpoint(db), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+    for (int i = 0; i < nsizes; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "big-%d", i);
+        yq_slice key = { k, strlen(k) };
+        yq_slice out = {0};
+        CHECK_EQ(yq_get(t, key, &out), YQ_OK);
+        CHECK_EQ((int64_t)out.size, (int64_t)sizes[i]);
+        CHECK(memcmp(out.data, vals[i], sizes[i]) == 0);
+    }
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    for (int i = 0; i < nsizes; i++) free(vals[i]);
+    free(vals);
+    remove_db();
+
+    printf("OK\n");
+}
+
+/*
+ * Meta block placement.
+ *
+ * The two meta blocks live in page 0 and page 1 of the database file, i.e. at
+ * offsets 0 and opts.page_size. yq_mvcc hard-coded page_size = 4096, so for
+ * any other page size meta block 1 was written into the middle of page 0 and
+ * page 1 — which the format reserves for it — stayed all zeroes:
+ *
+ *   $ hexdump db.yqdb          (page_size = 8192)
+ *   offset     0: 59 51 44 42   <- meta block 0
+ *   offset  4096: 59 51 44 42   <- meta block 1, inside page 0
+ *   offset  8192: 00 00 00 00   <- page 1, should hold meta block 1
+ *
+ * The B+Tree addresses pages by opts.page_size, so page 0 covered both meta
+ * blocks, and yq_open() had already reserved npages = 2 for them.
+ */
+static void test_meta_page_placement(void) {
+    printf("test_meta_page_placement... ");
+
+    /*
+     * What the writer puts on disk: yq_mvcc stores the magic by memcpy()ing a
+     * uint64 into the page, so building the expected bytes the same way keeps
+     * this test endian-independent.
+     */
+    const uint64_t magic = (uint64_t)0x42445159u | ((uint64_t)0x00010A1Au << 32);
+    uint8_t want[8];
+    for (int i = 0; i < 8; i++) want[i] = (uint8_t)(magic >> (8 * i));
+
+    const uint32_t sizes[] = { 4096, 8192, 16384, 65536 };
+
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        const uint32_t ps = sizes[s];
+        remove_db();
+
+        yq_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.struct_size = sizeof(opts);
+        opts.flags = YQ_OPEN_CREATE;
+        opts.page_size = ps;
+
+        yq_db *db = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+        yq_txn *t = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+        yq_slice k = { "k", 1 };
+        yq_slice v = { "v", 1 };
+        CHECK_EQ(yq_put(t, k, v, YQ_PUT_UPSERT), YQ_OK);
+        CHECK_EQ(yq_txn_commit(t), YQ_OK);
+        CHECK_EQ(yq_close(db), YQ_OK);
+
+        FILE *f = fopen(TEST_DB, "rb");
+        CHECK(f != NULL);
+        CHECK(fseek(f, 0, SEEK_END) == 0);
+        CHECK(ftell(f) >= (long)ps * 2);   /* at least the two meta pages */
+
+        uint8_t *page = malloc(ps);
+        CHECK(page != NULL);
+
+        for (int idx = 0; idx < 2; idx++) {
+            CHECK(fseek(f, (long)idx * (long)ps, SEEK_SET) == 0);
+            CHECK_EQ((long)fread(page, 1, ps, f), (long)ps);
+            CHECK(memcmp(page, want, 8) == 0);
+        }
+
+        free(page);
+        fclose(f);
+    }
+
+    remove_db();
+    printf("OK\n");
+}
+
+#if defined(YQ_TEST_CAN_MEASURE_HEAP)
+/*
+ * Bytes currently handed out by malloc(). hblkhd is included because glibc
+ * serves large requests (the 64 MiB arena below) from mmap() rather than the
+ * main heap, and those would otherwise not show up.
+ */
+static size_t heap_in_use(void) {
+    struct mallinfo2 m = mallinfo2();
+    return m.uordblks + m.hblkhd;
+}
+
+/*
+ * yq_close() must release everything yq_open() allocated.
+ *
+ * free_db() had an empty `if (db->btree) { }` block, so the yq_btree handle
+ * malloc()'d by yq_btree_open()/yq_btree_create() was never freed. Worse,
+ * when the database file is empty yq_open() cannot mmap() it and falls back
+ * to a heap arena of opts.map_size bytes — 1 GiB by default — which was
+ * leaked as well, once per open.
+ */
+static void test_close_releases_resources(void) {
+    printf("test_close_releases_resources... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    /* Warm up: the first open pulls in stdio/allocator state that would
+     * otherwise be counted as growth. */
+    for (int i = 0; i < 3; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+
+    /* (1) the b-tree handle: 96 bytes per cycle, so it takes a few thousand
+     *     cycles to show up above allocator noise. */
+    size_t heap_before = heap_in_use();
+    for (int i = 0; i < 2000; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+    size_t heap_growth = heap_in_use() - heap_before;
+    printf("(heap +%zu B) ", heap_growth);
+    CHECK(heap_growth < 64 * 1024);   /* leaking: ~220 KB for 2000 cycles */
+
+    /* (2) the heap arena fallback: a zero-length database file cannot be
+     *     mmap()ed, so yq_open() malloc()s opts.map_size bytes for the arena.
+     *     64 MiB keeps the test cheap; the default is 1 GiB. */
+    remove_db();
+    FILE *f = fopen(TEST_DB, "wb");
+    CHECK(f != NULL);
+    fclose(f);
+
+    yq_opts zopts;
+    memset(&zopts, 0, sizeof(zopts));
+    zopts.struct_size = sizeof(zopts);
+    zopts.page_size = 4096;
+    zopts.map_size = 64ULL * 1024 * 1024;
+
+    for (int i = 0; i < 2; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &zopts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+
+    size_t arena_before = heap_in_use();
+    for (int i = 0; i < 4; i++) {
+        yq_db *d = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &zopts, &d), YQ_OK);
+        CHECK_EQ(yq_close(d), YQ_OK);
+    }
+    size_t arena_growth = heap_in_use() - arena_before;
+    printf("(arena +%zu B) ", arena_growth);
+    CHECK(arena_growth < 4ULL * 1024 * 1024);   /* leaking: ~256 MiB here */
+
+    remove_db();
+    printf("OK\n");
+}
+#endif /* YQ_TEST_CAN_MEASURE_HEAP */
+
+#if !defined(_WIN32)
+/*
+ * Long database paths.
+ *
+ * Regression guard for the derived-path buffers: yq_open() used to accept a
+ * path only up to 1023 bytes and then snprintf() "%s.shm" / "%s.lock" into a
+ * 1024-byte buffer (truncating them), while yq_wal_open() rejected anything
+ * longer than 507 bytes outright. Both limits were below what yq_open()
+ * advertised, so a long path either failed with YQ_ERR_INVAL or silently used
+ * truncated auxiliary names.
+ */
+static void test_long_db_path(void) {
+    printf("test_long_db_path... ");
+
+    enum { LEVELS = 6, SEG = 200 };
+    char seg[SEG + 1];
+    memset(seg, 'd', SEG);
+    seg[SEG] = '\0';
+
+    char prefix[LEVELS * (SEG + 1) + 1];
+    char levels[LEVELS][LEVELS * (SEG + 1) + 1];
+    size_t plen = 0;
+    prefix[0] = '\0';
+
+    for (int i = 0; i < LEVELS; i++) {
+        memcpy(levels[i], prefix, plen);
+        memcpy(levels[i] + plen, seg, SEG);
+        memcpy(levels[i] + plen + SEG, "/", 2);
+        plen += SEG + 1;
+        mkdir(levels[i], 0755);
+        memcpy(prefix, levels[i], plen + 1);
+    }
+
+    char path[sizeof(prefix) + 32];
+    memcpy(path, prefix, plen);
+    memcpy(path + plen, "long.yqdb", 10);
+    plen += 9;
+    CHECK(plen > 1024);   /* past the old buffers */
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+    opts.page_size = 4096;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(path, &opts, &db), YQ_OK);
+
+    yq_txn *t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &t), YQ_OK);
+    yq_slice k = {"k", 1};
+    yq_slice v = {"v", 1};
+    CHECK_EQ(yq_put(t, k, v, YQ_PUT_UPSERT), YQ_OK);
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    /* The auxiliary files must sit next to the database, not at a truncated
+     * path — and the data must survive a reopen. */
+    char aux[sizeof(path) + 8];
+    memcpy(aux, path, plen);
+    memcpy(aux + plen, ".shm", 5);
+    CHECK(fopen(aux, "rb") != NULL);
+    memcpy(aux + plen, ".lock", 6);
+    CHECK(fopen(aux, "rb") != NULL);
+
+    db = NULL;
+    CHECK_EQ(yq_open(path, &opts, &db), YQ_OK);
+    t = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &t), YQ_OK);
+    yq_slice out = {0};
+    CHECK_EQ(yq_get(t, k, &out), YQ_OK);
+    CHECK(out.size == 1);
+    CHECK_EQ(yq_txn_commit(t), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+
+    memcpy(aux + plen, ".log", 5);  remove(aux);
+    memcpy(aux + plen, ".shm", 5);  remove(aux);
+    memcpy(aux + plen, ".lock", 6); remove(aux);
+    remove(path);
+    for (int i = LEVELS - 1; i >= 0; i--) rmdir(levels[i]);
+
+    printf("OK\n");
+}
+#endif /* !_WIN32 */
+
+/*
  * checkpoint 会把 memtable 里的 value 原样送进 yq_wal_append_put() 重新编码。
  * 该函数历史上用固定的 uint8_t enc_buf[2048]，key 上限 1024 加 varint 开销后，
  * value 超过约 1017 字节就会写穿栈缓冲，而 yq_put() 允许 value 到 1 GiB。
@@ -995,6 +1404,15 @@ int main(void) {
     test_reader_slots();
     test_readonly_snapshot();
     test_checkpoint_compaction();
+    test_writer_lock_contention();
+    test_large_value();
+    test_meta_page_placement();
+#if defined(YQ_TEST_CAN_MEASURE_HEAP)
+    test_close_releases_resources();
+#endif
+#if !defined(_WIN32)
+    test_long_db_path();
+#endif
     test_checkpoint_large_value();
     test_nosync();
 

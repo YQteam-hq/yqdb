@@ -1,4 +1,5 @@
 #include "yq_wal.h"
+#include "yq_vfs.h"
 #include "yq_enc.h"
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +32,7 @@ struct yq_wal {
     uint64_t default_page_size;
     uint64_t file_size;
     uint64_t last_lsn;
-    char log_path[512];
+    char log_path[YQ_MAX_PATH];
 };
 
 static int make_log_path(char *out, size_t out_cap, const char *db_path) {

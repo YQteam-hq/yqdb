@@ -6,6 +6,20 @@
 #include <sys/types.h>
 #include "yq.h"
 
+/*
+ * Cap for a database path plus its longest auxiliary suffix.
+ *
+ * yq_open() accepts a path up to this length, and the .shm / .lock / .log /
+ * .ckpt-tmp.log names are built by appending to it, so every buffer that
+ * holds a derived path must be at least this big. When they were smaller
+ * (1024 in yq.c, 512 in yq_wal.c) long paths were silently truncated or
+ * rejected outright.
+ */
+#define YQ_MAX_PATH 4096
+
+/* Longest suffix appended to a database path (".ckpt-tmp.log" + NUL). */
+#define YQ_MAX_SUFFIX 16
+
 typedef struct yq_file yq_file;
 
 yq_file *yq_file_open(const char *path, int create, int rdwr);
@@ -28,6 +42,14 @@ uint64_t yq_file_size(yq_file *f);
  */
 int yq_file_rename(const char *from, const char *to);
 int yq_file_lock(yq_file *f, int exclusive);
+/*
+ * Non-blocking variant of yq_file_lock().
+ *
+ * Returns YQ_OK when the lock was taken, YQ_ERR_BUSY when another holder has
+ * it, YQ_ERR_IO on a real failure. yq_file_lock() blocks until the lock is
+ * available, which makes it impossible to honour a lock timeout on top of it.
+ */
+int yq_file_lock_nb(yq_file *f, int exclusive);
 int yq_file_unlock(yq_file *f);
 void *yq_file_mmap(yq_file *f, uint64_t offset, size_t len);
 int yq_file_munmap(void *ptr, size_t len);

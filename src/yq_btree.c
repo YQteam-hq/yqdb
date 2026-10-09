@@ -719,6 +719,10 @@ int yq_btree_open(yq_btree **out, void *mmap_base, uint64_t file_size, uint32_t 
     return YQ_OK;
 }
 
+void yq_btree_close(yq_btree *bt) {
+    free(bt);
+}
+
 int yq_btree_get_root(yq_btree *bt, uint64_t *root_page) {
     *root_page = bt->root_page;
     return YQ_OK;

@@ -15,6 +15,14 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val);
 int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out);
 int yq_btree_delete(yq_btree *bt, yq_slice key);
 int yq_btree_open(yq_btree **out, void *mmap_base, uint64_t file_size, uint32_t page_size);
+/*
+ * Release a handle returned by yq_btree_create() or yq_btree_open().
+ *
+ * The arena is owned by the caller, not by the handle: yq_open() passes
+ * either an mmap()ed region or a heap block, and it is the caller that knows
+ * which one it is, so yq_btree_close() never touches bt->arena.
+ */
+void yq_btree_close(yq_btree *bt);
 int yq_btree_get_root(yq_btree *bt, uint64_t *root_page);
 int yq_btree_set_root(yq_btree *bt, uint64_t root_page);
 int yq_btree_set_npages(yq_btree *bt, uint64_t npages);
