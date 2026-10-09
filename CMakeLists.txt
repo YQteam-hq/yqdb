@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.10)
 project(yqdb C)
 
+# Required for add_test()/ctest to pick up any test at all; without it
+# `ctest --test-dir build` reports "No tests were found" and exits 0, so CI
+# passes without ever running the suite.
+enable_testing()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -43,6 +48,20 @@ add_executable(yq_test_seek src/yq_test_seek.c)
 target_link_libraries(yq_test_seek yqdb)
 add_test(NAME seek_test COMMAND yq_test_seek)
 
+add_executable(yq_test_mvcc src/yq_test_mvcc.c)
+target_link_libraries(yq_test_mvcc yqdb)
+add_test(NAME mvcc_test COMMAND yq_test_mvcc)
+
+# The test binaries report failures through assert(). Release-like build types
+# define NDEBUG, which compiles every assertion away and lets the suite "pass"
+# without verifying anything, so keep assertions enabled for test targets.
+foreach(yq_test_target yq_test_basic yq_test_integration yq_test_seek yq_test_mvcc)
+    if(MSVC)
+        target_compile_options(${yq_test_target} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${yq_test_target} PRIVATE -UNDEBUG)
+    endif()
+endforeach()
 add_executable(yq_test_p4 src/yq_test_p4.c)
 target_link_libraries(yq_test_p4 yqdb)
 add_test(NAME p4_recovery_test COMMAND yq_test_p4)
