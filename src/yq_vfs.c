@@ -36,7 +36,14 @@ yq_file *yq_file_open(const char *path, int create, int rdwr) {
     DWORD access = rdwr ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
     DWORD disp = create ? OPEN_ALWAYS : OPEN_EXISTING;
 
-    f->handle = CreateFileA(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    /*
+     * 必须带 FILE_SHARE_DELETE：checkpoint 用 MoveFileExA(...,
+     * MOVEFILE_REPLACE_EXISTING) 替换 <db>.log，而该调用需要先删除目标文件。
+     * 若句柄未共享删除权限（旧实现只有 READ|WRITE），替换会被挡下并返回
+     * ERROR_SHARING_VIOLATION，checkpoint 随之报 YQ_ERR_IO。
+     */
+    f->handle = CreateFileA(path, access,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f->handle == INVALID_HANDLE_VALUE) {
         free(f);
@@ -127,6 +134,13 @@ uint64_t yq_file_size(yq_file *f) {
     return (uint64_t)sz.QuadPart;
 }
 
+int yq_file_rename(const char *from, const char *to) {
+    if (!MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return YQ_ERR_IO;
+    }
+    return YQ_OK;
+}
+
 int yq_file_lock(yq_file *f, int exclusive) {
     DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
     OVERLAPPED ov = {0};
@@ -185,6 +199,7 @@ int yq_file_munmap(void *ptr, size_t len) {
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -243,6 +258,13 @@ int yq_file_sync(yq_file *f) {
 
 int yq_file_truncate(yq_file *f, uint64_t size) {
     if (ftruncate(f->fd, (off_t)size) < 0) {
+        return YQ_ERR_IO;
+    }
+    return YQ_OK;
+}
+
+int yq_file_rename(const char *from, const char *to) {
+    if (rename(from, to) != 0) {
         return YQ_ERR_IO;
     }
     return YQ_OK;

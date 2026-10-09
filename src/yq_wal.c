@@ -9,6 +9,12 @@
 #define YQ_WAL_VARINT_MAX   10
 #define YQ_WAL_STACK_ENC    512
 
+/*
+ * yq_wal_append_put() 的栈缓冲上限：payload 小于它就走栈，否则走堆。
+ * 取 2 KiB 是为了覆盖"小 key + 小 value"这一热路径，同时不至于把栈压大。
+ */
+#define YQ_WAL_SMALL_PAYLOAD 2048
+
 #define WAL_TYPE_BEGIN   1
 #define WAL_TYPE_PUT     2
 #define WAL_TYPE_DEL     3
