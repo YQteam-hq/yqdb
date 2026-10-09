@@ -492,8 +492,14 @@ int yq_txn_commit(yq_txn *txn) {
         }
 
         rc2 = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
-
         yq_mvcc_release_writer(db->mvcc);
+
+        if (rc2 != YQ_OK) {
+            txn->state = YQ_TXN_STATE_ABORTED;
+            if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+            free(txn);
+            return rc2;
+        }
     }
 
     txn->state = YQ_TXN_STATE_COMMITTED;
