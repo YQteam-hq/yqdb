@@ -1135,6 +1135,10 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
     }
+    if (!txn->db) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
     if (txn->state != YQ_TXN_STATE_ACTIVE) {
         yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
         return YQ_ERR_TXN_CLOSED;
@@ -1170,6 +1174,8 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
             entry_bad = 1;
         } else if (e->op == 1 && (e->val.size != 0 || e->val.data != NULL)) {
             entry_bad = 1;
+        } else if (e->op == 0 && e->val.size > 1024 * 1024) {
+            entry_bad = 1;
         }
         if (entry_bad) bad = 1;
     }
@@ -1196,6 +1202,10 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
         } else {
             failed++;
             if (first_error == YQ_OK) first_error = rc;
+            /* 记录失败 entry 的索引，便于调试 */
+            if (result && i < result->entries_total) {
+                result->failed_indices[result->entries_failed - 1] = (uint32_t)i;
+            }
         }
     }
 
@@ -1213,6 +1223,14 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
     }
+    if (!txn->db) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
+    if (txn->state != YQ_TXN_STATE_ACTIVE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
+        return YQ_ERR_TXN_CLOSED;
+    }
     /* count * sizeof(*entries) 为 size_t 运算，先挡回绕再分配 */
     if (count > SIZE_MAX / sizeof(yq_batch_entry)) {
         yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
@@ -1225,6 +1243,11 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
         return YQ_ERR_NOMEM;
     }
     for (size_t i = 0; i < count; i++) {
+        if (!keys[i].data || keys[i].size == 0 || keys[i].size > 1024) {
+            free(entries);
+            yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+            return YQ_ERR_INVAL;
+        }
         entries[i].key = keys[i];
         entries[i].val = (yq_slice){NULL, 0};
         entries[i].op = 1; /* DELETE */
@@ -1239,10 +1262,17 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
 int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
                  yq_slice *values, size_t *found_count) {
     if (!txn || !keys || count == 0 || !values || !found_count) return YQ_ERR_INVAL;
+    if (!txn->db) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    if (txn->flags & YQ_TXN_READONLY) return YQ_ERR_READONLY;
 
     size_t found = 0;
     for (size_t i = 0; i < count; i++) {
+        if (!keys[i].data || keys[i].size == 0 || keys[i].size > 1024) {
+            values[i].data = NULL;
+            values[i].size = 0;
+            continue;
+        }
         int rc = yq_get(txn, keys[i], &values[i]);
         if (rc == YQ_OK) {
             found++;
