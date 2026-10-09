@@ -193,7 +193,7 @@ static void free_db(yq_db *db) {
 
 int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     *out = NULL;
-    if (!opts || opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
+    if (!opts || !out || opts->struct_size != sizeof(yq_opts)) return YQ_ERR_INVAL;
     if (!path || path[0] == '\0') return YQ_ERR_INVAL;
 
     int rc = validate_opts(opts);
@@ -348,6 +348,8 @@ static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
 static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
     if (txn->pending_count >= txn->pending_cap) {
         size_t nc = txn->pending_cap ? txn->pending_cap * 2 : 64;
+        /* Check for integer overflow */
+        if (nc > SIZE_MAX / sizeof(pending_op)) return YQ_ERR_NOMEM;
         pending_op *na = realloc(txn->pending, nc * sizeof(pending_op));
         if (!na) return YQ_ERR_NOMEM;
         txn->pending = na;
@@ -363,7 +365,10 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
     op->is_del = is_del;
     if (!is_del) {
         op->val = malloc(val.size ? val.size : 1);
-        if (!op->val) { free(op->key); return YQ_ERR_NOMEM; }
+        if (!op->val) { 
+            free(op->key);
+            return YQ_ERR_NOMEM; 
+        }
         memcpy(op->val, val.data, val.size);
         op->val_len = val.size;
     }
@@ -1054,6 +1059,11 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
     }
 
     uint32_t total = (uint32_t)count;
+    /* Check for size_t to uint32_t truncation */
+    if ((size_t)total != count) {
+        yq_batch_result_init(result, 0, YQ_ERR_INVAL);
+        return YQ_ERR_INVAL;
+    }
     yq_batch_result_init(result, total, YQ_OK);
 
     /* 第一遍：先校验全部 entry，避免半批写入 */

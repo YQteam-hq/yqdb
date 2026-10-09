@@ -13,6 +13,7 @@
 #define YQ_PAGE_CRC_SIZE      4
 #define YQ_PAGE_SLOT_SIZE     2
 #define YQ_VARINT_MAX_SIZE    10
+#define YQ_BTREE_MAX_PATH_DEPTH 64
 
 #define YQ_INLINE_MAX(ps)     ((ps) / 4)
 
@@ -91,6 +92,7 @@ static void set_slot(uint8_t *page, uint16_t idx, uint16_t offset) {
 }
 
 static uint8_t *get_page_data(yq_btree *bt, uint64_t page_no) {
+    if (!bt) return NULL;
     if (bt->mmap_base) {
         return (uint8_t *)bt->mmap_base + page_no * bt->page_size;
     }
@@ -99,6 +101,7 @@ static uint8_t *get_page_data(yq_btree *bt, uint64_t page_no) {
 }
 
 static uint8_t *alloc_page(yq_btree *bt, int is_leaf) {
+    if (!bt) return NULL;
     if (bt->page_alloc) {
         return (uint8_t *)bt->page_alloc(bt->page_provider_ctx, is_leaf);
     }
@@ -490,7 +493,7 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
         write_page_header(root, &hdr);
         write_page_crc(root, bt->page_size);
         bt->root_page = 0;
-        bt->npages = 1;
+        bt->npages = 2;
     }
 
     uint64_t path_pnos[64];
@@ -577,7 +580,7 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
             return YQ_OK;
         }
 
-        if (path_len >= 64) return YQ_ERR_PANIC;
+        if (path_len >= YQ_BTREE_MAX_PATH_DEPTH) return YQ_ERR_PANIC;
         path_pnos[path_len] = cur_page;
         path_len++;
 

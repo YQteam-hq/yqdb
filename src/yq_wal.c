@@ -158,7 +158,6 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
  * 这里改为按需小缓冲：小 payload 走栈上的 2 KiB 缓冲避免堆分配，
  * 大 payload 回退到堆缓冲，两条路径都不再有溢出可能。
  */
-#define YQ_WAL_SMALL_PAYLOAD 2048
 
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
     if (!wal) return YQ_ERR_INVAL;

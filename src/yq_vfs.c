@@ -193,8 +193,10 @@ void *yq_file_mmap(yq_file *f, uint64_t offset, size_t len) {
                               (DWORD)(mv_off.HighPart),
                               (DWORD)(mv_off.LowPart),
                               len);
-    CloseHandle(mapping);
-    if (!ptr) return NULL;
+    if (!ptr) {
+        CloseHandle(mapping);
+        return NULL;
+    }
     return ptr;
 }
 
