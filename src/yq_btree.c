@@ -157,6 +157,7 @@ static int find_slot(const uint8_t *page, const uint8_t *key, size_t key_len, ui
         size_t pos = 0;
         uint64_t klen;
         if (yq_varint_decode(cell, page_size - offset, &klen, &pos) != 0) return -1;
+        if (pos + klen > (size_t)(page_size - offset)) return -1;
         int cmp = compare_key(cell + pos, klen, key, key_len);
         if (cmp == 0) return mid;
         if (cmp < 0) lo = mid + 1;
@@ -171,6 +172,7 @@ static int read_key_from_slot(const uint8_t *page, uint16_t slot_idx, uint8_t *k
     size_t n = 0;
     if (yq_varint_decode(cell, page_size - offset, key_len, &n) != 0) return -1;
     if (*key_len > 1024) return -1;
+    if (n + *key_len > (size_t)(page_size - offset)) return -1;
     memcpy(key_buf, cell + n, *key_len);
     return 0;
 }
@@ -590,7 +592,10 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
             uint8_t *cell = page + offset;
             size_t n = 0;
             uint64_t klen;
-            yq_varint_decode(cell, bt->page_size - offset, &klen, &n);
+            size_t avail = bt->page_size - offset;
+            if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
+                return YQ_ERR_CORRUPT;
+            }
             child = *(uint64_t *)(cell + n + klen);
         }
         cur_page = child;
@@ -620,6 +625,7 @@ int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
             size_t n = 0;
             uint64_t klen;
             if (yq_varint_decode(cell, ps - offset, &klen, &n) != 0) return YQ_ERR_CORRUPT;
+            if (n + klen > (size_t)(ps - offset)) return YQ_ERR_CORRUPT;
             if (klen != key.size || memcmp(cell + n, key.data, klen) != 0) return YQ_ERR_NOTFOUND;
 
             size_t pos = n + klen;
@@ -648,7 +654,10 @@ int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
             uint8_t *cell = page + offset;
             size_t n = 0;
             uint64_t klen;
-            yq_varint_decode(cell, ps - offset, &klen, &n);
+            size_t avail = ps - offset;
+            if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
+                return YQ_ERR_CORRUPT;
+            }
             child = *(uint64_t *)(cell + n + klen);
         }
         cur_page = child;
@@ -699,7 +708,10 @@ int yq_btree_delete(yq_btree *bt, yq_slice key) {
             uint8_t *cell = page + offset;
             size_t n = 0;
             uint64_t klen;
-            yq_varint_decode(cell, ps - offset, &klen, &n);
+            size_t avail = ps - offset;
+            if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
+                return YQ_ERR_CORRUPT;
+            }
             child = *(uint64_t *)(cell + n + klen);
         }
         cur_page = child;
@@ -783,7 +795,10 @@ static int find_rightmost_leaf(yq_btree *bt, uint64_t page_no, uint64_t *leaf_pa
         uint8_t *cell = page + offset;
         size_t n = 0;
         uint64_t klen;
-        yq_varint_decode(cell, ps - offset, &klen, &n);
+        size_t avail = ps - offset;
+        if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
+            return YQ_ERR_CORRUPT;
+        }
         uint64_t child = *(uint64_t *)(cell + n + klen);
         cur = child;
     }
@@ -908,6 +923,7 @@ int yq_btree_cursor_key(yq_btree_cursor *c, yq_slice *out) {
     size_t n = 0;
     uint64_t klen;
     if (yq_varint_decode(cell, bt->page_size - offset, &klen, &n) != 0) return YQ_ERR_CORRUPT;
+    if (n + klen > (size_t)(bt->page_size - offset)) return YQ_ERR_CORRUPT;
     out->data = cell + n;
     out->size = (size_t)klen;
     return YQ_OK;
@@ -924,9 +940,11 @@ int yq_btree_cursor_val(yq_btree_cursor *c, yq_slice *out) {
     size_t n = 0;
     uint64_t klen;
     if (yq_varint_decode(cell, bt->page_size - offset, &klen, &n) != 0) return YQ_ERR_CORRUPT;
+    if (n + klen > (size_t)(bt->page_size - offset)) return YQ_ERR_CORRUPT;
     size_t pos = n + klen;
     uint64_t val_len;
     if (yq_varint_decode(cell + pos, bt->page_size - offset - pos, &val_len, &n) != 0) return YQ_ERR_CORRUPT;
+    if (pos + n + val_len > (size_t)(bt->page_size - offset)) return YQ_ERR_CORRUPT;
     pos += n;
     out->data = cell + pos;
     out->size = (size_t)val_len;
