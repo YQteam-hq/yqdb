@@ -17,13 +17,13 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-#define barrier() _ReadWriteBarrier()
+#define barrier() MemoryBarrier()
 static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)GetCurrentProcessId(); }
 static uint32_t yq_mvcc_current_tid(void) { return (uint32_t)GetCurrentThreadId(); }
 #else
 #include <stdatomic.h>
 #include <unistd.h>
-#define barrier() __asm__ __volatile__("" ::: "memory")
+#define barrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 static uint32_t yq_mvcc_current_pid(void) { return (uint32_t)getpid(); }
 static uint32_t yq_mvcc_current_tid(void) { return 0; }
 #endif

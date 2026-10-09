@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 #define YQ_PAGE_TYPE_LEAF     1
 #define YQ_PAGE_TYPE_INTERNAL 2
@@ -28,8 +29,8 @@ typedef struct {
 
 struct yq_btree {
     uint32_t page_size;
-    uint64_t root_page;
-    uint64_t npages;
+    volatile atomic_uint64_t root_page;
+    volatile atomic_uint64_t npages;
     yq_memblk *arena;
     void *mmap_base;
     uint64_t mmap_size;
@@ -351,7 +352,7 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
 
     *out_new_page = bt->npages;
     *out_new_page_data = new_page;
-    bt->npages++;
+    atomic_fetch_add(&bt->npages, 1);
     return 2;
 }
 
@@ -459,9 +460,9 @@ static int insert_into_internal(yq_btree *bt, uint64_t page_no, uint8_t *page,
     write_page_header(page, &hdr);
     write_page_crc(page, ps);
 
-    *out_new_page = bt->npages;
+    *out_new_page = atomic_load(&bt->npages);
     *out_new_page_data = new_page;
-    bt->npages++;
+    atomic_fetch_add(&bt->npages, 1);
     return 2;
 }
 
@@ -471,8 +472,8 @@ yq_btree *yq_btree_create(yq_memblk *arena, uint32_t page_size) {
     memset(bt, 0, sizeof(yq_btree));
     bt->page_size = page_size > 0 ? page_size : 4096;
     bt->arena = arena;
-    bt->root_page = 0;
-    bt->npages = 2;
+    atomic_store(&bt->root_page, 0);
+    atomic_store(&bt->npages, 2);
     return bt;
 }
 
@@ -505,7 +506,7 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
     uint64_t path_pnos[64];
     int path_len = 0;
 
-    uint64_t cur_page = bt->root_page;
+    uint64_t cur_page = atomic_load(&bt->root_page);
     while (1) {
         uint8_t *page = get_page_data(bt, cur_page);
         if (!page) return YQ_ERR_NOMEM;
@@ -567,8 +568,8 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
                 *(uint64_t *)(new_root + bt->page_size - 8) = cur_page;
                 write_page_header(new_root, &new_root_hdr);
                 write_page_crc(new_root, bt->page_size);
-                bt->root_page = bt->npages;
-                bt->npages++;
+                uint64_t new_root_page = atomic_fetch_add(&bt->npages, 1) + 1;
+                atomic_store(&bt->root_page, new_root_page);
                 return YQ_OK;
             }
 
