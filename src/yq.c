@@ -950,7 +950,8 @@ int yq_checkpoint(yq_db *db) {
     if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
 
     uint64_t new_txn_id = 0;
-    yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
+    int rc_inc = yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
+    if (rc_inc != YQ_OK) return rc_inc;
 
     uint64_t cur_txn = 0, cur_root = 0, cur_free = 0, cur_npages = 0, cur_ckpt = 0;
     yq_mvcc_meta_read(db->mvcc, &cur_txn, &cur_root, &cur_free, &cur_npages, &cur_ckpt);
@@ -961,7 +962,8 @@ int yq_checkpoint(yq_db *db) {
         cur_npages = yq_btree_npages(db->btree);
     }
 
-    yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    int rc_meta = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    if (rc_meta != YQ_OK) return rc_meta;
 
     /*
      * The log can only be rewritten while it is the sole durable copy of the
