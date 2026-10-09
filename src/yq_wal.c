@@ -43,6 +43,13 @@ static int make_log_path(char *out, size_t out_cap, const char *db_path) {
 }
 
 int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size) {
+    if (!out || !db_path) return YQ_ERR_INVAL;
+    if (default_page_size == 0) default_page_size = 4096;
+    if (default_page_size > (1ULL << 30)) return YQ_ERR_INVAL; /* 1GB limit */
+    
+    /* Validate database path */
+    if (strlen(db_path) > 500) return YQ_ERR_INVAL; /* Path length limit */
+    
     yq_wal *wal = calloc(1, sizeof(yq_wal));
     if (!wal) return YQ_ERR_NOMEM;
 
@@ -67,7 +74,15 @@ int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size) {
         return YQ_ERR_NOMEM;
     }
 
+    /* Validate file size to prevent corruption */
     wal->file_size = yq_file_size(wal->file);
+    if (wal->file_size > (1ULL << 40)) {
+        yq_file_close(wal->file);
+        free(wal->buf);
+        free(wal);
+        return YQ_ERR_IO; /* File too large */
+    }
+    
     wal->last_lsn = 0;
 
     *out = wal;
@@ -90,11 +105,17 @@ int yq_wal_close(yq_wal *wal) {
 }
 
 static int ensure_buf_space(yq_wal *wal, size_t need) {
+    if (!wal || !wal->buf) return YQ_ERR_INVAL;
+    if (need > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
+    /* Check for integer overflow */
+    if (wal->buf_used > SIZE_MAX - need) return YQ_ERR_INVAL;
     if (wal->buf_used + need <= wal->buf_cap) return YQ_OK;
 
     size_t new_cap = wal->buf_cap;
     while (new_cap < wal->buf_used + need) {
         new_cap *= 2;
+        if (new_cap > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
     }
 
     uint8_t *new_buf = realloc(wal->buf, new_cap);
@@ -107,7 +128,15 @@ static int ensure_buf_space(yq_wal *wal, size_t need) {
 
 static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
                          const uint8_t *payload, size_t paylen) {
+    if (!wal) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
+    if (rec_type < 1 || rec_type > 7) return YQ_ERR_INVAL; /* Valid record types */
+    if (!payload && paylen > 0) return YQ_ERR_INVAL;
+    if (paylen > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
     size_t total = YQ_WAL_HEADER_SIZE + paylen;
+    if (total > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
+    
     int rc = ensure_buf_space(wal, total);
     if (rc != YQ_OK) return rc;
 
@@ -161,9 +190,11 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
 
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
     if (!wal) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
     if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
     if (!key.data) return YQ_ERR_INVAL;
     if (val.size > 0 && !val.data) return YQ_ERR_INVAL;
+    if (val.size > (1ULL << 30)) return YQ_ERR_TOOBIG; /* 1GB limit */
 
     /*
      * Payload layout is varint(key_len) key varint(val_len) val. Values are
@@ -179,7 +210,9 @@ int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) 
     if (yq_varint_encode(key.size, klen_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
     if (yq_varint_encode(val.size, vlen_buf, &nv) != YQ_OK) return YQ_ERR_INVAL;
 
-    if (val.size > SIZE_MAX - (nk + key.size + nv)) return YQ_ERR_TOOBIG;
+    if (nk > SIZE_MAX - key.size || key.size > SIZE_MAX - nk || 
+        nv > SIZE_MAX - (nk + key.size) || 
+        val.size > SIZE_MAX - (nk + key.size + nv)) return YQ_ERR_TOOBIG;
     size_t total = nk + key.size + nv + val.size;
 
     uint8_t stack_buf[YQ_WAL_STACK_ENC];
@@ -205,6 +238,7 @@ int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) 
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
     if (!wal) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
     if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
     if (!key.data) return YQ_ERR_INVAL;
 
@@ -218,14 +252,21 @@ int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
 }
 
 int yq_wal_append_commit(yq_wal *wal, uint64_t txn_id) {
+    if (!wal) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
     return append_record(wal, txn_id, WAL_TYPE_COMMIT, NULL, 0);
 }
 
 int yq_wal_append_abort(yq_wal *wal, uint64_t txn_id) {
+    if (!wal) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
     return append_record(wal, txn_id, WAL_TYPE_ABORT, NULL, 0);
 }
 
 int yq_wal_append_ckpt_begin(yq_wal *wal, uint64_t root_page, uint64_t txn_id) {
+    if (!wal) return YQ_ERR_INVAL;
+    if (txn_id == 0) return YQ_ERR_INVAL;
+    if (root_page > (1ULL << 40)) return YQ_ERR_INVAL; /* 1TB limit */
     uint8_t payload[16];
     memcpy(payload + 0, &root_page, 8);
     memcpy(payload + 8, &txn_id, 8);
@@ -233,6 +274,8 @@ int yq_wal_append_ckpt_begin(yq_wal *wal, uint64_t root_page, uint64_t txn_id) {
 }
 
 int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
+    if (!wal) return YQ_ERR_INVAL;
+    if (ckpt_lsn > (1ULL << 40)) return YQ_ERR_INVAL; /* 1TB limit */
     uint8_t payload[8];
     memcpy(payload, &ckpt_lsn, 8);
     return append_record(wal, 0, WAL_TYPE_CKPT_END, payload, 8);
@@ -240,13 +283,16 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
 
 int yq_wal_flush(yq_wal *wal) {
     if (!wal || wal->buf_used == 0) return YQ_OK;
+    if (!wal->buf) return YQ_ERR_INVAL;
 
     size_t offset = wal->file_size;
     size_t pos = 0;
 
     while (pos < wal->buf_used) {
         uint8_t *rec = wal->buf + pos;
-        uint64_t lsn = ++wal->last_lsn;
+        uint64_t lsn = wal->last_lsn + 1;
+        if (lsn > (1ULL << 40)) return YQ_ERR_INVAL; /* 1TB limit */
+        wal->last_lsn = lsn;
         memcpy(rec + 0, &lsn, 8);
 
         uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
