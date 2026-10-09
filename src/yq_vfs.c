@@ -298,8 +298,12 @@ int yq_file_lock(yq_file *f, int exclusive) {
 
 int yq_file_lock_nb(yq_file *f, int exclusive) {
     int type = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
-    if (flock(f->fd, type) < 0) {
-        if (errno == EWOULDBLOCK || errno == EINTR || errno == EAGAIN) {
+    int rc;
+    do {
+        rc = flock(f->fd, type);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
             return YQ_ERR_BUSY;
         }
         return YQ_ERR_IO;
