@@ -467,6 +467,15 @@ yq_btree *yq_btree_create(yq_memblk *arena, uint32_t page_size) {
     return bt;
 }
 
+/*
+ * Release a B+Tree handle. The backing arena is NOT freed here: it is either
+ * the caller's mmap window or a block owned by yq_db, and ownership stays
+ * with whoever allocated it.
+ */
+void yq_btree_destroy(yq_btree *bt) {
+    free(bt);
+}
+
 int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
     if (bt->root_page == 0) {
         uint8_t *root = alloc_page(bt, 1);

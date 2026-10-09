@@ -10,6 +10,7 @@ typedef struct yq_btree yq_btree;
 typedef struct yq_btree_cursor yq_btree_cursor;
 
 yq_btree *yq_btree_create(yq_memblk *arena, uint32_t page_size);
+void yq_btree_destroy(yq_btree *bt);
 int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val);
 int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out);
 int yq_btree_delete(yq_btree *bt, yq_slice key);
