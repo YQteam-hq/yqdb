@@ -1,7 +1,7 @@
 # yq-DB
 
 [![Language](https://img.shields.io/badge/language-C11-blue.svg)](#环境要求)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](#版本与兼容策略)
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](#版本与兼容策略)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#环境要求)
 
@@ -56,6 +56,10 @@ yq-DB 是一个面向嵌入场景的单文件、零依赖 KV 存储引擎。它�
 | 双元数据页 | 页 0 / 页 1 按 `txn_id` / `meta_seq` 轮换，保证崩溃安全 |
 | 零拷贝读取 | 值以指向 mmap 的借用指针返回 |
 | 游标 | 双向有序遍历，支持 seek / seek_le / seek_exact |
+| 有序 seek | B+Tree 二分下降的有序游标定位（P2） |
+| 批量操作 | `yq_batch_put` / `yq_batch_del` / `yq_batch_get` 一次调用折叠多条操作 |
+| Checkpoint / 日志压缩 | `yq_checkpoint` 将内存表合并进 B+Tree 并截断 WAL |
+| 每句柄内存池 | 每个 `yq_db` 拥有独立内存池（独立模块） |
 | 可移植 | Windows（Win32）与 POSIX 后端统一在同一 VFS 接口下 |
 
 ## 架构概览
@@ -189,9 +193,20 @@ int main(void) {
 |------|------|
 | `yq_cur_open` / `yq_cur_close` | 创建 / 销毁绑定事务的游标 |
 | `yq_cur_first` / `yq_cur_last` | 定位到首 / 末条记录 |
-| `yq_cur_seek` / `yq_cur_seek_le` / `yq_cur_seek_exact` | 按键定位 |
+| `yq_cur_seek` / `yq_cur_seek_le` / `yq_cur_seek_exact` | 按键定位（二分下降） |
 | `yq_cur_next` / `yq_cur_prev` | 前移 / 后移一条 |
 | `yq_cur_valid` / `yq_cur_key` / `yq_cur_val` | 读取当前记录 |
+
+**批量操作**
+
+| 函数 | 说明 |
+|------|------|
+| `yq_batch_put` | 一次调用执行多条 PUT/DELETE 条目 |
+| `yq_batch_del` | 一次删除一批键 |
+| `yq_batch_get` | 一次读取多个键（未命中返回 `{NULL,0}`） |
+
+批量操作运行在调用者的事务内：任何变更前先整体校验，全批仅在提交时可见。
+`result` 传 `NULL` 可跳过逐条统计。
 
 **维护**
 
@@ -251,27 +266,26 @@ gcc -std=c11 -Iinclude src/yq_test_integration.c src/*.o -o yq_test_integration
 | `yq_test_basic` | varint 编解码、字节切片比较、CRC32C、内存块分配器 |
 | `yq_test_integration` | 版本 / 错误码、开关库、读写删、覆盖写保护、事务回滚、游标遍历、checkpoint、并发读者、批量吞吐、统计信息 |
 
-当前 `yq_test_integration` 的 12 项全部通过。
+当前 `yq_test_integration` 的 23 项全部通过（另有 lifecycle、MVCC、只读、
+WAL、opts、seek 独立测试套件）。
 
 ## 当前范围与限制
 
-本版为 **1.0 首个稳定版**，请在使用前了解以下边界：
+当前版本为 **1.1.0**，请在使用前了解以下边界：
 
-1. **持久化路径。** 当前通过「提交写 WAL → 打开时回放已提交事务到内存表」保证持久性；
-   B+Tree 页落盘与日志截断属于预留能力，尚未启用。因此：
+1. **持久化路径。** 通过「提交写 WAL → 打开时回放已提交事务到内存表」保证持久性，
+   并以 `yq_checkpoint` 将内存表合并进 B+Tree、截断日志。checkpoint 范围之外的
+   B+Tree 页落盘仍属预留能力。因此：
    - 关闭后数据可由 `path.log` 恢复；
-   - 长运行且不做 checkpoint 时，`path.log` 会持续增长；调用 `yq_checkpoint()`
-     会将其重写为仅包含当前活跃数据（一个含全部内存表内容的事务）。
+   - 长运行且不做 checkpoint 时，`path.log` 会持续增长。
 2. **单写者。** 同一时刻仅一个读写事务，跨进程由 `path.lock` 保证；只读事务可并发，
    上限为 `max_readers`。
 3. **数据规模。** 活跃数据集受 `memtable_bytes` / `map_size` 约束，默认 64 MiB / 1 GiB。
 4. **无 SQL。** 仅提供 KV 原语，不含查询语言、二级索引、表结构。
 
-以上均不影响 1.0 的功能正确性，属于后续版本的演进方向。
-
 ## 版本与兼容策略
 
-- **库版本**遵循 `YQ_VERSION_MAJOR.MINOR.PATCH`（当前 `1.0.0`），运行时可经
+- **库版本**遵循 `YQ_VERSION_MAJOR.MINOR.PATCH`（当前 `1.1.0`），运行时可经
   `yq_version` 查询。
 - **磁盘格式版本**为 `format_version = 1`（见 `yq_stat`）。破坏性变更时递增；
   未知的更高格式由 `YQ_ERR_VERSION` 拒绝。

@@ -1,7 +1,7 @@
 # yq-DB
 
 [![Language](https://img.shields.io/badge/language-C11-blue.svg)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](#versioning)
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](#versioning)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#requirements)
 
@@ -61,6 +61,10 @@ correctness-first design.
 | Dual meta pages | Page 0 / page 1 rotate by `txn_id` / `meta_seq` for crash safety |
 | Zero-copy reads | Values returned as borrowed pointers into the mmap |
 | Cursors | Bidirectional, ordered iteration with seek / seek_le / seek_exact |
+| Ordered seek | Binary-descent cursor seek across the B+Tree (P2) |
+| Batch operations | `yq_batch_put` / `yq_batch_del` / `yq_batch_get` fold many ops into one call |
+| Checkpoint / log compaction | `yq_checkpoint` merges the memtable into the B+Tree and truncates the WAL |
+| Per-handle memory pool | Each `yq_db` gets an independent memory pool (self-contained module) |
 | Portability | Windows (Win32) and POSIX backends behind a single VFS interface |
 
 ## Architecture at a Glance
@@ -197,9 +201,21 @@ in the [Usage Guide](docs/USAGE.md).
 |----------|-------------|
 | `yq_cur_open` / `yq_cur_close` | Create / destroy a cursor bound to a txn |
 | `yq_cur_first` / `yq_cur_last` | Position at the first / last record |
-| `yq_cur_seek` / `yq_cur_seek_le` / `yq_cur_seek_exact` | Position by key |
+| `yq_cur_seek` / `yq_cur_seek_le` / `yq_cur_seek_exact` | Position by key (binary descent) |
 | `yq_cur_next` / `yq_cur_prev` | Move one record forward / backward |
 | `yq_cur_valid` / `yq_cur_key` / `yq_cur_val` | Inspect the current record |
+
+**Batch operations**
+
+| Function | Description |
+|----------|-------------|
+| `yq_batch_put` | Run many PUT/DELETE entries in a single call |
+| `yq_batch_del` | Delete a batch of keys in one call |
+| `yq_batch_get` | Read many keys at once (`{NULL,0}` for misses) |
+
+Batches run inside the caller's transaction: all-or-nothing validation before
+any mutation, and the whole batch becomes visible only on commit. Pass `NULL`
+as `result` to skip per-entry statistics.
 
 **Maintenance**
 
@@ -263,20 +279,19 @@ gcc -std=c11 -Iinclude src/yq_test_integration.c src/*.o -o yq_test_integration
 | `yq_test_basic` | varint codec, slice comparison, CRC32C, memory-block allocator |
 | `yq_test_integration` | version / error codes, open·close, put·get·del, overwrite protection, txn rollback, cursor iteration, checkpoint, concurrent readers, batch throughput, statistics |
 
-All 12 integration tests currently pass.
+23 integration test cases currently pass (plus dedicated lifecycle, MVCC,
+read-only, WAL, opts, and seek test suites).
 
 ## Current Scope & Limitations
 
-This is the **first stable 1.0 release**. Please note the following boundaries:
+Current release is **1.1.0**. Please note the following boundaries:
 
-1. **Durability path.** Persistence is currently provided by "commit writes the
-   WAL → open replays committed transactions into the memtable". B+Tree page
-   spilling and log truncation are reserved capabilities that are not yet
-   enabled. As a result:
+1. **Durability path.** Persistence is provided by "commit writes the WAL →
+   open replays committed transactions into the memtable", and
+   `yq_checkpoint` merges the memtable into the B+Tree and truncates the log.
+   B+Tree page spilling beyond checkpoint scope remains a reserved capability:
    - Data is recoverable from `path.log` after a close;
-   - `path.log` grows while the process runs without a checkpoint; calling
-     `yq_checkpoint()` rewrites it down to the live dataset (one committed
-     transaction holding the current memtable contents).
+   - `path.log` grows while the process runs without a checkpoint.
 2. **Single writer.** At most one read-write transaction exists at a time,
    enforced across processes by `path.lock`; read-only transactions run
    concurrently up to `max_readers`.
@@ -285,13 +300,10 @@ This is the **first stable 1.0 release**. Please note the following boundaries:
 4. **No SQL.** Only KV primitives — no query language, secondary indexes, or
    table schemas.
 
-None of these affect the correctness of the 1.0 feature set; they are directions
-for later releases.
-
 ## Versioning & Compatibility
 
 - **Library version** follows `YQ_VERSION_MAJOR.MINOR.PATCH` (currently
-  `1.0.0`) and is queryable at runtime via `yq_version`.
+  `1.1.0`) and is queryable at runtime via `yq_version`.
 - **On-disk format version** is `format_version = 1` (see `yq_stat`). It is
   incremented on breaking changes; an unknown newer format is rejected with
   `YQ_ERR_VERSION`.

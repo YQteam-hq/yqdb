@@ -219,6 +219,33 @@ if (yq_txn_commit(txn) != YQ_OK) {
 
 Group related writes into one transaction — it is both faster and atomic.
 
+### Batch operations
+
+When one transaction writes many keys, fold them into a single call with
+`yq_batch_put` / `yq_batch_del` instead of a loop of `yq_put` / `yq_del`. The
+whole batch runs inside your transaction: it is validated before any mutation
+(all-or-nothing), becomes visible only on commit, and is discarded on rollback.
+
+```c
+yq_batch_entry entries[2];
+yq_slice ka = { "alpha", 5 }, va = { "1", 1 };
+yq_slice kb = { "beta", 4 },  vb = { "2", 1 };
+entries[0].key   = ka;        entries[0].val = va;
+entries[0].op    = 0;         entries[0].flags = YQ_PUT_UPSERT;
+entries[1].key   = kb;        entries[1].val = vb;
+entries[1].op    = 0;         entries[1].flags = YQ_PUT_UPSERT;
+
+yq_txn *txn = NULL;
+yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
+yq_batch_result res;                 /* pass NULL to skip statistics */
+int rc = yq_batch_put(txn, entries, 2, &res);
+/* res.entries_ok + res.entries_failed == res.entries_total on every path */
+yq_txn_commit(txn);
+```
+
+`yq_batch_get` reads many keys in one call; misses come back as `{NULL, 0}` and
+`*found_count` receives the number of hits.
+
 ---
 
 ## 5. Handling borrowed pointers

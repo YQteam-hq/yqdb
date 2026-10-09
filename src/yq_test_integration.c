@@ -718,7 +718,7 @@ static void test_version(void) {
     int rc = yq_version(&major, &minor, &patch);
     CHECK_EQ(rc, YQ_OK);
     CHECK(major == 1);
-    CHECK(minor == 0);
+    CHECK(minor == 1);
     CHECK(patch == 0);
     printf("OK\n");
 }

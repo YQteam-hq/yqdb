@@ -211,6 +211,31 @@ if (yq_txn_commit(txn) != YQ_OK) {
 
 把相关写入合并进一个事务 —— 既更快又具原子性。
 
+### 批量操作
+
+当一个事务要写入大量键时，用 `yq_batch_put` / `yq_batch_del` 折叠为一次调用，
+而不是循环 `yq_put` / `yq_del`。整批运行在调用者的事务内：任何变更前先整体校验
+（全有或全无），仅提交时可见，回滚即全部丢弃。
+
+```c
+yq_batch_entry entries[2];
+yq_slice ka = { "alpha", 5 }, va = { "1", 1 };
+yq_slice kb = { "beta", 4 },  vb = { "2", 1 };
+entries[0].key   = ka;        entries[0].val = va;
+entries[0].op    = 0;         entries[0].flags = YQ_PUT_UPSERT;
+entries[1].key   = kb;        entries[1].val = vb;
+entries[1].op    = 0;         entries[1].flags = YQ_PUT_UPSERT;
+
+yq_txn *txn = NULL;
+yq_txn_begin(db, YQ_TXN_READWRITE, &txn);
+yq_batch_result res;                 /* 传 NULL 可跳过统计 */
+int rc = yq_batch_put(txn, entries, 2, &res);
+/* 任何路径下 res.entries_ok + res.entries_failed == res.entries_total */
+yq_txn_commit(txn);
+```
+
+`yq_batch_get` 一次读取多个键，未命中返回 `{NULL, 0}`，`*found_count` 收到命中数。
+
 ---
 
 ## 5. 处理借用指针

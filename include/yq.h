@@ -27,7 +27,7 @@ extern "C" {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 #define YQ_VERSION_MAJOR 1
-#define YQ_VERSION_MINOR 0
+#define YQ_VERSION_MINOR 1
 #define YQ_VERSION_PATCH 0
 
 /* ═══════════════════════════════════════════════════════════════════════
