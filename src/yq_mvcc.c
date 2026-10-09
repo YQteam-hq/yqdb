@@ -417,16 +417,38 @@ int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     return YQ_OK;
 }
 
+static void sleep_ms(int ms) {
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
+    usleep((useconds_t)ms * 1000);
+#endif
+}
+
+/*
+ * Try to become the single writer.
+ *
+ *   wait_ms == 0  -> never wait: YQ_ERR_BUSY if somebody else holds the lock
+ *   wait_ms >  0  -> retry every 10 ms, YQ_ERR_TIMEOUT once the budget is gone
+ *
+ * The lock must be taken non-blockingly: a blocking flock()/LockFileEx() call
+ * would sit in the kernel for as long as the other writer holds the lock, so
+ * neither YQ_ERR_BUSY nor YQ_ERR_TIMEOUT could ever be reported and callers
+ * would simply hang.
+ */
 int yq_mvcc_elect_writer(yq_mvcc *mvcc, int wait_ms, int *got_it) {
-    int rc;
-    int elapsed = 0;
     const int interval = 10;
 
-    while (true) {
-        rc = yq_file_lock(mvcc->lock_file, 1);
+    for (;;) {
+        int rc = yq_file_lock_nb(mvcc->lock_file, 1);
         if (rc == YQ_OK) {
             *got_it = 1;
             return YQ_OK;
+        }
+        if (rc != YQ_ERR_BUSY) {
+            /* A real I/O failure, not contention. */
+            *got_it = 0;
+            return rc;
         }
 
         if (wait_ms <= 0) {
@@ -434,25 +456,11 @@ int yq_mvcc_elect_writer(yq_mvcc *mvcc, int wait_ms, int *got_it) {
             return YQ_ERR_BUSY;
         }
 
-        if (wait_ms <= interval) {
-            elapsed += wait_ms;
-#if defined(_WIN32)
-            Sleep((DWORD)wait_ms);
-#else
-            usleep((useconds_t)wait_ms * 1000);
-#endif
-            wait_ms = 0;
-        } else {
-            elapsed += interval;
-#if defined(_WIN32)
-            Sleep((DWORD)interval);
-#else
-            usleep((useconds_t)interval * 1000);
-#endif
-            wait_ms -= interval;
-        }
+        int slice = wait_ms < interval ? wait_ms : interval;
+        sleep_ms(slice);
+        wait_ms -= slice;
 
-        if (wait_ms <= 0 && elapsed >= 0) {
+        if (wait_ms <= 0) {
             *got_it = 0;
             return YQ_ERR_TIMEOUT;
         }

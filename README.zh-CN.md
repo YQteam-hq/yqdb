@@ -260,7 +260,8 @@ gcc -std=c11 -Iinclude src/yq_test_integration.c src/*.o -o yq_test_integration
 1. **持久化路径。** 当前通过「提交写 WAL → 打开时回放已提交事务到内存表」保证持久性；
    B+Tree 页落盘与日志截断属于预留能力，尚未启用。因此：
    - 关闭后数据可由 `path.log` 恢复；
-   - 长运行且不做 checkpoint 时，`path.log` 会持续增长。
+   - 长运行且不做 checkpoint 时，`path.log` 会持续增长；调用 `yq_checkpoint()`
+     会将其重写为仅包含当前活跃数据（一个含全部内存表内容的事务）。
 2. **单写者。** 同一时刻仅一个读写事务，跨进程由 `path.lock` 保证；只读事务可并发，
    上限为 `max_readers`。
 3. **数据规模。** 活跃数据集受 `memtable_bytes` / `map_size` 约束，默认 64 MiB / 1 GiB。
