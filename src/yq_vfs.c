@@ -54,12 +54,18 @@ yq_file *yq_file_open(const char *path, int create, int rdwr) {
 
 int yq_file_close(yq_file *f) {
     if (!f) return YQ_OK;
-    CloseHandle(f->handle);
+    if (f->handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(f->handle);
+        f->handle = INVALID_HANDLE_VALUE;
+    }
     free(f);
     return YQ_OK;
 }
 
 int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
+    if (!f || !buf) return YQ_ERR_INVAL;
+    if (len == 0) return YQ_OK;
+    
     const uint8_t *p = (const uint8_t *)buf;
     size_t remaining = len;
     uint64_t off = offset;
@@ -84,6 +90,9 @@ int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
 }
 
 int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
+    if (!f || !buf) return YQ_ERR_INVAL;
+    if (len == 0) return YQ_OK;
+    
     uint8_t *p = (uint8_t *)buf;
     size_t remaining = len;
     uint64_t off = offset;
@@ -108,6 +117,10 @@ int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
 }
 
 int yq_file_sync(yq_file *f) {
+    if (!f) return YQ_ERR_INVAL;
+    if (f->handle == INVALID_HANDLE_VALUE) {
+        return YQ_ERR_INVAL;
+    }
     if (!FlushFileBuffers(f->handle)) {
         return win32_error();
     }
