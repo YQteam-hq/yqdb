@@ -634,11 +634,16 @@ int yq_del(yq_txn *txn, yq_slice key) {
 int yq_get(yq_txn *txn, yq_slice key, yq_slice *out) {
     if (!txn || !out) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
+    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
+    if (!key.data) return YQ_ERR_INVAL;
+    
+    /* Initialize output structure */
     out->data = NULL;
     out->size = 0;
 
     yq_db *db = txn->db;
 
+    /* Check pending operations first */
     pending_op *p = pending_find(txn, key, NULL);
     if (p) {
         if (p->is_del) return YQ_ERR_NOTFOUND;
@@ -647,9 +652,11 @@ int yq_get(yq_txn *txn, yq_slice key, yq_slice *out) {
         return YQ_OK;
     }
 
+    /* Check memtable */
     int rc = yq_memtable_get(db->memtable, key, out);
     if (rc == YQ_OK) return YQ_OK;
 
+    /* Check B+Tree if available */
     if (db->btree) {
         rc = yq_btree_lookup(db->btree, key, out);
         if (rc == YQ_OK) return YQ_OK;
@@ -1055,13 +1062,20 @@ int yq_sync(yq_db *db) {
 int yq_db_stat(yq_db *db, yq_stat *out) {
     if (!db || !out) return YQ_ERR_INVAL;
     if (out->struct_size != sizeof(yq_stat)) return YQ_ERR_INVAL;
+    
+    /* Clear the output structure */
     memset(out, 0, sizeof(yq_stat));
     out->struct_size = sizeof(yq_stat);
     out->format_version = 1;
     out->page_size = db->opts.page_size;
     out->max_readers = db->opts.max_readers;
+    
+    /* Read MVCC metadata */
     uint64_t txn_id = 0, root_page = 0, free_head = 0, npages = 0, ckpt_lsn = 0;
-    yq_mvcc_meta_read(db->mvcc, &txn_id, &root_page, &free_head, &npages, &ckpt_lsn);
+    int rc = yq_mvcc_meta_read(db->mvcc, &txn_id, &root_page, &free_head, &npages, &ckpt_lsn);
+    if (rc != YQ_OK) return rc;
+    
+    /* Fill in statistics */
     out->txn_id = txn_id;
     out->npages = npages;
     out->free_pages = free_head;

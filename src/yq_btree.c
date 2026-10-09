@@ -4,17 +4,20 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Page type constants */
 #define YQ_PAGE_TYPE_LEAF     1
 #define YQ_PAGE_TYPE_INTERNAL 2
 #define YQ_PAGE_TYPE_OVERFLOW 3
 #define YQ_PAGE_TYPE_FREE     4
 
+/* Page layout constants */
 #define YQ_PAGE_HEADER_SIZE   24
 #define YQ_PAGE_CRC_SIZE      4
 #define YQ_PAGE_SLOT_SIZE     2
 #define YQ_VARINT_MAX_SIZE    10
 #define YQ_BTREE_MAX_PATH_DEPTH 64
 
+/* Inline value threshold: values smaller than this are stored inline */
 #define YQ_INLINE_MAX(ps)     ((ps) / 4)
 
 typedef struct {
