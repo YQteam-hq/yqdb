@@ -155,9 +155,15 @@ void *yq_mempool_alloc(yq_mempool *pool, size_t size) {
     struct yq_memchunk *chunk = pool->chunks;
     void *ptr = chunk->memory + chunk->used;
     chunk->used += size;
-    
+
     pool->objects_allocated++;
-    memset(ptr, 0, size);  /* Zero-fill for security */
+    /*
+     * No zero-fill here: chunk memory comes from mmap(MAP_ANONYMOUS) /
+     * VirtualAlloc, both of which hand back zero-initialised pages, so the
+     * memset the original code did on every fresh allocation was dead work.
+     * (Zeroing is still performed for objects pulled from the free list
+     * above, where stale data from a prior owner could otherwise leak.)
+     */
     return ptr;
 }
 
