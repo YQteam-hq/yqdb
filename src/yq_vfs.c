@@ -155,6 +155,9 @@ int yq_file_lock_nb(yq_file *f, int exclusive) {
     if (exclusive) flags |= LOCKFILE_EXCLUSIVE_LOCK;
     OVERLAPPED ov = {0};
     if (!LockFileEx(f->handle, flags, 0, 1, 0, &ov)) {
+        if (GetLastError() == ERROR_LOCK_VIOLATION) {
+            return YQ_ERR_BUSY;
+        }
         return win32_error();
     }
     return YQ_OK;
