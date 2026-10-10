@@ -106,19 +106,44 @@ static int ensure_buf_space(yq_wal *wal, size_t need) {
     return YQ_OK;
 }
 
+/*
+ * Compute the CRC of a record header.
+ *
+ * The two CRC slots (bytes 21..24 header, 25..28 payload) read as zero while
+ * the header CRC itself is computed, so the image handed to yq_crc32c() has
+ * to be built with them cleared rather than pointing straight at the record:
+ * append_record() leaves them untouched and flush fills them in place.
+ *
+ * `lsn` is passed separately because flush assigns it after the record was
+ * buffered, while truncate and scan have already decoded it.
+ */
+static uint32_t wal_header_crc(const uint8_t *rec, uint64_t lsn) {
+    uint8_t img[YQ_WAL_HEADER_SIZE];
+    memcpy(img, rec, YQ_WAL_HEADER_SIZE);
+    memcpy(img + 0, &lsn, 8);
+    memset(img + 21, 0, 4);
+    memset(img + 25, 0, 4);
+    return yq_crc32c(img, YQ_WAL_HEADER_SIZE);
+}
+
 static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
                          const uint8_t *payload, size_t paylen) {
+    /* The payload length is stored in a 4-byte field; the engine caps values
+     * at 1 GiB in yq_put(), so anything larger can only be a caller bug. */
+    if (paylen > 0xFFFFFFFFu) return YQ_ERR_TOOBIG;
+
     size_t total = YQ_WAL_HEADER_SIZE + paylen;
     int rc = ensure_buf_space(wal, total);
     if (rc != YQ_OK) return rc;
 
     uint8_t *p = wal->buf + wal->buf_used;
+    uint32_t paylen32 = (uint32_t)paylen;
 
     uint64_t lsn = 0;
     memcpy(p + 0, &lsn, 8);
     memcpy(p + 8, &txn_id, 8);
     p[16] = (uint8_t)rec_type;
-    memcpy(p + 17, &paylen, 4);
+    memcpy(p + 17, &paylen32, 4);
 
     /* The header/payload CRC fields are NOT computed here. yq_wal_flush()
      * recomputes both CRCs from scratch (it is the only place that stamps
@@ -225,44 +250,51 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
     return append_record(wal, 0, WAL_TYPE_CKPT_END, payload, 8);
 }
 
+/*
+ * Flush the buffered records to the log.
+ *
+ * The buffer is a dense run of records, so it goes out in a single pwrite()
+ * instead of one syscall per record: a transaction appending N records used
+ * to cost N writes, and once they are issued separately the kernel has no
+ * chance to coalesce them. Only the LSN and the header CRC are patched in the
+ * loop -- both depend on the LSN, which is assigned here.
+ */
 int yq_wal_flush(yq_wal *wal) {
     if (!wal || wal->buf_used == 0) return YQ_OK;
 
-    size_t offset = wal->file_size;
     size_t pos = 0;
 
     while (pos < wal->buf_used) {
+        /* The record length is read back out of the buffer, so validate it
+         * against buf_used instead of trusting it to advance the cursor. */
+        if (pos + YQ_WAL_HEADER_SIZE > wal->buf_used) return YQ_ERR_CORRUPT;
+
         uint8_t *rec = wal->buf + pos;
+        uint32_t payload_len;
+        memcpy(&payload_len, rec + 17, 4);
+
+        size_t rec_len = (size_t)YQ_WAL_HEADER_SIZE + payload_len;
+        if (rec_len > wal->buf_used - pos) return YQ_ERR_CORRUPT;
+
         uint64_t lsn = ++wal->last_lsn;
         memcpy(rec + 0, &lsn, 8);
 
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
-        memcpy(header_for_crc + 0, rec + 0, 8);
-        memcpy(header_for_crc + 8, rec + 8, 8);
-        header_for_crc[16] = rec[16];
-        memcpy(header_for_crc + 17, rec + 17, 4);
-        memset(header_for_crc + 21, 0, 4);
-        memset(header_for_crc + 25, 0, 4);
-
-        uint32_t header_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        uint32_t header_crc = wal_header_crc(rec, lsn);
         memcpy(rec + 21, &header_crc, 4);
 
-        uint32_t payload_len;
-        memcpy(&payload_len, rec + 17, 4);
         uint32_t payload_crc = 0;
         if (payload_len > 0) {
             payload_crc = yq_crc32c(rec + YQ_WAL_HEADER_SIZE, payload_len);
         }
         memcpy(rec + 25, &payload_crc, 4);
 
-        int rc = yq_file_pwrite(wal->file, rec, YQ_WAL_HEADER_SIZE + payload_len, offset);
-        if (rc != YQ_OK) return rc;
-
-        offset += YQ_WAL_HEADER_SIZE + payload_len;
-        pos += YQ_WAL_HEADER_SIZE + payload_len;
+        pos += rec_len;
     }
 
-    int rc = yq_file_sync(wal->file);
+    int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, wal->file_size);
+    if (rc != YQ_OK) return rc;
+
+    rc = yq_file_sync(wal->file);
     if (rc != YQ_OK) return rc;
 
     wal->file_size += wal->buf_used;
@@ -290,17 +322,9 @@ int yq_wal_truncate(yq_wal *wal, uint64_t lsn) {
         uint32_t payload_len;
         memcpy(&payload_len, header + 17, 4);
 
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
-        memcpy(header_for_crc + 0, header + 0, 8);
-        memcpy(header_for_crc + 8, header + 8, 8);
-        header_for_crc[16] = header[16];
-        memcpy(header_for_crc + 17, header + 17, 4);
-        memset(header_for_crc + 21, 0, 4);
-        memset(header_for_crc + 25, 0, 4);
-
         uint32_t stored_crc;
         memcpy(&stored_crc, header + 21, 4);
-        uint32_t calc_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        uint32_t calc_crc = wal_header_crc(header, rec_lsn);
 
         if (stored_crc != calc_crc) break;
 
@@ -426,13 +450,11 @@ int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx)
 
     while (pos + YQ_WAL_HEADER_SIZE <= b->file_size) {
         uint8_t header[YQ_WAL_HEADER_SIZE];
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
         uint64_t lsn;
         uint64_t txn_id;
         int rec_type;
         uint32_t payload_len;
         uint32_t stored_crc;
-        uint32_t calc_crc;
         const uint8_t *payload = NULL;
         int g;
 
@@ -447,16 +469,8 @@ int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx)
         rec_type = header[16];
         memcpy(&payload_len, header + 17, 4);
 
-        memcpy(header_for_crc + 0, header + 0, 8);
-        memcpy(header_for_crc + 8, header + 8, 8);
-        header_for_crc[16] = header[16];
-        memcpy(header_for_crc + 17, header + 17, 4);
-        memset(header_for_crc + 21, 0, 4);
-        memset(header_for_crc + 25, 0, 4);
-
         memcpy(&stored_crc, header + 21, 4);
-        calc_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
-        if (stored_crc != calc_crc) break; /* 坏记录：停止，保持截断语义 */
+        if (stored_crc != wal_header_crc(header, lsn)) break; /* 坏记录：停止，保持截断语义 */
 
         if (payload_len > 0) {
             uint32_t stored_payload_crc;
