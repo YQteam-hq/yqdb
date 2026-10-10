@@ -1,0 +1,137 @@
+name: "Bot: AI Auto Fix PR"
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      max_files:
+        description: "本次最多检查的文件数量"
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run AI fixer
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GLM_MODEL: glm-4.5-flash
+          MAX_FILES: ${{ github.event.inputs.max_files || '3' }}
+        run: |
+          python3 - <<'PY'
+          import os, json, subprocess, urllib.request, pathlib, sys
+
+          KEY = (os.environ.get("GLM_API_KEY") or "").strip()
+          MODEL = os.environ.get("GLM_MODEL", "glm-4.5-flash")
+          ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+          MAX_FILES = int(os.environ.get("MAX_FILES", "3") or "3")
+          MAX_BYTES = 16000
+
+          if not KEY:
+              print("GLM_API_KEY not set; nothing to do.")
+              sys.exit(0)
+
+          EXTS = {".py",".js",".jsx",".ts",".tsx",".go",".rs",".java",".rb",".php",".c",".h",
+                  ".cc",".cpp",".hpp",".cs",".kt",".swift",".sh",".css",".scss",".html",".vue",".svelte"}
+          SKIP = {"package-lock.json","yarn.lock","pnpm-lock.yaml","Cargo.lock","go.sum","composer.lock"}
+          SKIP_DIRS = {"node_modules","dist","build","vendor",".git","target","out"}
+
+          files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          cands = []
+          for f in files:
+              p = pathlib.Path(f)
+              if not p.is_file():
+                  continue
+              if p.suffix.lower() not in EXTS:
+                  continue
+              if p.name in SKIP:
+                  continue
+              if f.startswith(".github/"):
+                  continue
+              if any(part in SKIP_DIRS for part in p.parts):
+                  continue
+              try:
+                  if p.stat().st_size > MAX_BYTES:
+                      continue
+                  text = p.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+              cands.append((f, text))
+
+          if not cands:
+              print("No candidate files.")
+              sys.exit(0)
+
+          def call(messages):
+              req = urllib.request.Request(
+                  ENDPOINT,
+                  data=json.dumps({"model": MODEL, "messages": messages,
+                                   "temperature": 0.2, "max_tokens": 4000}).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + KEY},
+              )
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  data = json.loads(r.read().decode())
+              return data["choices"][0]["message"]["content"]
+
+          changed = []
+          for f, text in cands[:MAX_FILES]:
+              prompt = (
+                  "你是严谨的代码修复助手。下面给出一个源文件。"
+                  "请只修复其中明确的错误（Bug、明显的边界/空值问题、安全问题）。"
+                  "如果不需要修改，只回复 NO_CHANGES。"
+                  "如果需要修改，只输出修改后的完整文件内容，不要输出任何解释，也不要使用 Markdown 代码块围栏。\n\n"
+                  f"文件名：{f}\n\n-----BEGIN FILE-----\n{text}\n-----END FILE-----"
+              )
+              try:
+                  out = call([{"role": "user", "content": prompt}]).strip()
+              except Exception as e:
+                  print(f"[skip] {f}: {e}")
+                  continue
+
+              if not out or out == "NO_CHANGES":
+                  print(f"[ok] {f}: no changes")
+                  continue
+
+              if out.startswith("```"):
+                  lines = out.splitlines()
+                  if lines and lines[0].startswith("```"):
+                      lines = lines[1:]
+                  if lines and lines[-1].strip() == "```":
+                      lines = lines[:-1]
+                  out = "\n".join(lines) + "\n"
+
+              if out.strip() == text.strip():
+                  print(f"[ok] {f}: identical")
+                  continue
+
+              pathlib.Path(f).write_text(out, encoding="utf-8")
+              changed.append(f)
+              print(f"[fixed] {f}")
+
+          if not changed:
+              print("No files changed.")
+              sys.exit(0)
+          print("Changed files: " + ", ".join(changed))
+          PY
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: AI 自动修复 (GLM-4.5-Flash)"
+          title: "🤖 AI 自动修复建议"
+          body: |
+            由 **AI Auto Fix** 机器人自动生成。
+
+            该 PR 由模型对仓库源码进行的保守修复，**请人工复核后再合并**。
+          branch: ai-autofix
+          delete-branch: true
