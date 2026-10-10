@@ -1,6 +1,7 @@
 #include "yq_memtable.h"
 #include "yq_memblk.h"
 #include "yq_enc.h"
+#include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,15 +42,27 @@ static int alloc_copy(yq_memtable *mt, const void *data, size_t len, size_t *out
     return YQ_OK;
 }
 
+/*
+ * Binary search for `key` over the sorted entry array.
+ *
+ * Returns 1 with *idx set to the matching entry, or 0 with *idx set to the
+ * position where the key would be inserted.
+ *
+ * The comparison is done on raw key spans rather than by wrapping each entry
+ * key in a yq_slice and calling yq_slice_compare(): this runs once per probe,
+ * so an out-of-line call and two temporary slices per comparison dominate the
+ * search. The arena base is hoisted out of the loop for the same reason.
+ */
 static int search_entry(yq_memtable *mt, const yq_slice *key, size_t *idx) {
+    const uint8_t *base = (const uint8_t *)yq_memblk_base(mt->arena);
+    const mt_entry *entries = mt->entries;
     size_t lo = 0, hi = mt->num_entries;
+
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        const mt_entry *e = &mt->entries[mid];
-        const uint8_t *ek = (const uint8_t *)yq_memblk_base(mt->arena) + e->key_offset;
-        yq_slice ek_slice;
-        yq_slice_set(&ek_slice, ek, e->key_len);
-        int cmp = yq_slice_compare(key, &ek_slice);
+        const mt_entry *e = &entries[mid];
+        int cmp = yq_slice_compare_raw(key->data, key->size,
+                                       base + e->key_offset, e->key_len);
         if (cmp == 0) {
             *idx = mid;
             return 1;
