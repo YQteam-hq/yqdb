@@ -1,5 +1,6 @@
 #include "yq_btree.h"
 #include "yq_enc.h"
+#include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -137,14 +138,7 @@ static int cell_size(const uint8_t *page, uint16_t slot_idx, uint32_t page_size)
 }
 
 static int compare_key(const uint8_t *key1, size_t len1, const uint8_t *key2, size_t len2) {
-    size_t min_len = len1 < len2 ? len1 : len2;
-    if (min_len > 0) {
-        int cmp = memcmp(key1, key2, min_len);
-        if (cmp != 0) return cmp < 0 ? -1 : 1;
-    }
-    if (len1 < len2) return -1;
-    if (len1 > len2) return 1;
-    return 0;
+    return yq_slice_compare_raw(key1, len1, key2, len2);
 }
 
 static int find_slot(const uint8_t *page, const uint8_t *key, size_t key_len, uint16_t nkeys, uint32_t page_size) {
