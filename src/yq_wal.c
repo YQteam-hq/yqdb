@@ -245,20 +245,26 @@ int yq_wal_flush(yq_wal *wal) {
     size_t offset = wal->file_size;
     size_t pos = 0;
 
+    /*
+     * Pass 1: stamp every buffered record in place -- assign its LSN and
+     * recompute the header and payload checksums -- leaving the buffer ready
+     * to be written as one contiguous run.
+     *
+     * The header checksum covers bytes 0..28 with both checksum fields treated
+     * as zero. The previous implementation assembled that image in a 29-byte
+     * scratch buffer with six copies per record; zeroing the two checksum
+     * fields in place is equivalent and keeps the record itself as the only
+     * memory touched.
+     */
     while (pos < wal->buf_used) {
         uint8_t *rec = wal->buf + pos;
         uint64_t lsn = ++wal->last_lsn;
         memcpy(rec + 0, &lsn, 8);
 
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
-        memcpy(header_for_crc + 0, rec + 0, 8);
-        memcpy(header_for_crc + 8, rec + 8, 8);
-        header_for_crc[16] = rec[16];
-        memcpy(header_for_crc + 17, rec + 17, 4);
-        memset(header_for_crc + 21, 0, 4);
-        memset(header_for_crc + 25, 0, 4);
+        /* Zero both checksum fields (header at 21, payload at 25). */
+        memset(rec + 21, 0, 8);
 
-        uint32_t header_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        uint32_t header_crc = yq_crc32c(rec, YQ_WAL_HEADER_SIZE);
         memcpy(rec + 21, &header_crc, 4);
 
         uint32_t payload_len;
@@ -269,14 +275,22 @@ int yq_wal_flush(yq_wal *wal) {
         }
         memcpy(rec + 25, &payload_crc, 4);
 
-        int rc = yq_file_pwrite(wal->file, rec, YQ_WAL_HEADER_SIZE + payload_len, offset);
-        if (rc != YQ_OK) return rc;
-
-        offset += YQ_WAL_HEADER_SIZE + payload_len;
         pos += YQ_WAL_HEADER_SIZE + payload_len;
     }
 
-    int rc = yq_file_sync(wal->file);
+    /*
+     * Pass 2: the records are contiguous in wal->buf, so the entire batch is
+     * one pwrite instead of one syscall per record. A commit that buffered N
+     * operations used to pay N write syscalls; it now pays one.
+     *
+     * A short write is reported as YQ_ERR_IO with the buffer retained, exactly
+     * as before: the next flush rewrites the whole batch starting at the same
+     * file offset, so a partially written run is simply overwritten.
+     */
+    int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, offset);
+    if (rc != YQ_OK) return rc;
+
+    rc = yq_file_sync(wal->file);
     if (rc != YQ_OK) return rc;
 
     wal->file_size += wal->buf_used;
