@@ -735,42 +735,36 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
 int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
 
-    /* Position the tree cursor at the first key >= target (binary descent). */
-    int tree_found = 0;
-    if (c->bt_cur) {
-        int rc = yq_btree_cursor_seek(c->bt_cur, key);
-        if (rc == YQ_OK) tree_found = 1;
-        else if (rc != YQ_ERR_NOTFOUND) return rc;
+    /*
+     * Reuse yq_cur_seek() to perform the full merge-order positioning at the
+     * first key >= target. It sets c->state/c->at_end exactly as the seek path
+     * expects, so the exact-seek only has to confirm the positioned key equals
+     * the target. Building on yq_cur_seek() keeps the two routines in lock-step
+     * -- any future improvement to the seek descent (e.g. a binary search over
+     * the memtable) is picked up here automatically instead of drifting into a
+     * second, divergent copy.
+     */
+    int rc = yq_cur_seek(c, key);
+    if (rc != YQ_OK) {
+        /* yq_cur_seek() already left the cursor in its not-found state. */
+        return YQ_ERR_NOTFOUND;
     }
 
-    /* Position the memtable iterator at the first key >= target. */
-    int mt_found = 0;
-    if (c->mt_iter) {
-        int rc = yq_memtable_iter_first(c->mt_iter);
-        while (rc == YQ_OK) {
-            yq_slice k;
-            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
-            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
-            rc = yq_memtable_iter_next(c->mt_iter);
+    yq_slice k;
+    if (c->state == 1) {
+        if (yq_memtable_iter_key(c->mt_iter, &k) == YQ_OK &&
+            yq_slice_compare(&k, &key) == 0) {
+            return YQ_OK;
+        }
+    } else if (c->state == 2) {
+        if (yq_btree_cursor_key(c->bt_cur, &k) == YQ_OK &&
+            yq_slice_compare(&k, &key) == 0) {
+            return YQ_OK;
         }
     }
 
-    /* Success requires an exact match on the iterator chosen by merge order
-     * (memtable first, then tree); anything else is a miss. */
-    if (mt_found) {
-        yq_slice k;
-        if (yq_memtable_iter_key(c->mt_iter, &k) == YQ_OK && yq_slice_compare(&k, &key) == 0) {
-            c->state = 1; c->at_end = 0; return YQ_OK;
-        }
-        c->state = 0; c->at_end = 1; return YQ_ERR_NOTFOUND;
-    }
-    if (tree_found) {
-        yq_slice k;
-        if (yq_btree_cursor_key(c->bt_cur, &k) == YQ_OK && yq_slice_compare(&k, &key) == 0) {
-            c->state = 2; c->at_end = 0; return YQ_OK;
-        }
-    }
-    c->state = 0; c->at_end = 1;
+    c->state = 0;
+    c->at_end = 1;
     return YQ_ERR_NOTFOUND;
 }
 
