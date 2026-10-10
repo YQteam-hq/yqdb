@@ -132,6 +132,12 @@ static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
      * at 1 GiB in yq_put(), so anything larger can only be a caller bug. */
     if (paylen > 0xFFFFFFFFu) return YQ_ERR_TOOBIG;
 
+    /* Independent guard on the size_t sum below: on a 32-bit platform SIZE_MAX
+     * is only 4 GiB, so a large payload could wrap `total` and let
+     * ensure_buf_space() reserve too little. The 4-byte length field already
+     * bounds paylen, but keep the check explicit for clarity and 32-bit safety. */
+    if (paylen > SIZE_MAX - YQ_WAL_HEADER_SIZE) return YQ_ERR_TOOBIG;
+
     size_t total = YQ_WAL_HEADER_SIZE + paylen;
     int rc = ensure_buf_space(wal, total);
     if (rc != YQ_OK) return rc;
@@ -262,19 +268,33 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
 int yq_wal_flush(yq_wal *wal) {
     if (!wal || wal->buf_used == 0) return YQ_OK;
 
-    size_t pos = 0;
+    /*
+     * Flush the buffered records to the log.
+     *
+     * The buffer is a dense run of records, so it goes out in a single pwrite()
+     * instead of one syscall per record: a transaction appending N records used
+     * to cost N write syscalls plus N offset advances, and once issued
+     * separately the kernel could not coalesce them.
+     *
+     * Trade-off: a single write is more atomic but also more all-or-nothing. If
+     * pwrite() returns short or a crash lands mid-buffer, there is no per-record
+     * progress to recover -- the whole buffer is treated as unwritten and the
+     * WAL replays from the last synced point. That is consistent with redo
+     * semantics, since a partial record would fail its CRC and stop replay anyway.
+     */
+    size_t buf_pos = 0;
 
-    while (pos < wal->buf_used) {
+    while (buf_pos < wal->buf_used) {
         /* The record length is read back out of the buffer, so validate it
          * against buf_used instead of trusting it to advance the cursor. */
-        if (pos + YQ_WAL_HEADER_SIZE > wal->buf_used) return YQ_ERR_CORRUPT;
+        if (buf_pos + YQ_WAL_HEADER_SIZE > wal->buf_used) return YQ_ERR_CORRUPT;
 
-        uint8_t *rec = wal->buf + pos;
+        uint8_t *rec = wal->buf + buf_pos;
         uint32_t payload_len;
         memcpy(&payload_len, rec + 17, 4);
 
         size_t rec_len = (size_t)YQ_WAL_HEADER_SIZE + payload_len;
-        if (rec_len > wal->buf_used - pos) return YQ_ERR_CORRUPT;
+        if (rec_len > wal->buf_used - buf_pos) return YQ_ERR_CORRUPT;
 
         uint64_t lsn = ++wal->last_lsn;
         memcpy(rec + 0, &lsn, 8);
@@ -288,7 +308,7 @@ int yq_wal_flush(yq_wal *wal) {
         }
         memcpy(rec + 25, &payload_crc, 4);
 
-        pos += rec_len;
+        buf_pos += rec_len;
     }
 
     int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, wal->file_size);
