@@ -1,5 +1,12 @@
 name: "Bot: AI PR Review"
 
+# Reviews a pull request with GLM-4.5-Flash and posts the review as a comment.
+# The model writes its review in Simplified Chinese, while every literal in this
+# file stays English so the repository language policy is satisfied.
+#
+# Requirement: set a repository (or organization) secret named GLM_API_KEY.
+# Without the secret the job logs a warning and exits successfully.
+
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -14,6 +21,7 @@ concurrency:
 
 jobs:
   review:
+    name: review
     if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
@@ -45,7 +53,7 @@ jobs:
               if (!f.patch) continue;
               if (skipRe.test(f.filename)) continue;
               const chunk = `### ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\`\n`;
-              if (chunk.length > budget) { diffText += "\n_(部分文件因体积过大被跳过)_\n"; break; }
+              if (chunk.length > budget) { diffText += "\n_(some files skipped: too large)_\n"; break; }
               diffText += chunk;
               budget -= chunk.length;
             }
@@ -53,18 +61,22 @@ jobs:
             if (!diffText.trim()) {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: pr.number,
-                body: "## 🤖 AI 代码评审\n\n本次改动没有可评审的文本差异，已跳过。",
+                body: "## AI code review\n\nThis pull request has no reviewable text changes. Skipped.",
               });
               return;
             }
 
             const system = [
-              "你是资深代码评审专家。请用简体中文评审这个 Pull Request。",
-              "重点：1) 正确性与潜在 Bug；2) 边界与错误处理；3) 安全与性能；4) 可读性与可维护性。",
-              "请给出具体、可执行的改进建议，并引用文件名与关键代码。若发现严重问题请标注【严重】。",
-              "最后给出总体结论（可以合并 / 建议修改后再合并）。使用 Markdown，条理清晰，不要复述完整 diff。",
+              "You are a senior code reviewer.",
+              "Review this Pull Request and write the final review in Simplified Chinese.",
+              "Focus on: 1) correctness and potential bugs; 2) edge cases and error handling;",
+              "3) security and performance; 4) readability and maintainability.",
+              "Give concrete, actionable suggestions and reference file names and key code.",
+              "Mark severe problems with the tag [Severe].",
+              "End with an overall verdict: safe to merge, or fix before merging.",
+              "Use Markdown and do not repeat the full diff.",
             ].join("\n");
-            const user = `仓库：${owner}/${repo}\nPR 标题：${pr.title}\nPR 描述：${(pr.body || "").slice(0, 2000)}\n\n变更如下：\n\n${diffText}`;
+            const user = `Repo: ${owner}/${repo}\nPR title: ${pr.title}\nPR body: ${(pr.body || "").slice(0, 2000)}\n\nChanges:\n\n${diffText}`;
 
             async function callGLM() {
               const res = await fetch(process.env.GLM_ENDPOINT, {
@@ -100,5 +112,5 @@ jobs:
               return;
             }
 
-            const body = `## 🤖 AI 代码评审（GLM-4.5-Flash）\n\n${review}\n\n---\n<sub>由 AI PR Review 机器人自动生成，仅供参考。</sub>`;
+            const body = `## AI code review (GLM-4.5-Flash)\n\n${review}\n\n---\n<sub>Generated automatically by the AI PR Review bot. For reference only.</sub>`;
             await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
