@@ -269,6 +269,17 @@ int yq_wal_flush(yq_wal *wal) {
 
         uint32_t payload_len;
         memcpy(&payload_len, rec + 17, 4);
+
+        /*
+         * The record length is written by append_record() from this same
+         * buffer, so a payload that runs past buf_used means the buffer was
+         * corrupted rather than that a caller passed something odd. Refuse it
+         * instead of checksumming past the end of the buffer.
+         */
+        if (payload_len > wal->buf_used - pos - YQ_WAL_HEADER_SIZE) {
+            return YQ_ERR_CORRUPT;
+        }
+
         uint32_t payload_crc = 0;
         if (payload_len > 0) {
             payload_crc = yq_crc32c(rec + YQ_WAL_HEADER_SIZE, payload_len);
