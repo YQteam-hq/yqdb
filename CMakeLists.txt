@@ -66,10 +66,14 @@ add_executable(yq_test_mvcc src/yq_test_mvcc.c)
 target_link_libraries(yq_test_mvcc yqdb)
 add_test(NAME mvcc_test COMMAND yq_test_mvcc)
 
+add_executable(yq_test_memtable_cursor src/yq_test_memtable_cursor.c)
+target_link_libraries(yq_test_memtable_cursor yqdb)
+add_test(NAME memtable_cursor_test COMMAND yq_test_memtable_cursor)
+
 # The test binaries report failures through assert(). Release-like build types
 # define NDEBUG, which compiles every assertion away and lets the suite "pass"
 # without verifying anything, so keep assertions enabled for test targets.
-foreach(yq_test_target yq_test_basic yq_test_integration yq_test_seek yq_test_mvcc)
+foreach(yq_test_target yq_test_basic yq_test_integration yq_test_seek yq_test_mvcc yq_test_memtable_cursor)
     if(MSVC)
         target_compile_options(${yq_test_target} PRIVATE /UNDEBUG)
     else()
