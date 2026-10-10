@@ -24,6 +24,13 @@ int yq_memtable_iter_prev(yq_memtable_iter *it);
 int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out);
 int yq_memtable_iter_val(yq_memtable_iter *it, yq_slice *out);
 int yq_memtable_iter_valid(yq_memtable_iter *it);
+/*
+ * Position the iterator at the first live entry with key >= `key` (lower
+ * bound). Binary search over the sorted entries, so it is O(log n) rather
+ * than the O(n) walk the callers used to do. Returns YQ_OK when a live entry
+ * was found, YQ_ERR_NOTFOUND otherwise; the iterator is positioned either way.
+ */
+int yq_memtable_iter_seek(yq_memtable_iter *it, yq_slice key);
 void yq_memtable_reset(yq_memtable *mt);
 
 #endif
