@@ -243,24 +243,74 @@ int yq_file_close(yq_file *f) {
     return YQ_OK;
 }
 
+/*
+ * POSIX allows a single pread()/pwrite() to transfer fewer bytes than asked
+ * for. That is not an error: the kernel may return a short count when the
+ * request crosses a signal boundary, for very large requests, or when the
+ * file is a special device. Both calls may also fail with EINTR before
+ * transferring anything.
+ *
+ * The previous implementation treated any short transfer as a hard I/O error.
+ * Because yq_file_pwrite() carries WAL records and meta pages, a spurious
+ * EINTR or a partial write surfaced as a failed commit even though the file
+ * itself is perfectly healthy. Both entry points now loop until the whole
+ * request has been transferred, retrying on EINTR -- the same contract the
+ * Win32 branch already implements.
+ */
 int yq_file_pwrite(yq_file *f, const void *buf, size_t len, uint64_t offset) {
-    ssize_t ret = pwrite(f->fd, buf, len, (off_t)offset);
-    if (ret < 0 || (size_t)ret != len) {
-        return YQ_ERR_IO;
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t remaining = len;
+    uint64_t off = offset;
+
+    while (remaining > 0) {
+        ssize_t ret = pwrite(f->fd, p, remaining, (off_t)off);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return YQ_ERR_IO;
+        }
+        if (ret == 0) {
+            /* No progress and no error: the write cannot complete. */
+            return YQ_ERR_IO;
+        }
+        p += (size_t)ret;
+        off += (uint64_t)ret;
+        remaining -= (size_t)ret;
     }
     return YQ_OK;
 }
 
 int yq_file_pread(yq_file *f, void *buf, size_t len, uint64_t offset) {
-    ssize_t ret = pread(f->fd, buf, len, (off_t)offset);
-    if (ret < 0 || (size_t)ret != len) {
-        return YQ_ERR_IO;
+    uint8_t *p = (uint8_t *)buf;
+    size_t remaining = len;
+    uint64_t off = offset;
+
+    while (remaining > 0) {
+        ssize_t ret = pread(f->fd, p, remaining, (off_t)off);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return YQ_ERR_IO;
+        }
+        if (ret == 0) {
+            /*
+             * EOF before the requested length. A partial read is still an
+             * error at this layer -- callers ask for exactly the record or
+             * page they expect -- so fail rather than hand back a buffer with
+             * uninitialised tail bytes.
+             */
+            return YQ_ERR_IO;
+        }
+        p += (size_t)ret;
+        off += (uint64_t)ret;
+        remaining -= (size_t)ret;
     }
     return YQ_OK;
 }
 
 int yq_file_sync(yq_file *f) {
-    if (fdatasync(f->fd) < 0) {
+    /* fdatasync() may also return EINTR when a signal arrives while the
+     * kernel is flushing; retry instead of reporting a durability failure. */
+    while (fdatasync(f->fd) < 0) {
+        if (errno == EINTR) continue;
         return YQ_ERR_IO;
     }
     return YQ_OK;
