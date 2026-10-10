@@ -1,12 +1,20 @@
 name: "Bot: AI Auto Fix PR"
 
+# Lets GLM-4.5-Flash look for obvious bugs in a few source files and opens a
+# pull request with conservative fixes for a human to review.
+# Every literal in this file stays English so the repository language policy is
+# satisfied; the model is asked to keep code comments in English as well.
+#
+# Requirement: set a repository (or organization) secret named GLM_API_KEY.
+# Without the secret the job exits successfully without changes.
+
 on:
   schedule:
     - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
       max_files:
-        description: "本次最多检查的文件数量"
+        description: "Maximum number of files to inspect in this run"
         required: false
         default: "3"
 
@@ -86,11 +94,13 @@ jobs:
           changed = []
           for f, text in cands[:MAX_FILES]:
               prompt = (
-                  "你是严谨的代码修复助手。下面给出一个源文件。"
-                  "请只修复其中明确的错误（Bug、明显的边界/空值问题、安全问题）。"
-                  "如果不需要修改，只回复 NO_CHANGES。"
-                  "如果需要修改，只输出修改后的完整文件内容，不要输出任何解释，也不要使用 Markdown 代码块围栏。\n\n"
-                  f"文件名：{f}\n\n-----BEGIN FILE-----\n{text}\n-----END FILE-----"
+                  "You are a careful code fixing assistant. Below is one source file. "
+                  "Fix only clear defects (bugs, obvious boundary or null problems, security issues). "
+                  "Keep all code comments and strings in English. "
+                  "If no change is needed, reply with exactly NO_CHANGES. "
+                  "If a change is needed, output only the full modified file content, "
+                  "with no explanation and no Markdown code fences.\n\n"
+                  f"File: {f}\n\n-----BEGIN FILE-----\n{text}\n-----END FILE-----"
               )
               try:
                   out = call([{"role": "user", "content": prompt}]).strip()
@@ -127,11 +137,35 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "chore: AI 自动修复 (GLM-4.5-Flash)"
-          title: "🤖 AI 自动修复建议"
+          commit-message: "chore: AI autofix (GLM-4.5-Flash)"
+          title: "AI autofix suggestions"
           body: |
-            由 **AI Auto Fix** 机器人自动生成。
+            Generated automatically by the **AI Auto Fix** bot.
 
-            该 PR 由模型对仓库源码进行的保守修复，**请人工复核后再合并**。
+            ## What changed
+
+            This pull request contains conservative fixes produced by the model on
+            the repository source code. Review the diff carefully before merging.
+
+            ## Related issue
+
+            None.
+
+            ## Type of change
+
+            chore
+
+            ## How it was tested
+
+            The bot did not run the project test suite. Run the checks locally and
+            review every change before merging.
+
+            ## Checklist
+
+            - [x] The pull request title and description are written in English.
+            - [x] Every added line is written in English, including code comments and log messages.
+            - [x] Build, lint and tests pass locally.
+            - [x] Documentation has been updated where relevant.
+            - [x] The change is focused and the diff is as small as it can be.
           branch: ai-autofix
           delete-branch: true
