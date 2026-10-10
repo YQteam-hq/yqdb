@@ -323,6 +323,10 @@ int yq_wal_truncate(yq_wal *wal, uint64_t lsn) {
     wal->file_size = target_pos;
     wal->last_lsn = target_lsn;
 
+    /* Truncate must follow yq_wal_flush(): clear any unflushed buffered
+     * records so a later flush cannot re-append them past the new end. */
+    wal->buf_used = 0;
+
     return YQ_OK;
 }
 
