@@ -1110,27 +1110,67 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
         yq_batch_result_init(result, 0, YQ_ERR_INVAL);
         return YQ_ERR_INVAL;
     }
-    /* count * sizeof(*entries) 为 size_t 运算，先挡回绕再分配 */
-    if (count > SIZE_MAX / sizeof(yq_batch_entry)) {
-        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
-        return YQ_ERR_NOMEM;
+    if (txn->state != YQ_TXN_STATE_ACTIVE) {
+        yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
+        return YQ_ERR_TXN_CLOSED;
+    }
+    /* A read-only transaction cannot delete: yq_del() would reject it per-key,
+     * but the contract is to reject the whole batch up front, before any
+     * mutation reaches the database. */
+    if (txn->flags & YQ_TXN_READONLY) {
+        yq_batch_result_init(result, 0, YQ_ERR_READONLY);
+        return YQ_ERR_READONLY;
+    }
+    /* count 超过 uint32 时统计字段无法表达，提前拒绝而不是静默截断 */
+    if (count > 0xFFFFFFFFu) {
+        yq_batch_result_init(result, 0, YQ_ERR_TOOBIG);
+        return YQ_ERR_TOOBIG;
     }
 
-    yq_batch_entry *entries = malloc(count * sizeof(*entries));
-    if (!entries) {
-        yq_batch_result_init(result, 0, YQ_ERR_NOMEM);
-        return YQ_ERR_NOMEM;
-    }
+    uint32_t total = (uint32_t)count;
+    yq_batch_result_init(result, total, YQ_OK);
+
+    /*
+     * 第一遍：先校验全部 key，避免半批写入。原实现为此把 keys 复制到一份
+     * yq_batch_entry[] 堆数组再交给 yq_batch_put；但对 DELETE 来说每条 entry
+     *只携带一个 key，那份 40 字节/条的临时数组纯属浪费。这里直接校验 key
+     *本身，省掉一次 O(count) 的堆分配与整段拷贝。
+     */
+    int bad = 0;
     for (size_t i = 0; i < count; i++) {
-        entries[i].key = keys[i];
-        entries[i].val = (yq_slice){NULL, 0};
-        entries[i].op = 1; /* DELETE */
-        entries[i].flags = 0;
+        const yq_slice *k = &keys[i];
+        if (k->data == NULL || k->size == 0 || k->size > 1024) bad = 1;
     }
 
-    int rc = yq_batch_put(txn, entries, count, result);
-    free(entries);
-    return rc;
+    if (bad) {
+        /* 整批拒绝（未做任何变更）：全部计入 failed，保持 total == ok + failed */
+        if (result) {
+            result->first_error = YQ_ERR_INVAL;
+            result->entries_ok = 0;
+            result->entries_failed = total;
+        }
+        return YQ_ERR_INVAL;
+    }
+
+    /* 第二遍：执行。逐条记录结果，不做提前返回，保证计数完整。 */
+    int first_error = YQ_OK;
+    uint32_t ok = 0, failed = 0;
+    for (size_t i = 0; i < count; i++) {
+        int rc = yq_del(txn, keys[i]);
+        if (rc == YQ_OK) {
+            ok++;
+        } else {
+            failed++;
+            if (first_error == YQ_OK) first_error = rc;
+        }
+    }
+
+    if (result) {
+        result->entries_ok = ok;
+        result->entries_failed = failed;
+        result->first_error = first_error;
+    }
+    return first_error;
 }
 
 int yq_batch_get(yq_txn *txn, const yq_slice *keys, size_t count,
