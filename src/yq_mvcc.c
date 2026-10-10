@@ -96,6 +96,106 @@ struct yq_mvcc {
     uint8_t *io_buf;     /* staging area for reads and for stamping the CRC */
 };
 
+/*
+ * In-process writer registry (Win32 only).
+ *
+ * Win32 byte-range locks are per handle, and two handles opened by the SAME
+ * process do not conflict: yq_file_lock_nb() -> LockFileEx() succeeds even
+ * when another yq_db handle in this process already "owns" the writer slot.
+ * Two in-process writers would then race on the shared shm seq counters and
+ * the meta pages, breaking the single-writer invariant the whole MVCC
+ * protocol is built on. POSIX has no such hole: flock() locks attach to the
+ * open file description, so two descriptors of the same file really do
+ * conflict, and the plain file-lock path below is correct there.
+ *
+ * The registry provides the process-local exclusion the file lock provides
+ * across processes. Entries are keyed by the identity of the lock file (see
+ * yq_file_same_target()) rather than by path, and are guarded by a spinlock,
+ * so the registry needs no lazy initialisation or CRT constructor.
+ */
+#if defined(_WIN32)
+
+typedef struct yq_writer_owner {
+    struct yq_writer_owner *next;
+    yq_file *lock_file;     /* borrowed; identifies the lock file */
+    const struct yq_mvcc *owner; /* the mvcc holding the writer slot */
+} yq_writer_owner;
+
+static yq_writer_owner *g_writer_owners = NULL;
+static volatile LONG g_writer_reg_spin = 0;
+
+static void writer_reg_lock(void) {
+    while (InterlockedCompareExchange(&g_writer_reg_spin, 1, 0) != 0) {
+        SwitchToThread();
+    }
+}
+
+static void writer_reg_unlock(void) {
+    InterlockedExchange(&g_writer_reg_spin, 0);
+}
+
+/* Is the writer slot for mvcc's lock file held by another mvcc? */
+static int writer_held_by_other(const yq_mvcc *mvcc) {
+    int held = 0;
+    writer_reg_lock();
+    for (const yq_writer_owner *e = g_writer_owners; e; e = e->next) {
+        if (e->owner != mvcc && yq_file_same_target(e->lock_file, mvcc->lock_file) == 1) {
+            held = 1;
+            break;
+        }
+    }
+    writer_reg_unlock();
+    return held;
+}
+
+/*
+ * Claim the writer slot for mvcc. Returns YQ_OK, or YQ_ERR_BUSY when another
+ * mvcc in this process holds it (a race lost against a same-process peer),
+ * or YQ_ERR_NOMEM if the entry could not be allocated.
+ */
+static int writer_register(yq_mvcc *mvcc) {
+    int rc = YQ_ERR_BUSY;
+    writer_reg_lock();
+    for (const yq_writer_owner *e = g_writer_owners; e; e = e->next) {
+        if (yq_file_same_target(e->lock_file, mvcc->lock_file) == 1) {
+            if (e->owner == mvcc) rc = YQ_OK; /* already ours */
+            break;
+        }
+    }
+    if (rc != YQ_OK) {
+        yq_writer_owner *e = (yq_writer_owner *)malloc(sizeof(*e));
+        if (e) {
+            e->lock_file = mvcc->lock_file;
+            e->owner = mvcc;
+            e->next = g_writer_owners;
+            g_writer_owners = e;
+            rc = YQ_OK;
+        } else {
+            rc = YQ_ERR_NOMEM;
+        }
+    }
+    writer_reg_unlock();
+    return rc;
+}
+
+/* Drop every registry entry owned by mvcc (used on release and close). */
+static void writer_unregister(yq_mvcc *mvcc) {
+    writer_reg_lock();
+    yq_writer_owner **link = &g_writer_owners;
+    while (*link) {
+        if ((*link)->owner == mvcc) {
+            yq_writer_owner *dead = *link;
+            *link = dead->next;
+            free(dead);
+        } else {
+            link = &(*link)->next;
+        }
+    }
+    writer_reg_unlock();
+}
+
+#endif /* _WIN32 */
+
 int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lock_file,
                  uint32_t max_readers, uint32_t page_size) {
     yq_mvcc *mvcc = calloc(1, sizeof(yq_mvcc));
@@ -163,7 +263,13 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
 
 int yq_mvcc_close(yq_mvcc *mvcc) {
     if (!mvcc) return YQ_OK;
+#if defined(_WIN32)
+    /* Drop any writer-slot entry left behind by an unbalanced release, so a
+     * later handle in this process is not blocked forever by a dead mvcc. */
+    writer_unregister(mvcc);
+#endif
     if (mvcc->shm_base) yq_file_munmap(mvcc->shm_base, mvcc->shm_size);
+
     free(mvcc->meta_buf);
     free(mvcc->io_buf);
     free(mvcc);
@@ -459,11 +565,45 @@ static void sleep_ms(int ms) {
  * neither YQ_ERR_BUSY nor YQ_ERR_TIMEOUT could ever be reported and callers
  * would simply hang.
  */
+#if defined(_WIN32)
+/*
+ * One non-blocking election attempt: in-process registry first, then the
+ * cross-process file lock. The registry check must come first: it is the
+ * only thing that makes two yq_db handles opened by the same process
+ * mutually exclusive (Win32 locks do not conflict within one process).
+ */
+static int try_elect_writer(yq_mvcc *mvcc) {
+    if (writer_held_by_other(mvcc)) {
+        return YQ_ERR_BUSY;
+    }
+    int rc = yq_file_lock_nb(mvcc->lock_file, 1);
+    if (rc != YQ_OK) return rc;
+
+    rc = writer_register(mvcc);
+    if (rc != YQ_OK) {
+        /*
+         * A same-process peer won the file lock between the registry check
+         * and our LockFileEx() (same-process handles do not conflict).
+         * Release the file lock again and report contention so the caller's
+         * wait budget decides between BUSY and TIMEOUT.
+         */
+        yq_file_unlock(mvcc->lock_file);
+        return (rc == YQ_ERR_NOMEM) ? YQ_ERR_NOMEM : YQ_ERR_BUSY;
+    }
+    return YQ_OK;
+}
+#else
+static int try_elect_writer(yq_mvcc *mvcc) {
+    /* flock() already conflicts between two descriptors of the same file. */
+    return yq_file_lock_nb(mvcc->lock_file, 1);
+}
+#endif
+
 int yq_mvcc_elect_writer(yq_mvcc *mvcc, int wait_ms, int *got_it) {
     const int interval = 10;
 
     for (;;) {
-        int rc = yq_file_lock_nb(mvcc->lock_file, 1);
+        int rc = try_elect_writer(mvcc);
         if (rc == YQ_OK) {
             *got_it = 1;
             return YQ_OK;
@@ -491,8 +631,15 @@ int yq_mvcc_elect_writer(yq_mvcc *mvcc, int wait_ms, int *got_it) {
 }
 
 int yq_mvcc_release_writer(yq_mvcc *mvcc) {
+#if defined(_WIN32)
+    /* Drop the in-process entry first: from then on the slot is visibly
+     * free, and the file lock is still held, so a peer that slips in only
+     * gets BUSY and retries after the unlock below. */
+    writer_unregister(mvcc);
+#endif
     return yq_file_unlock(mvcc->lock_file);
 }
+
 
 int yq_mvcc_seqlock_read(yq_mvcc *mvcc, void *dst, size_t off, size_t len) {
     uint8_t *base = (uint8_t *)mvcc->shm_base;
