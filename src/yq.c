@@ -712,16 +712,14 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
         else if (rc != YQ_ERR_NOTFOUND) return rc;
     }
 
-    /* Position the memtable iterator at the first key >= target. */
+    /* Position the memtable iterator at the first key >= target. The
+     * memtable is a sorted array, so this is a binary search rather than a
+     * walk from the first entry -- the walk made every seek O(n) in the
+     * number of live entries. */
     int mt_found = 0;
     if (c->mt_iter) {
-        int rc = yq_memtable_iter_first(c->mt_iter);
-        while (rc == YQ_OK) {
-            yq_slice k;
-            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
-            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
-            rc = yq_memtable_iter_next(c->mt_iter);
-        }
+        int rc = yq_memtable_iter_seek(c->mt_iter, key);
+        if (rc == YQ_OK) mt_found = 1;
     }
 
     /* Merge order visits the memtable first, then the tree; pick the first
@@ -743,16 +741,12 @@ int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
         else if (rc != YQ_ERR_NOTFOUND) return rc;
     }
 
-    /* Position the memtable iterator at the first key >= target. */
+    /* Position the memtable iterator at the first key >= target (binary
+     * search, see yq_cur_seek()). */
     int mt_found = 0;
     if (c->mt_iter) {
-        int rc = yq_memtable_iter_first(c->mt_iter);
-        while (rc == YQ_OK) {
-            yq_slice k;
-            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
-            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
-            rc = yq_memtable_iter_next(c->mt_iter);
-        }
+        int rc = yq_memtable_iter_seek(c->mt_iter, key);
+        if (rc == YQ_OK) mt_found = 1;
     }
 
     /* Success requires an exact match on the iterator chosen by merge order
