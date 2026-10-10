@@ -226,6 +226,9 @@ yq_file *yq_file_open(const char *path, int create, int rdwr) {
 
     int flags = rdwr ? (O_RDWR) : (O_RDONLY);
     if (create) flags |= O_CREAT;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
     int mode = 0644;
 
     f->fd = open(path, flags, mode);
