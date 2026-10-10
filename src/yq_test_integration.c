@@ -1620,6 +1620,60 @@ static void test_pending_index_semantics(void) {
     remove_db();
     printf("OK\n");
 }
+/*
+ * YQ_SYNC_OFF (and its flag twin YQ_OPEN_NOSYNC) must round-trip like any
+ * other mode: the log is handed to the OS without an fsync per commit
+ * (documented as "a crash may lose the most recent commits"), which does
+ * not stop the data being readable after a clean close/reopen. Before the
+ * sync_mode split in yq_wal_flush() the mode was accepted - and
+ * YQ_OPEN_NOSYNC even forced sync_mode = YQ_SYNC_OFF in yq_open() - but the
+ * commit path ignored it and fdatasynced anyway, so a NOSYNC handle paid
+ * FULL durability prices while still being told it was in OFF mode.
+ */
+static void test_sync_mode_off(void) {
+    printf("test_sync_mode_off... ");
+    remove_db();
+
+    for (int use_flag = 0; use_flag < 2; use_flag++) {
+        yq_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.struct_size = sizeof(opts);
+        opts.flags = YQ_OPEN_CREATE;
+        if (use_flag) {
+            opts.flags |= YQ_OPEN_NOSYNC;   /* documented: equivalent to YQ_SYNC_OFF */
+        } else {
+            opts.sync_mode = YQ_SYNC_OFF;
+        }
+
+        yq_db *db = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+        yq_txn *txn = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+        yq_slice k1 = {"off-key", 7}, v1 = {"off-val", 7};
+        CHECK_EQ(yq_put(txn, k1, v1, 0), YQ_OK);
+        CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+        CHECK_EQ(yq_close(db), YQ_OK);
+
+        /* A fresh read-write open replays the log and must see the key. */
+        yq_opts ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.struct_size = sizeof(ro);
+        ro.flags = 0;
+        db = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &ro, &db), YQ_OK);
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &txn), YQ_OK);
+        yq_slice out = {0};
+        CHECK_EQ(yq_get(txn, k1, &out), YQ_OK);
+        CHECK(out.size == 7 && memcmp(out.data, "off-val", 7) == 0);
+        CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+        CHECK_EQ(yq_close(db), YQ_OK);
+        remove_db();
+    }
+    printf("OK\n");
+}
+
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -1651,6 +1705,7 @@ int main(void) {
     test_checkpoint_large_value();
     test_key_value_limits();
     test_nosync();
+    test_sync_mode_off();
     test_pending_index_semantics();
     test_batch_readonly_rejected();
     test_mempool_size_classes();

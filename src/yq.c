@@ -628,7 +628,27 @@ int yq_txn_commit(yq_txn *txn) {
             free(txn);
             return rc;
         }
-        if (db->opts.sync_mode == YQ_SYNC_FULL && db->db_file) yq_file_sync(db->db_file);
+        /*
+         * Durability policy (yq.h, opts.sync_mode): YQ_SYNC_OFF hands the
+         * log to the OS without waiting for the device - documented as
+         * "a crash may lose the most recent commits" - while NORMAL and
+         * FULL fdatasync before returning. A true group commit would let
+         * concurrent NORMAL committers share one fdatasync; the contract
+         * presents that as an optimisation, not a promise, so the eager
+         * sync keeps the default behaviour unchanged. The old code always
+         * fdatasynced here, so YQ_SYNC_OFF could not switch fsync off.
+         */
+        if (db->opts.sync_mode != YQ_SYNC_OFF) {
+            rc = yq_wal_sync(db->wal);
+            if (rc != YQ_OK) {
+                txn->state = YQ_TXN_STATE_ABORTED;
+                pending_free(txn);
+                yq_mvcc_release_writer(db->mvcc);
+                if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+                free(txn);
+                return rc;
+            }
+        }        if (db->opts.sync_mode == YQ_SYNC_FULL && db->db_file) yq_file_sync(db->db_file);
 
         int rc_apply = pending_apply(txn);
         pending_free(txn);
@@ -1041,6 +1061,7 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
 
     if (rc == YQ_OK) rc = yq_wal_append_commit(tmp, txn_id);
     if (rc == YQ_OK) rc = yq_wal_flush(tmp);
+    if (rc == YQ_OK) rc = yq_wal_sync(tmp);   /* the rename must not publish an unsynced log */
 
     yq_wal_close(tmp);
 
@@ -1130,6 +1151,8 @@ int yq_checkpoint(yq_db *db) {
      */
     int rc = yq_wal_flush(db->wal);
     if (rc != YQ_OK) return rc;
+    rc = yq_wal_sync(db->wal);
+    if (rc != YQ_OK) return rc;
 
     uint64_t wal_sz = yq_wal_size(db->wal);
     if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
@@ -1171,6 +1194,8 @@ int yq_sync(yq_db *db) {
     if (!db->write_enabled) return YQ_ERR_READONLY;
     /* yq_sync() exists to report flush success, so surface its failures. */
     int rc = yq_wal_flush(db->wal);
+    if (rc != YQ_OK) return rc;
+    rc = yq_wal_sync(db->wal);
     if (rc != YQ_OK) return rc;
     if (db->db_file) {
         rc = yq_file_sync(db->db_file);

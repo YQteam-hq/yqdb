@@ -17,6 +17,7 @@ int yq_wal_append_abort(yq_wal *wal, uint64_t txn_id);
 int yq_wal_append_ckpt_begin(yq_wal *wal, uint64_t root_page, uint64_t txn_id);
 int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn);
 int yq_wal_flush(yq_wal *wal);
+int yq_wal_sync(yq_wal *wal);
 int yq_wal_truncate(yq_wal *wal, uint64_t lsn);
 uint64_t yq_wal_size(yq_wal *wal);
 uint64_t yq_wal_last_lsn(yq_wal *wal);
