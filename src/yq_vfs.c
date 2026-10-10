@@ -141,6 +141,17 @@ int yq_file_rename(const char *from, const char *to) {
     return YQ_OK;
 }
 
+int yq_file_same_target(yq_file *a, yq_file *b) {
+    if (!a || !b) return -1;
+    BY_HANDLE_FILE_INFORMATION ia, ib;
+    if (!GetFileInformationByHandle(a->handle, &ia) ||
+        !GetFileInformationByHandle(b->handle, &ib)) {
+        return -1;
+    }
+    return ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+           ia.nFileIndexHigh == ib.nFileIndexHigh &&
+           ia.nFileIndexLow == ib.nFileIndexLow;
+}
 int yq_file_lock(yq_file *f, int exclusive) {
     DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
     OVERLAPPED ov = {0};
@@ -288,6 +299,12 @@ uint64_t yq_file_size(yq_file *f) {
     return (uint64_t)st.st_size;
 }
 
+int yq_file_same_target(yq_file *a, yq_file *b) {
+    if (!a || !b) return -1;
+    struct stat sa, sb;
+    if (fstat(a->fd, &sa) != 0 || fstat(b->fd, &sb) != 0) return -1;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
 int yq_file_lock(yq_file *f, int exclusive) {
     int type = exclusive ? LOCK_EX : LOCK_SH;
     if (flock(f->fd, type) < 0) {

@@ -1385,6 +1385,295 @@ static void test_checkpoint_large_value(void) {
     printf("OK\n");
 }
 
+/*
+ * Key/value limits must be reported with YQ_ERR_TOOBIG on every write path
+ * (ERRORS.md 4.2). yq_put() did, but yq_del() answered YQ_ERR_INVAL for the
+ * same oversized key, so callers could not distinguish "too big" from
+ * "bad argument" without consulting the size again.
+ */
+static void test_key_value_limits(void) {
+    printf("test_key_value_limits... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    yq_txn *txn = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+
+    static uint8_t big[1025];
+    memset(big, 'x', sizeof(big));
+    yq_slice big_key = { big, sizeof(big) };
+    yq_slice empty_key = { "", 0 };
+
+    CHECK_EQ(yq_put(txn, big_key, big_key, 0), YQ_ERR_TOOBIG);
+    CHECK_EQ(yq_put(txn, empty_key, big_key, 0), YQ_ERR_TOOBIG);
+    CHECK_EQ(yq_del(txn, big_key), YQ_ERR_TOOBIG);
+    CHECK_EQ(yq_del(txn, empty_key), YQ_ERR_TOOBIG);
+
+    /* A valid key right at the limit must still be accepted. */
+    yq_slice max_key = { big, 1024 };
+    CHECK_EQ(yq_put(txn, max_key, max_key, 0), YQ_OK);
+
+    CHECK_EQ(yq_txn_abort(txn), YQ_OK);
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+/*
+ * The pool keeps one free list per size class (regression guard).
+ *
+ * The pool used to keep a single mixed-size free list: free() pushed any
+ * object onto it and alloc() popped any object off it, so a 256-byte
+ * request could be handed a slot that had been freed after a 64-byte
+ * allocation. Filling that object then ran past the slot into its
+ * neighbour. Both neighbours are filled with known patterns here and must
+ * survive any fill of the larger object.
+ */
+static void test_mempool_size_classes(void) {
+    printf("test_mempool_size_classes... ");
+
+    yq_mempool *pool = yq_mempool_create();
+    CHECK(pool != NULL);
+
+    unsigned char *a = (unsigned char *)yq_mempool_alloc(pool, 64);
+    unsigned char *b = (unsigned char *)yq_mempool_alloc(pool, 64);
+    CHECK(a != NULL && b != NULL);
+    memset(a, 0xAA, 64);
+    memset(b, 0xBB, 64);
+
+    yq_mempool_free(pool, a);
+
+    /* A 256-byte request must not be served the 64-byte slot. */
+    unsigned char *c = (unsigned char *)yq_mempool_alloc(pool, 256);
+    CHECK(c != NULL);
+    CHECK(c != a);
+    memset(c, 0xCC, 256);
+
+    int clobbered = 0;
+    for (int i = 0; i < 64; i++) {
+        if (b[i] != 0xBB) clobbered++;
+    }
+    CHECK(clobbered == 0);
+
+    /* Same-class reuse still works: the next 64-byte request takes the slot. */
+    unsigned char *d = (unsigned char *)yq_mempool_alloc(pool, 64);
+    CHECK(d == a);
+    memset(d, 0xDD, 64);
+    clobbered = 0;
+    for (int i = 0; i < 64; i++) {
+        if (b[i] != 0xBB) clobbered++;
+    }
+    CHECK(clobbered == 0);
+
+    yq_mempool_stats st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+    CHECK_EQ(yq_mempool_stats_get(pool, &st), YQ_OK);
+    CHECK(st.chunks_allocated == 1);
+    CHECK(st.objects_allocated == 3);
+    CHECK(st.objects_freed == 1);
+    CHECK(st.free_objects == 0);
+
+    yq_mempool_destroy(pool);
+    printf("OK\n");
+}
+/*
+ * yq_batch_put() must reject a read-only transaction up front, whatever
+ * spelling of "read-only" the caller passed to yq_txn_begin().
+ *
+ * The guard used to test txn->flags & YQ_TXN_READONLY, which only catches
+ * the explicit 0x2 form: a transaction begun with flags == 0 is read-only
+ * as well (anything without the YQ_TXN_READWRITE bit is), and it used to
+ * slip past the guard and be rejected one entry at a time instead.
+ */
+static void test_batch_readonly_rejected(void) {
+    printf("test_batch_readonly_rejected... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    uint8_t kbuf[5] = "key";
+    uint8_t vbuf[4] = "val";
+    yq_batch_entry entries[1];
+    memset(entries, 0, sizeof(entries));
+    entries[0].key.data = kbuf; entries[0].key.size = 3;
+    entries[0].val.data = vbuf; entries[0].val.size = 3;
+    entries[0].op = 0;
+
+    /* Explicit YQ_TXN_READONLY. */
+    yq_txn *txn = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &txn), YQ_OK);
+    yq_batch_result res;
+    memset(&res, 0, sizeof(res));
+    res.struct_size = sizeof(res);
+    CHECK_EQ(yq_batch_put(txn, entries, 1, &res), YQ_ERR_READONLY);
+    CHECK(res.entries_total == 0);
+    CHECK(res.entries_ok == 0);
+    CHECK(res.entries_failed == 0);
+    CHECK(res.first_error == YQ_ERR_READONLY);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    /* Bare 0: also read-only, must be rejected the same way. */
+    CHECK_EQ(yq_txn_begin(db, 0, &txn), YQ_OK);
+    memset(&res, 0, sizeof(res));
+    res.struct_size = sizeof(res);
+    CHECK_EQ(yq_batch_put(txn, entries, 1, &res), YQ_ERR_READONLY);
+    CHECK(res.entries_total == 0);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    /* A write transaction still goes through. */
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+    memset(&res, 0, sizeof(res));
+    res.struct_size = sizeof(res);
+    CHECK_EQ(yq_batch_put(txn, entries, 1, &res), YQ_OK);
+    CHECK(res.entries_total == 1);
+    CHECK(res.entries_ok == 1);
+    CHECK(res.entries_failed == 0);
+    CHECK(res.first_error == YQ_OK);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+
+
+/*
+ * The pending-op hash index must preserve the exact semantics of the old
+ * reverse scan: the newest op for a key wins, tombstones hide older
+ * values, and NOOVERWRITE still sees keys written earlier in the same
+ * transaction.
+ */
+static void test_pending_index_semantics(void) {
+    printf("test_pending_index_semantics... ");
+    remove_db();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = sizeof(opts);
+    opts.flags = YQ_OPEN_CREATE;
+
+    yq_db *db = NULL;
+    CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+    yq_txn *txn = NULL;
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+
+    /* enough keys to force the hash table to grow past its initial 64 */
+    char k[32], v[32];
+    for (int i = 0; i < 500; i++) {
+        snprintf(k, sizeof(k), "k%04d", i);
+        snprintf(v, sizeof(v), "v%04d", i);
+        yq_slice key = { k, strlen(k) }, val = { v, strlen(v) };
+        CHECK_EQ(yq_put(txn, key, val, 0), YQ_OK);
+    }
+
+    yq_slice key = { "k0100", 6 };
+    yq_slice val = { "second", 6 };
+    CHECK_EQ(yq_put(txn, key, val, 0), YQ_OK);          /* overwrite */
+    yq_slice val2 = { "third", 5 };
+    CHECK_EQ(yq_put(txn, key, val2, 0), YQ_OK);         /* overwrite again */
+
+    yq_slice out = {0};
+    CHECK_EQ(yq_get(txn, key, &out), YQ_OK);
+    CHECK(out.size == 5 && memcmp(out.data, "third", 5) == 0);
+
+    /* NOOVERWRITE must still reject a key already written in this txn. */
+    CHECK_EQ(yq_put(txn, key, val, YQ_PUT_NOOVERWRITE), YQ_ERR_EXISTS);
+
+    /* Delete inside the txn hides the older value; re-put revives it. */
+    CHECK_EQ(yq_del(txn, key), YQ_OK);
+    CHECK_EQ(yq_get(txn, key, &out), YQ_ERR_NOTFOUND);
+    yq_slice val3 = { "fourth", 6 };
+    CHECK_EQ(yq_put(txn, key, val3, 0), YQ_OK);
+    CHECK_EQ(yq_get(txn, key, &out), YQ_OK);
+    CHECK(out.size == 6 && memcmp(out.data, "fourth", 6) == 0);
+
+    /* A key never touched in this txn still resolves to NOTFOUND. */
+    yq_slice missing = { "zzzz", 4 };
+    CHECK_EQ(yq_get(txn, missing, &out), YQ_ERR_NOTFOUND);
+
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    /* After the commit the values are visible through a fresh read txn. */
+    CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &txn), YQ_OK);
+    CHECK_EQ(yq_get(txn, key, &out), YQ_OK);
+    CHECK(out.size == 6 && memcmp(out.data, "fourth", 6) == 0);
+    yq_slice untouched = { "k0499", 5 };
+    CHECK_EQ(yq_get(txn, untouched, &out), YQ_OK);
+    CHECK(out.size == 5 && memcmp(out.data, "v0499", 5) == 0);
+    CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+
+    CHECK_EQ(yq_close(db), YQ_OK);
+    remove_db();
+    printf("OK\n");
+}
+/*
+ * YQ_SYNC_OFF (and its flag twin YQ_OPEN_NOSYNC) must round-trip like any
+ * other mode: the log is handed to the OS without an fsync per commit
+ * (documented as "a crash may lose the most recent commits"), which does
+ * not stop the data being readable after a clean close/reopen. Before the
+ * sync_mode split in yq_wal_flush() the mode was accepted - and
+ * YQ_OPEN_NOSYNC even forced sync_mode = YQ_SYNC_OFF in yq_open() - but the
+ * commit path ignored it and fdatasynced anyway, so a NOSYNC handle paid
+ * FULL durability prices while still being told it was in OFF mode.
+ */
+static void test_sync_mode_off(void) {
+    printf("test_sync_mode_off... ");
+    remove_db();
+
+    for (int use_flag = 0; use_flag < 2; use_flag++) {
+        yq_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.struct_size = sizeof(opts);
+        opts.flags = YQ_OPEN_CREATE;
+        if (use_flag) {
+            opts.flags |= YQ_OPEN_NOSYNC;   /* documented: equivalent to YQ_SYNC_OFF */
+        } else {
+            opts.sync_mode = YQ_SYNC_OFF;
+        }
+
+        yq_db *db = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &opts, &db), YQ_OK);
+
+        yq_txn *txn = NULL;
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READWRITE, &txn), YQ_OK);
+        yq_slice k1 = {"off-key", 7}, v1 = {"off-val", 7};
+        CHECK_EQ(yq_put(txn, k1, v1, 0), YQ_OK);
+        CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+        CHECK_EQ(yq_close(db), YQ_OK);
+
+        /* A fresh read-write open replays the log and must see the key. */
+        yq_opts ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.struct_size = sizeof(ro);
+        ro.flags = 0;
+        db = NULL;
+        CHECK_EQ(yq_open(TEST_DB, &ro, &db), YQ_OK);
+        CHECK_EQ(yq_txn_begin(db, YQ_TXN_READONLY, &txn), YQ_OK);
+        yq_slice out = {0};
+        CHECK_EQ(yq_get(txn, k1, &out), YQ_OK);
+        CHECK(out.size == 7 && memcmp(out.data, "off-val", 7) == 0);
+        CHECK_EQ(yq_txn_commit(txn), YQ_OK);
+        CHECK_EQ(yq_close(db), YQ_OK);
+        remove_db();
+    }
+    printf("OK\n");
+}
+
+
 int main(void) {
     printf("=== yq-DB Integration Tests ===\n\n");
 
@@ -1414,7 +1703,12 @@ int main(void) {
     test_long_db_path();
 #endif
     test_checkpoint_large_value();
+    test_key_value_limits();
     test_nosync();
+    test_sync_mode_off();
+    test_pending_index_semantics();
+    test_batch_readonly_rejected();
+    test_mempool_size_classes();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

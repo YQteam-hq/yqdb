@@ -105,7 +105,11 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
 
     if (found) {
         mt_entry *e = &mt->entries[idx];
-        if (!e->tombstone) mt->used_bytes -= entry_cost(e->key_len, e->val_len);
+        /* Always subtract what this slot currently accounts for: a live
+         * entry entry_cost(key, val), a tombstone entry_cost(key, 0) --
+         * its val_len is already 0. Skipping the subtraction for tombstones
+         * double-counted a resurrected key (key + entry per delete/put pair). */
+        mt->used_bytes -= entry_cost(e->key_len, e->val_len);
         size_t voff = 0;
         int rc = alloc_copy(mt, val.data, val.size, &voff);
         if (rc != YQ_OK) return rc;

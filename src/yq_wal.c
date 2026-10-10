@@ -239,13 +239,24 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
     return append_record(wal, 0, WAL_TYPE_CKPT_END, payload, 8);
 }
 
+/*
+ * Flush the buffered records to the log file.
+ *
+ * The records occupy one contiguous region of the write buffer and land at
+ * consecutive file offsets starting at file_size, so the batch goes out
+ * in a single write. A transaction of N records used to cost N pwrite
+ * calls (one per record) plus one fsync; now it costs one write plus one
+ * fsync regardless of N, which is what the group-commit model in
+ * YQ_SYNC_NORMAL wants. Failure handling is unchanged from the caller's
+ * point of view: the buffer stays intact and file_size only advances
+ * after the whole batch is durable.
+ */
 int yq_wal_flush(yq_wal *wal) {
     if (!wal || wal->buf_used == 0) return YQ_OK;
 
-    size_t offset = wal->file_size;
-    size_t pos = 0;
-
-    while (pos < wal->buf_used) {
+    /* Stamp each record in place: monotonically increasing LSN, the header
+     * CRC, and the payload CRC over the payload as it sits in the buffer. */
+    for (size_t pos = 0; pos < wal->buf_used; ) {
         uint8_t *rec = wal->buf + pos;
         uint64_t lsn = ++wal->last_lsn;
         memcpy(rec + 0, &lsn, 8);
@@ -269,20 +280,28 @@ int yq_wal_flush(yq_wal *wal) {
         }
         memcpy(rec + 25, &payload_crc, 4);
 
-        int rc = yq_file_pwrite(wal->file, rec, YQ_WAL_HEADER_SIZE + payload_len, offset);
-        if (rc != YQ_OK) return rc;
-
-        offset += YQ_WAL_HEADER_SIZE + payload_len;
         pos += YQ_WAL_HEADER_SIZE + payload_len;
     }
 
-    int rc = yq_file_sync(wal->file);
+    int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, wal->file_size);
     if (rc != YQ_OK) return rc;
 
     wal->file_size += wal->buf_used;
     wal->buf_used = 0;
 
     return YQ_OK;
+}
+
+/*
+ * Push the log file to stable storage. Split from yq_wal_flush() so the
+ * caller can implement its durability policy: yq_wal_flush() hands the
+ * bytes to the OS, yq_wal_sync() waits for the device. opts.sync_mode
+ * (YQ_SYNC_OFF / NORMAL / FULL) decides which of the two a commit runs;
+ * every other path (sync, checkpoint, compaction) needs both.
+ */
+int yq_wal_sync(yq_wal *wal) {
+    if (!wal) return YQ_ERR_INVAL;
+    return yq_file_sync(wal->file);
 }
 
 int yq_wal_truncate(yq_wal *wal, uint64_t lsn) {
