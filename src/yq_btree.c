@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
 
 #define YQ_PAGE_TYPE_LEAF     1
 #define YQ_PAGE_TYPE_INTERNAL 2
@@ -129,6 +130,7 @@ static uint8_t *alloc_page(yq_btree *bt, int is_leaf) {
  */
 static int cell_size(const uint8_t *page, uint16_t slot_idx, uint32_t page_size,
                      uint8_t page_type) {
+    assert(page_type == YQ_PAGE_TYPE_LEAF || page_type == YQ_PAGE_TYPE_INTERNAL);
     uint16_t offset = get_slot(page, slot_idx);
     uint8_t *cell = (uint8_t *)page + offset;
     size_t n = 0;
@@ -208,6 +210,8 @@ static size_t encode_leaf_cell(uint8_t *cell, yq_slice key, yq_slice val,
         if (val.size) memcpy(cell + pos, val.data, val.size);
         pos += val.size;
     }
+    assert(leaf_cell_size(key, val, page_size) == pos &&
+           "leaf cell encoder and predictor disagree on the cell length");
     return pos;
 }
 
@@ -226,6 +230,8 @@ static size_t encode_internal_cell(uint8_t *cell, yq_slice key, uint64_t child) 
     pos += key.size;
     *(uint64_t *)(cell + pos) = child;
     pos += 8;
+    assert(internal_cell_size(key) == pos &&
+           "internal cell encoder and predictor disagree on the cell length");
     return pos;
 }
 
