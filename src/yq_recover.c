@@ -242,6 +242,8 @@ static void replay_apply(recover_ctx *ctx, size_t idx) {
         yq_slice v;
         v.data = ctx->vals ? ctx->vals + op->val_off : NULL;
         v.size = op->val_len;
+        /* The memtable is best-effort here, exactly as before this change: a
+         * full memtable skips the key rather than failing the whole reopen. */
         yq_memtable_put(ctx->mt, k, v);
     } else if (op->type == 3) {
         yq_memtable_del(ctx->mt, k);
@@ -272,6 +274,11 @@ static void replay_apply(recover_ctx *ctx, size_t idx) {
  *
  * If the scratch array cannot be allocated the sequential replay runs instead,
  * so recovery still makes progress under memory pressure.
+ *
+ * Note on the dedup loop below: `prev_key` is not a copy and does not point
+ * into `order`. It points into ctx->keys, the arena that holds every op's key
+ * bytes for the lifetime of this function, so it stays valid for the whole
+ * loop and for any number of comparisons against it.
  */
 static void replay_ops(recover_ctx *ctx) {
     if (ctx->ops_count == 0) return;
