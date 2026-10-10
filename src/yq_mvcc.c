@@ -284,11 +284,46 @@ int yq_mvcc_increment_txn_id(yq_mvcc *mvcc, uint64_t *out) {
 /* Bytes of a meta page covered by header_crc32c. */
 #define YQ_META_CRC_LEN 96
 
+/*
+ * Bytes of a meta page that carry any meaning: the packed meta_block, which is
+ * the CRC-covered prefix plus the trailing header_crc32c word. Everything past
+ * it on the page is padding.
+ *
+ * read_meta_page() used to pull in a whole page per meta block -- up to 64 KiB
+ * at the largest page size yq_opts accepts -- and this runs on the hottest
+ * path in the engine: yq_mvcc_meta_read() is called by every yq_txn_begin()
+ * and every commit, and select_meta_index() reads both blocks again on the way
+ * to writing one. That is six full-page reads per transaction to inspect 100
+ * bytes, so the read is narrowed to the block itself.
+ *
+ * The invariant the narrowing depends on is that the block really is exactly
+ * the CRC region plus its CRC word; it is enforced at compile time below.
+ */
+#define YQ_META_READ_LEN ((size_t)sizeof(meta_block))
+
+/* Compile-time assertion: a negative array size is a hard compile error. */
+typedef char yq_meta_block_size_check[
+    (sizeof(meta_block) == YQ_META_CRC_LEN + 4) ? 1 : -1];
+
 static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
     uint8_t *buf = mvcc->io_buf;
     uint64_t off = (uint64_t)page_idx * mvcc->page_size;
 
-    if (yq_file_pread(mvcc->db_file, buf, mvcc->page_size, off) != YQ_OK) {
+    /*
+     * Only the packed meta_block (YQ_META_READ_LEN bytes) is read into io_buf,
+     * never the whole page -- that is the win this PR is about. Nothing in this
+     * file ever reads io_buf past the block: the CRC is computed over the
+     * YQ_META_CRC_LEN prefix, and the only field consulted after the read is
+     * the meta_block that starts at buf[0]. So the buffer is deliberately left
+     * uninitialized beyond the block, and callers must not rely on more than
+     * YQ_META_READ_LEN bytes being valid.
+     *
+     * The block region is zeroed up front so the struct is in a deterministic
+     * state even if pread returns a short read; on the hot path pread fills
+     * the whole block and the memset is overwritten.
+     */
+    memset(buf, 0, YQ_META_READ_LEN);
+    if (yq_file_pread(mvcc->db_file, buf, YQ_META_READ_LEN, off) != YQ_OK) {
         return YQ_ERR_IO;
     }
 
@@ -368,7 +403,11 @@ int yq_mvcc_meta_write(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page, uint6
 
 int yq_mvcc_meta_pwrite(yq_mvcc *mvcc, uint8_t meta_index) {
     uint8_t *buf = mvcc->io_buf;
-    memset(buf, 0, mvcc->page_size);
+    /*
+     * The zero-fill used to precede this copy is gone: it wrote page_size
+     * bytes that the memcpy immediately overwrote in full, which is a pure
+     * waste of up to 64 KiB per meta write.
+     */
     memcpy(buf, mvcc->meta_buf, mvcc->page_size);
     uint32_t crc = yq_crc32c(buf, YQ_META_CRC_LEN);
     ((meta_block*)buf)->header_crc32c = crc;
