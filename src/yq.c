@@ -421,13 +421,15 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     txn->state = YQ_TXN_STATE_ACTIVE;
     txn->slot_idx = -1;
     txn->first_write = (flags & YQ_TXN_READWRITE) ? 1 : 0;
-
     /*
-     * YQ_TXN_READONLY is 0, so `flags & YQ_TXN_READONLY` is always false and
-     * cannot be used to select this branch -- read-write must be tested for
-     * and read-only treated as the fallback. Getting this wrong silently
-     * skipped snapshot registration for every read-only transaction, i.e. the
-     * reader table never learned about them and MVCC had nothing to protect.
+     * YQ_TXN_READWRITE is a flag bit, not an enum: the read-only form is
+     * anything without that bit, which covers both YQ_TXN_READONLY (0x2)
+     * and a bare 0. (An older version of this comment claimed READONLY
+     * was 0 and the flag test useless; it is neither.) Test for the
+     * read-write bit and treat read-only as the fallback. Getting this
+     * wrong silently skipped snapshot registration for every read-only
+     * transaction, i.e. the reader table never learned about them and
+     * MVCC had nothing to protect.
      */
     if (!(flags & YQ_TXN_READWRITE)) {
         uint64_t txn_id = 0, root = 0;
@@ -465,7 +467,23 @@ int yq_txn_commit(yq_txn *txn) {
             free(txn);
             return rc;
         }
-        yq_wal_flush(db->wal);
+        /*
+         * The commit record must actually reach the file before the commit
+         * is reported as successful. yq_wal_flush() failing means this
+         * commit (and everything still buffered before it) never made it to
+         * disk, so the transaction is not durable: fail it exactly like the
+         * append above instead of returning YQ_OK and silently losing the
+         * writes on the next reopen.
+         */
+        rc = yq_wal_flush(db->wal);
+        if (rc != YQ_OK) {
+            txn->state = YQ_TXN_STATE_ABORTED;
+            pending_free(txn);
+            yq_mvcc_release_writer(db->mvcc);
+            if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+            free(txn);
+            return rc;
+        }
         if (db->opts.sync_mode == YQ_SYNC_FULL && db->db_file) yq_file_sync(db->db_file);
 
         int rc_apply = pending_apply(txn);
@@ -494,6 +512,14 @@ int yq_txn_commit(yq_txn *txn) {
         rc2 = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
 
         yq_mvcc_release_writer(db->mvcc);
+        if (rc2 != YQ_OK) {
+            /* The log is durable, but the meta page did not take the new
+             * txn id / root. Report the failure rather than a silent OK. */
+            txn->state = YQ_TXN_STATE_ABORTED;
+            if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+            free(txn);
+            return rc2;
+        }
     }
 
     txn->state = YQ_TXN_STATE_COMMITTED;
@@ -520,7 +546,7 @@ int yq_txn_abort(yq_txn *txn) {
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    /* Read-only is anything without the YQ_TXN_READWRITE bit (see yq_txn_begin). */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
@@ -553,9 +579,11 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 int yq_del(yq_txn *txn, yq_slice key) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    /* Read-only is anything without the YQ_TXN_READWRITE bit (see yq_txn_begin). */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
+    /* Mirror yq_put(): ERRORS.md 4.2 maps a key outside 1..1024 bytes to
+     * YQ_ERR_TOOBIG, not YQ_ERR_INVAL. */
+    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
 
     yq_db *db = txn->db;
     yq_slice empty;
@@ -885,36 +913,49 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
     memcpy(cur_log + plen, ".log", 5);
 
     /*
-     * 先释放旧句柄再 rename。Win32 上 MoveFileExA(MOVEFILE_REPLACE_EXISTING)
-     * 需要先删除目标文件，任何仍持有 <db>.log 的句柄都会挡住这一步（除非它
-     * 共享了 FILE_SHARE_DELETE）。yq_file_open 现在已带 FILE_SHARE_DELETE，
-     * 但先关闭更稳妥，也顺带避免"旧句柄指向被替换掉的 inode"的语义歧义。
+     * 必须先关闭旧日志句柄，再 rename。
      *
-     * 注意：压实后的数据此刻已持久化在新 <db>.log 中，所以从这里往下即使
-     * 出错，磁盘上也不缺数据；要保证的只是别把 db 留在不可用状态。
+     * Win32 上 MoveFileExA(MOVEFILE_REPLACE_EXISTING) 替换目标文件前要先
+     * "删除"它，而只要目标仍被任何句柄打开，删除就以 ERROR_ACCESS_DENIED(5)
+     * 失败——句柄即使带 FILE_SHARE_DELETE 也不行（已用最小化程序实测确认：
+     * 句柄开着 rename 必失败，关掉才成功）。旧注释声称的"除非它共享了
+     * FILE_SHARE_DELETE"并不成立。POSIX 的 rename() 无视已打开的句柄，所以
+     * 这个 bug 只在 Windows 上显形：checkpoint 直接返回 YQ_ERR_IO，main 上
+     * windows/msvc 的 CI 正是挂在 test_checkpoint（yq_test_integration.c）。
+     *
+     * 数据安全方面：压实后的记录此刻已完整写入临时文件并 fsync 过，关闭旧
+     * 句柄不会丢数据；要保证的只是 rename 失败时 db 依然可用。
      */
     yq_wal *old_wal = db->wal;
     db->wal = NULL;
+
+    yq_wal_close(old_wal);
 
     rc = yq_file_rename(tmp_log, cur_log);
     if (rc != YQ_OK) {
         remove(tmp_log);
         /*
-         * 重命名失败：新日志没顶上，但旧日志文件仍在原位且内容完好，
-         * 于是把旧句柄恢复回去继续用，而不是让 db->wal 停在 NULL ——
+         * 重命名失败：新日志没顶上，但旧日志文件仍在原位且内容完好。重新
+         * 打开它挂回 db->wal，而不是让 db->wal 停在 NULL ——
          * yq_wal_append_put() 不做空指针检查，NULL 会在下一个写事务里崩。
+         * 万一重开也失败，数据依然在磁盘上，把库标成待重开（拒绝后续写而
+         * 不是踩 NULL），然后把错误透出去。
          */
-        db->wal = old_wal;
+        yq_wal *reopen_wal = NULL;
+        int reopen_rc = yq_wal_open(&reopen_wal, db->path, db->opts.page_size);
+        if (reopen_rc != YQ_OK) {
+            db->write_enabled = 0;
+            return rc;
+        }
+        db->wal = reopen_wal;
         return rc;
     }
 
     /*
-     * rename 成功：旧句柄现在指向已从目录中消失的文件，必须关掉。
-     * 先把新句柄开进局部变量，确认成功后再交给 db->wal，避免"落盘已成功
-     * 却把库搞成不可用"——reopen 失败时明确报错而不是留下悬空 NULL。
+     * rename 成功：新日志已就位。重开新句柄并确认成功后再交给 db->wal，避免
+     * "落盘已成功却把库搞成不可用"——reopen 失败时明确报错，而不是留下一个
+     * 悬空 NULL。
      */
-    yq_wal_close(old_wal);
-
     yq_wal *new_wal = NULL;
     rc = yq_wal_open(&new_wal, db->path, db->opts.page_size);
     if (rc != YQ_OK) {
@@ -961,7 +1002,8 @@ int yq_checkpoint(yq_db *db) {
         cur_npages = yq_btree_npages(db->btree);
     }
 
-    yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    rc = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    if (rc != YQ_OK) return rc;
 
     /*
      * The log can only be rewritten while it is the sole durable copy of the
@@ -983,8 +1025,13 @@ int yq_sync(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
     /* See the note in yq_checkpoint(). */
     if (!db->write_enabled) return YQ_ERR_READONLY;
-    yq_wal_flush(db->wal);
-    if (db->db_file) yq_file_sync(db->db_file);
+    /* yq_sync() exists to report flush success, so surface its failures. */
+    int rc = yq_wal_flush(db->wal);
+    if (rc != YQ_OK) return rc;
+    if (db->db_file) {
+        rc = yq_file_sync(db->db_file);
+        if (rc != YQ_OK) return rc;
+    }
     return YQ_OK;
 }
 
@@ -1043,7 +1090,11 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
         yq_batch_result_init(result, 0, YQ_ERR_TXN_CLOSED);
         return YQ_ERR_TXN_CLOSED;
     }
-    if (txn->flags & YQ_TXN_READONLY) {
+    /* YQ_TXN_READWRITE is a flag bit, not an enum value: a read-only
+     * transaction is anything without that bit, which includes both the
+     * YQ_TXN_READONLY flag and a bare 0. Testing the READONLY flag alone
+     * (as this line used to) misses the 0 form and disagrees with yq_put(). */
+    if (!(txn->flags & YQ_TXN_READWRITE)) {
         yq_batch_result_init(result, 0, YQ_ERR_READONLY);
         return YQ_ERR_READONLY;
     }
