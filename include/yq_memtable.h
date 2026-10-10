@@ -21,6 +21,19 @@ int yq_memtable_iter_first(yq_memtable_iter *it);
 int yq_memtable_iter_next(yq_memtable_iter *it);
 int yq_memtable_iter_last(yq_memtable_iter *it);
 int yq_memtable_iter_prev(yq_memtable_iter *it);
+/*
+ * Position the iterator at the first entry whose key is >= `target`,
+ * skipping tombstones the way iter_first()/iter_next() do.
+ *
+ * This is a binary search. Walking from iter_first() and comparing each key
+ * in turn is linear in the number of entries, which makes every yq_cur_seek()
+ * and yq_cur_seek_exact() call O(n) in the size of the memtable.
+ *
+ * Returns YQ_OK with the iterator positioned, or YQ_ERR_NOTFOUND when every
+ * key is smaller than `target` (in which case the iterator is left past the
+ * end and iter_valid() reports 0).
+ */
+int yq_memtable_iter_seek(yq_memtable_iter *it, yq_slice target);
 int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out);
 int yq_memtable_iter_val(yq_memtable_iter *it, yq_slice *out);
 int yq_memtable_iter_valid(yq_memtable_iter *it);

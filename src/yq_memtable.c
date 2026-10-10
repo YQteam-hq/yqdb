@@ -107,6 +107,35 @@ void yq_memtable_destroy(yq_memtable *mt) {
     free(mt);
 }
 
+/*
+ * Make room for one more entry. Called on the insert path of both put() and
+ * del(), which had the same doubling logic inline.
+ */
+static int reserve_entry(yq_memtable *mt) {
+    if (mt->num_entries < mt->cap_entries) return YQ_OK;
+
+    size_t new_cap = mt->cap_entries * 2;
+    mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
+    if (!new_entries) return YQ_ERR_NOMEM;
+
+    mt->entries = new_entries;
+    mt->cap_entries = new_cap;
+    return YQ_OK;
+}
+
+/*
+ * Open a gap at `idx` by shifting everything above it up one slot.
+ *
+ * memmove() rather than an element-by-element loop: the compiler cannot
+ * assume the regions do not overlap here, and a hand-rolled loop of struct
+ * assignments is what the insert path of a large memtable spends its time on.
+ */
+static void shift_entries_up(mt_entry *entries, size_t idx, size_t num_entries) {
+    if (idx >= num_entries) return;
+    memmove(&entries[idx + 1], &entries[idx],
+            (num_entries - idx) * sizeof(*entries));
+}
+
 int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
     if (!mt || key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
 
@@ -129,23 +158,16 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
         return YQ_OK;
     }
 
-    if (mt->num_entries >= mt->cap_entries) {
-        size_t new_cap = mt->cap_entries * 2;
-        mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
-        if (!new_entries) return YQ_ERR_NOMEM;
-        mt->entries = new_entries;
-        mt->cap_entries = new_cap;
-    }
+    int rc = reserve_entry(mt);
+    if (rc != YQ_OK) return rc;
 
     size_t koff = 0, voff = 0;
-    int rc = alloc_copy(mt, key.data, key.size, &koff);
+    rc = alloc_copy(mt, key.data, key.size, &koff);
     if (rc != YQ_OK) return rc;
     rc = alloc_copy(mt, val.data, val.size, &voff);
     if (rc != YQ_OK) return rc;
 
-    for (size_t i = mt->num_entries; i > idx; i--) {
-        mt->entries[i] = mt->entries[i - 1];
-    }
+    shift_entries_up(mt->entries, idx, mt->num_entries);
     mt->num_entries++;
 
     mt_entry *e = &mt->entries[idx];
@@ -176,21 +198,14 @@ int yq_memtable_del(yq_memtable *mt, yq_slice key) {
         return YQ_OK;
     }
 
-    if (mt->num_entries >= mt->cap_entries) {
-        size_t new_cap = mt->cap_entries * 2;
-        mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
-        if (!new_entries) return YQ_ERR_NOMEM;
-        mt->entries = new_entries;
-        mt->cap_entries = new_cap;
-    }
-
-    size_t koff = 0;
-    int rc = alloc_copy(mt, key.data, key.size, &koff);
+    int rc = reserve_entry(mt);
     if (rc != YQ_OK) return rc;
 
-    for (size_t i = mt->num_entries; i > idx; i--) {
-        mt->entries[i] = mt->entries[i - 1];
-    }
+    size_t koff = 0;
+    rc = alloc_copy(mt, key.data, key.size, &koff);
+    if (rc != YQ_OK) return rc;
+
+    shift_entries_up(mt->entries, idx, mt->num_entries);
     mt->num_entries++;
 
     mt_entry *e = &mt->entries[idx];
@@ -302,6 +317,33 @@ int yq_memtable_iter_prev(yq_memtable_iter *it) {
     while (it->mt->entries[it->pos].tombstone) {
         if (it->pos == 0) return YQ_ERR_NOTFOUND;
         it->pos--;
+    }
+    return YQ_OK;
+}
+
+/*
+ * Lower bound: first entry with key >= target, then past any tombstones.
+ *
+ * search_entry() returns the insertion position, which is the lowest index
+ * whose key is >= target -- tombstones included, since they carry their key
+ * and sit at their sorted position. Every index below it holds a smaller key,
+ * so no entry there can satisfy the seek no matter whether it is a tombstone;
+ * starting the tombstone skip from there therefore lands on exactly the entry
+ * a linear scan from iter_first() would have stopped at.
+ */
+int yq_memtable_iter_seek(yq_memtable_iter *it, yq_slice target) {
+    if (!it || !it->mt) return YQ_ERR_INVAL;
+
+    size_t idx;
+    search_entry(it->mt, &target, &idx);
+
+    it->pos = idx;
+    while (it->pos < it->mt->num_entries && it->mt->entries[it->pos].tombstone) {
+        it->pos++;
+    }
+
+    if (it->pos >= it->mt->num_entries) {
+        return YQ_ERR_NOTFOUND;
     }
     return YQ_OK;
 }
