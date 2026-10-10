@@ -125,14 +125,14 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
 
     if (fsize == 0) {
         shm_created = 1;
-        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) { free(mvcc); return YQ_ERR_IO; }
+        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) { if (mvcc->meta_buf) free(mvcc->meta_buf); if (mvcc->io_buf) free(mvcc->io_buf); free(mvcc); return YQ_ERR_IO; }
     } else if ((size_t)fsize < shm_size) {
-        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) { free(mvcc); return YQ_ERR_IO; }
+        if (yq_file_truncate(shm_file, shm_size) != YQ_OK) { if (mvcc->meta_buf) free(mvcc->meta_buf); if (mvcc->io_buf) free(mvcc->io_buf); free(mvcc); return YQ_ERR_IO; }
     }
 
     mvcc->shm_size = shm_size;
     mvcc->shm_base = yq_file_mmap(shm_file, 0, shm_size);
-    if (!mvcc->shm_base) { free(mvcc); return YQ_ERR_IO; }
+    if (!mvcc->shm_base) { if (mvcc->meta_buf) free(mvcc->meta_buf); if (mvcc->io_buf) free(mvcc->io_buf); free(mvcc); return YQ_ERR_IO; }
 
     if (shm_created) {
         shm_header *hdr = (shm_header *)mvcc->shm_base;
@@ -153,8 +153,8 @@ int yq_mvcc_open(yq_mvcc **out, yq_file *db_file, yq_file *shm_file, yq_file *lo
         }
     } else {
         shm_header *hdr = (shm_header *)mvcc->shm_base;
-        if (hdr->shm_magic != YQ_SHM_MAGIC) { yq_file_munmap(mvcc->shm_base, mvcc->shm_size); free(mvcc); return YQ_ERR_CORRUPT; }
-        if (hdr->shm_version != YQ_SHM_VERSION) { yq_file_munmap(mvcc->shm_base, mvcc->shm_size); free(mvcc); return YQ_ERR_VERSION; }
+        if (hdr->shm_magic != YQ_SHM_MAGIC) { yq_file_munmap(mvcc->shm_base, mvcc->shm_size); if (mvcc->meta_buf) free(mvcc->meta_buf); if (mvcc->io_buf) free(mvcc->io_buf); free(mvcc); return YQ_ERR_CORRUPT; }
+        if (hdr->shm_version != YQ_SHM_VERSION) { yq_file_munmap(mvcc->shm_base, mvcc->shm_size); if (mvcc->meta_buf) free(mvcc->meta_buf); if (mvcc->io_buf) free(mvcc->io_buf); free(mvcc); return YQ_ERR_VERSION; }
     }
 
     *out = mvcc;
