@@ -346,9 +346,16 @@ int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint
     return YQ_OK;
 }
 
-int yq_mvcc_meta_write(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page, uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
-    memset(mvcc->meta_buf, 0, mvcc->page_size);
-    meta_block *mb = (meta_block *)mvcc->meta_buf;
+/*
+ * Build a meta block in *mb from the supplied fields, filling every member so
+ * the two callers that persist metadata (yq_mvcc_meta_write and
+ * yq_mvcc_meta_pwrite_full) cannot drift apart. Keeping the layout in one place
+ * also makes the on-disk format trivially auditable.
+ */
+static void yq_mvcc_fill_meta_block(yq_mvcc *mvcc, meta_block *mb,
+                                    uint64_t txn_id, uint64_t root_page,
+                                    uint64_t free_head, uint64_t npages,
+                                    uint64_t ckpt_lsn) {
     mb->magic = (uint64_t)YQ_MAGIC_0 | ((uint64_t)YQ_MAGIC_1 << 32);
     mb->format_version = 1;
     mb->page_size = mvcc->page_size;
@@ -363,6 +370,12 @@ int yq_mvcc_meta_write(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page, uint6
     mb->node_encoding = 1;
     mb->flags = 0;
     mb->reserved1 = 0;
+}
+
+int yq_mvcc_meta_write(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page, uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
+    memset(mvcc->meta_buf, 0, mvcc->page_size);
+    meta_block *mb = (meta_block *)mvcc->meta_buf;
+    yq_mvcc_fill_meta_block(mvcc, mb, txn_id, root_page, free_head, npages, ckpt_lsn);
     return YQ_OK;
 }
 
@@ -407,20 +420,7 @@ int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     memset(buf, 0, mvcc->page_size);
 
     meta_block *mb = (meta_block *)buf;
-    mb->magic = (uint64_t)YQ_MAGIC_0 | ((uint64_t)YQ_MAGIC_1 << 32);
-    mb->format_version = 1;
-    mb->page_size = mvcc->page_size;
-    mb->txn_id = txn_id;
-    mb->root_page = root_page;
-    mb->free_head = free_head;
-    mb->npages = npages;
-    mb->ckpt_lsn = ckpt_lsn;
-    mb->log_trunc_lsn = 0;
-    mb->meta_seq = mvcc->meta_seq;
-    mb->reserved0 = 0;
-    mb->node_encoding = 1;
-    mb->flags = 0;
-    mb->reserved1 = 0;
+    yq_mvcc_fill_meta_block(mvcc, mb, txn_id, root_page, free_head, npages, ckpt_lsn);
 
     uint32_t crc = yq_crc32c(buf, YQ_META_CRC_LEN);
     mb->header_crc32c = crc;
