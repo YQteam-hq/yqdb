@@ -1065,6 +1065,8 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
             entry_bad = 1;
         } else if (e->op == 0 && e->val.data == NULL && e->val.size != 0) {
             entry_bad = 1;
+        } else if (e->op == 0 && e->val.size > (1ULL << 30)) {
+            entry_bad = 1;
         }
         if (entry_bad) bad = 1;
     }
