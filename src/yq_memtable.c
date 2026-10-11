@@ -143,9 +143,10 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
     rc = alloc_copy(mt, val.data, val.size, &voff);
     if (rc != YQ_OK) return rc;
 
-    for (size_t i = mt->num_entries; i > idx; i--) {
-        mt->entries[i] = mt->entries[i - 1];
-    }
+    /* Make room at idx. A single memmove is far cheaper than copying each
+     * struct in a loop, and matters once the memtable holds many entries. */
+    memmove(&mt->entries[idx + 1], &mt->entries[idx],
+            (mt->num_entries - idx) * sizeof(mt_entry));
     mt->num_entries++;
 
     mt_entry *e = &mt->entries[idx];
@@ -188,9 +189,9 @@ int yq_memtable_del(yq_memtable *mt, yq_slice key) {
     int rc = alloc_copy(mt, key.data, key.size, &koff);
     if (rc != YQ_OK) return rc;
 
-    for (size_t i = mt->num_entries; i > idx; i--) {
-        mt->entries[i] = mt->entries[i - 1];
-    }
+    /* See yq_memtable_put(): one memmove instead of a per-entry copy loop. */
+    memmove(&mt->entries[idx + 1], &mt->entries[idx],
+            (mt->num_entries - idx) * sizeof(mt_entry));
     mt->num_entries++;
 
     mt_entry *e = &mt->entries[idx];
