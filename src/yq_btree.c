@@ -141,6 +141,55 @@ static int compare_key(const uint8_t *key1, size_t len1, const uint8_t *key2, si
     return yq_slice_compare_raw(key1, len1, key2, len2);
 }
 
+/*
+ * Encode one leaf cell in place.
+ *
+ * The layout is varint(key_len) key [payload], where the payload is either the
+ * inline value (varint(val_len) value) or, when the value is too large to be
+ * inlined, an overflow marker plus the total length. In both forms the length
+ * varint encodes val.size, so val_len_buf serves either case -- the overflow
+ * branch used to re-encode the same value into a second buffer.
+ *
+ * This block was written out three times in insert_into_leaf() (the in-place
+ * fast path and the two arms of the split), which is where the copies drifted
+ * apart in readability even though they must stay byte-identical.
+ */
+static void write_leaf_cell(uint8_t *cell,
+                            const uint8_t *key_len_buf, size_t key_len_enc,
+                            const void *key_data, size_t key_size,
+                            const uint8_t *val_len_buf, size_t val_len_enc,
+                            const void *val_data, size_t val_size,
+                            int is_overflow) {
+    size_t pos = 0;
+    memcpy(cell + pos, key_len_buf, key_len_enc);
+    pos += key_len_enc;
+    memcpy(cell + pos, key_data, key_size);
+    pos += key_size;
+
+    if (is_overflow) {
+        *(uint64_t *)(cell + pos) = 0;
+        pos += 8;
+        memcpy(cell + pos, val_len_buf, val_len_enc);
+    } else {
+        memcpy(cell + pos, val_len_buf, val_len_enc);
+        pos += val_len_enc;
+        memcpy(cell + pos, val_data, val_size);
+    }
+}
+
+/* Encode one internal cell: varint(key_len) key child_page. */
+static void write_internal_cell(uint8_t *cell,
+                                const uint8_t *key_len_buf, size_t key_len_enc,
+                                const void *key_data, size_t key_size,
+                                uint64_t child) {
+    size_t pos = 0;
+    memcpy(cell + pos, key_len_buf, key_len_enc);
+    pos += key_len_enc;
+    memcpy(cell + pos, key_data, key_size);
+    pos += key_size;
+    *(uint64_t *)(cell + pos) = child;
+}
+
 static int find_slot(const uint8_t *page, const uint8_t *key, size_t key_len, uint16_t nkeys, uint32_t page_size) {
     int lo = 0, hi = (int)nkeys - 1;
     if (nkeys == 0) return 0;
@@ -206,25 +255,10 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
         }
         set_slot(page, (uint16_t)slot, new_offset);
 
-        uint8_t *cell = page + new_offset;
-        size_t pos = 0;
-        memcpy(cell + pos, key_len_buf, key_len_enc);
-        pos += key_len_enc;
-        memcpy(cell + pos, key.data, key.size);
-        pos += key.size;
-
-        if (is_overflow) {
-            *(uint64_t *)(cell + pos) = 0;
-            pos += 8;
-            size_t total_enc = 0;
-            uint8_t total_buf[10];
-            yq_varint_encode(val.size, total_buf, &total_enc);
-            memcpy(cell + pos, total_buf, total_enc);
-        } else {
-            memcpy(cell + pos, val_len_buf, val_len_enc);
-            pos += val_len_enc;
-            memcpy(cell + pos, val.data, val.size);
-        }
+        write_leaf_cell(page + new_offset,
+                        key_len_buf, key_len_enc, key.data, key.size,
+                        val_len_buf, val_len_enc, val.data, val.size,
+                        is_overflow);
 
         hdr.nkeys++;
         hdr.free_bytes = new_offset - (YQ_PAGE_HEADER_SIZE + (nkeys + 1) * YQ_PAGE_SLOT_SIZE);
@@ -249,53 +283,45 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
     new_hdr.free_bytes = ps - YQ_PAGE_HEADER_SIZE;
 
     for (uint16_t i = 0; i < nkeys - split_pos; i++) {
-        uint16_t old_offset = get_slot(page, split_pos + i);
-        uint16_t new_offset = (uint16_t)(ps - YQ_PAGE_CRC_SIZE - (i * YQ_PAGE_SLOT_SIZE) - (cell_size(page, split_pos + i, ps)));
-        set_slot(new_page, i, new_offset);
-        uint8_t *src_cell = page + old_offset;
-        uint8_t *dst_cell = new_page + new_offset;
+        /*
+         * cell_size() parses the page header and decodes up to three varints,
+         * and it was called twice per cell -- once for the offset and once for
+         * the copy length. Both uses need the same value, so compute it once.
+         */
         int csz = cell_size(page, split_pos + i, ps);
-        memcpy(dst_cell, src_cell, csz);
+        if (csz < 0) {
+            free(new_page);
+            return YQ_ERR_CORRUPT;
+        }
+        uint16_t old_offset = get_slot(page, split_pos + i);
+        uint16_t new_offset = (uint16_t)(ps - YQ_PAGE_CRC_SIZE - (i * YQ_PAGE_SLOT_SIZE) - csz);
+        set_slot(new_page, i, new_offset);
+        memcpy(new_page + new_offset, page + old_offset, (size_t)csz);
         new_hdr.nkeys++;
     }
 
-    uint8_t *insert_key_buf = (uint8_t *)malloc(key.size);
-    if (!insert_key_buf) {
-        free(new_page);
-        return YQ_ERR_NOMEM;
-    }
-    memcpy(insert_key_buf, key.data, key.size);
-
+    /*
+     * Decide which half of the split the new key belongs to. The key being
+     * inserted is compared directly: it is still owned by the caller, so the
+     * malloc/copy/free that used to shadow it did nothing but add a heap
+     * round trip to every leaf split.
+     */
     uint8_t split_key_buf[1024];
     size_t split_key_len = 0;
     if (read_key_from_slot(page, split_pos, split_key_buf, &split_key_len, ps) != 0) {
-        free(insert_key_buf);
         free(new_page);
         return YQ_ERR_CORRUPT;
     }
 
-    int cmp = compare_key(insert_key_buf, key.size, split_key_buf, split_key_len);
+    int cmp = compare_key((const uint8_t *)key.data, key.size,
+                          split_key_buf, split_key_len);
 
     if (cmp < 0) {
         uint16_t new_offset = (uint16_t)(ps - YQ_PAGE_CRC_SIZE - (nkeys - split_pos) * YQ_PAGE_SLOT_SIZE - needed);
-        uint8_t *cell = new_page + new_offset;
-        size_t pos = 0;
-        memcpy(cell + pos, key_len_buf, key_len_enc);
-        pos += key_len_enc;
-        memcpy(cell + pos, key.data, key.size);
-        pos += key.size;
-        if (is_overflow) {
-            *(uint64_t *)(cell + pos) = 0;
-            pos += 8;
-            size_t total_enc = 0;
-            uint8_t total_buf[10];
-            yq_varint_encode(val.size, total_buf, &total_enc);
-            memcpy(cell + pos, total_buf, total_enc);
-        } else {
-            memcpy(cell + pos, val_len_buf, val_len_enc);
-            pos += val_len_enc;
-            memcpy(cell + pos, val.data, val.size);
-        }
+        write_leaf_cell(new_page + new_offset,
+                        key_len_buf, key_len_enc, key.data, key.size,
+                        val_len_buf, val_len_enc, val.data, val.size,
+                        is_overflow);
         for (uint16_t i = new_hdr.nkeys; i > 0; i--) {
             set_slot(new_page, i, get_slot(new_page, i - 1));
         }
@@ -303,28 +329,13 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
         new_hdr.nkeys++;
     } else {
         uint16_t new_offset = (uint16_t)(new_hdr.free_bytes - needed);
-        uint8_t *cell = new_page + new_offset;
-        size_t pos = 0;
-        memcpy(cell + pos, key_len_buf, key_len_enc);
-        pos += key_len_enc;
-        memcpy(cell + pos, key.data, key.size);
-        pos += key.size;
-        if (is_overflow) {
-            *(uint64_t *)(cell + pos) = 0;
-            pos += 8;
-            size_t total_enc = 0;
-            uint8_t total_buf[10];
-            yq_varint_encode(val.size, total_buf, &total_enc);
-            memcpy(cell + pos, total_buf, total_enc);
-        } else {
-            memcpy(cell + pos, val_len_buf, val_len_enc);
-            pos += val_len_enc;
-            memcpy(cell + pos, val.data, val.size);
-        }
+        write_leaf_cell(new_page + new_offset,
+                        key_len_buf, key_len_enc, key.data, key.size,
+                        val_len_buf, val_len_enc, val.data, val.size,
+                        is_overflow);
         set_slot(new_page, new_hdr.nkeys, new_offset);
         new_hdr.nkeys++;
     }
-    free(insert_key_buf);
 
     new_hdr.free_bytes = YQ_PAGE_HEADER_SIZE + new_hdr.nkeys * YQ_PAGE_SLOT_SIZE;
     write_page_header(new_page, &new_hdr);
@@ -396,13 +407,16 @@ static int insert_into_internal(yq_btree *bt, uint64_t page_no, uint8_t *page,
 
     uint16_t new_slot_area_size = (nkeys - split_pos) * YQ_PAGE_SLOT_SIZE;
     for (uint16_t i = 0; i < nkeys - split_pos; i++) {
-        uint16_t old_offset = get_slot(page, split_pos + i);
-        uint16_t new_offset = (uint16_t)(ps - 8 - new_slot_area_size - (i * YQ_PAGE_SLOT_SIZE) - (cell_size(page, split_pos + i, ps)));
-        set_slot(new_page, i, new_offset);
-        uint8_t *src_cell = page + old_offset;
-        uint8_t *dst_cell = new_page + new_offset;
+        /* Same hoist as the leaf split: cell_size() was called twice. */
         int csz = cell_size(page, split_pos + i, ps);
-        memcpy(dst_cell, src_cell, csz);
+        if (csz < 0) {
+            free(new_page);
+            return YQ_ERR_CORRUPT;
+        }
+        uint16_t old_offset = get_slot(page, split_pos + i);
+        uint16_t new_offset = (uint16_t)(ps - 8 - new_slot_area_size - (i * YQ_PAGE_SLOT_SIZE) - csz);
+        set_slot(new_page, i, new_offset);
+        memcpy(new_page + new_offset, page + old_offset, (size_t)csz);
         new_hdr.nkeys++;
     }
 
@@ -413,24 +427,14 @@ static int insert_into_internal(yq_btree *bt, uint64_t page_no, uint8_t *page,
                     page + get_slot(page, split_pos) + 1,
                     *(uint16_t *)(page + get_slot(page, split_pos))) >= 0) {
         uint16_t new_offset = (uint16_t)(new_hdr.free_bytes - cell_total);
-        uint8_t *cell = new_page + new_offset;
-        size_t pos = 0;
-        memcpy(cell + pos, key_len_buf, key_len_enc);
-        pos += key_len_enc;
-        memcpy(cell + pos, key.data, key.size);
-        pos += key.size;
-        *(uint64_t *)(cell + pos) = right_child;
+        write_internal_cell(new_page + new_offset, key_len_buf, key_len_enc,
+                            key.data, key.size, right_child);
         set_slot(new_page, new_hdr.nkeys, new_offset);
         new_hdr.nkeys++;
     } else {
         uint16_t new_offset = (uint16_t)(hdr.free_bytes - cell_total);
-        uint8_t *cell = page + new_offset;
-        size_t pos = 0;
-        memcpy(cell + pos, key_len_buf, key_len_enc);
-        pos += key_len_enc;
-        memcpy(cell + pos, key.data, key.size);
-        pos += key.size;
-        *(uint64_t *)(cell + pos) = right_child;
+        write_internal_cell(page + new_offset, key_len_buf, key_len_enc,
+                            key.data, key.size, right_child);
         for (uint16_t i = hdr.nkeys; i > (uint16_t)split_pos; i--) {
             set_slot(page, i, get_slot(page, i - 1));
         }
