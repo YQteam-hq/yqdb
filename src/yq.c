@@ -54,6 +54,28 @@ typedef struct pending_op {
     int is_del;
 } pending_op;
 
+/*
+ * Auxiliary index over a transaction's pending operations.
+ *
+ * pending_find() used to walk the pending array backwards, comparing every
+ * key, so a transaction that staged N writes and then issued M reads (or
+ * NOOVERWRITE puts) paid O(N*M) key comparisons. Batch/loop workloads that
+ * write then re-read the same keys inside one transaction degrade to
+ * quadratic here, and this lookup sits on both yq_get() and the
+ * YQ_PUT_NOOVERWRITE path of yq_put().
+ *
+ * The index is an open-addressing hash table keyed by the pending key bytes,
+ * storing the *newest* pending-op index for each key -- exactly what the
+ * backward scan returned. It is strictly auxiliary: pending_apply() still
+ * replays the array in insertion order, so last-write-wins is unaffected. If
+ * the table cannot be grown the code falls back to the linear scan rather than
+ * failing the write.
+ */
+typedef struct pending_slot {
+    size_t op_idx;   /* index into txn->pending */
+    uint8_t used;
+} pending_slot;
+
 struct yq_txn {
     yq_db *db;
     uint32_t flags;
@@ -65,6 +87,9 @@ struct yq_txn {
     pending_op *pending;
     size_t pending_count;
     size_t pending_cap;
+    pending_slot *pending_index;   /* key -> newest pending op index */
+    size_t pending_index_cap;      /* power of two; 0 when unallocated */
+    int pending_index_off;         /* set once indexing is abandoned */
 };
 
 struct yq_cur {
@@ -333,16 +358,123 @@ int yq_close(yq_db *db) {
     return YQ_OK;
 }
 
-static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
+/* Hash a pending key (FNV-1a); runs once per indexed lookup / insert. */
+static uint64_t pending_key_hash(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int pending_key_eq(const pending_op *op, yq_slice key) {
+    return op->key_len == key.size &&
+           (key.size == 0 || memcmp(op->key, key.data, key.size) == 0);
+}
+
+/*
+ * Find the slot holding `key`. Returns the slot when present, else NULL with
+ * *slot_out left at the free slot an insert should use.
+ */
+static pending_slot *pending_index_lookup(yq_txn *txn, yq_slice key, size_t *slot_out) {
+    size_t mask = txn->pending_index_cap - 1;
+    size_t i = (size_t)(pending_key_hash(key.data, key.size) & mask);
+    for (;;) {
+        pending_slot *s = &txn->pending_index[i];
+        if (!s->used) {
+            if (slot_out) *slot_out = i;
+            return NULL;
+        }
+        if (pending_key_eq(&txn->pending[s->op_idx], key)) {
+            if (slot_out) *slot_out = i;
+            return s;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/* (Re)build the index at `new_cap`, folding repeated keys onto one slot. */
+static int pending_index_build(yq_txn *txn, size_t new_cap) {
+    pending_slot *ns = (pending_slot *)calloc(new_cap, sizeof(pending_slot));
+    if (!ns) return YQ_ERR_NOMEM;
+
+    size_t mask = new_cap - 1;
+    for (size_t j = 0; j < txn->pending_count; j++) {
+        pending_op *op = &txn->pending[j];
+        yq_slice k;
+        yq_slice_set(&k, op->key, op->key_len);
+        size_t i = (size_t)(pending_key_hash(op->key, op->key_len) & mask);
+        /* Iterating in insertion order, a repeated key must update its existing
+         * slot instead of claiming a second one, so each key ends up with the
+         * single, newest index -- exactly what the backwards scan returned. */
+        while (ns[i].used && !pending_key_eq(&txn->pending[ns[i].op_idx], k)) {
+            i = (i + 1) & mask;
+        }
+        ns[i].used = 1;
+        ns[i].op_idx = j;
+    }
+
+    free(txn->pending_index);
+    txn->pending_index = ns;
+    txn->pending_index_cap = new_cap;
+    return YQ_OK;
+}
+
+/*
+ * Index the op just appended at `op_idx`, growing the table as needed. Returns
+ * YQ_ERR_NOMEM only when the table cannot be allocated; the caller then
+ * abandons indexing and keeps the linear scan, so a write never fails merely
+ * because the index could not grow.
+ */
+static int pending_index_put(yq_txn *txn, size_t op_idx) {
+    /* keep the load factor under 0.75 so a free slot always exists */
+    if (txn->pending_index_cap == 0 ||
+        (txn->pending_count + 1) * 4 >= txn->pending_index_cap * 3) {
+        size_t new_cap = txn->pending_index_cap ? txn->pending_index_cap * 2 : 64;
+        return pending_index_build(txn, new_cap);
+    }
+
+    pending_op *op = &txn->pending[op_idx];
+    yq_slice k;
+    yq_slice_set(&k, op->key, op->key_len);
+    size_t slot = 0;
+    (void)pending_index_lookup(txn, k, &slot);
+    txn->pending_index[slot].used = 1;
+    txn->pending_index[slot].op_idx = op_idx;
+    return YQ_OK;
+}
+
+static pending_op *pending_find_linear(yq_txn *txn, yq_slice key, size_t *idx_out) {
     for (size_t i = txn->pending_count; i > 0; i--) {
         pending_op *op = &txn->pending[i - 1];
-        if (op->key_len == key.size && memcmp(op->key, key.data, key.size) == 0) {
+        if (pending_key_eq(op, key)) {
             if (idx_out) *idx_out = i - 1;
             return op;
         }
     }
     if (idx_out) *idx_out = (size_t)-1;
     return NULL;
+}
+
+static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
+    /*
+     * O(1) amortised lookup through the index; fall back to the linear scan
+     * when the index was never built (no writes yet) or had to be abandoned.
+     */
+    if (txn->pending_index_cap == 0) {
+        return pending_find_linear(txn, key, idx_out);
+    }
+
+    size_t slot = 0;
+    pending_slot *s = pending_index_lookup(txn, key, &slot);
+    if (!s) {
+        if (idx_out) *idx_out = (size_t)-1;
+        return NULL;
+    }
+    if (idx_out) *idx_out = s->op_idx;
+    return &txn->pending[s->op_idx];
 }
 
 static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
@@ -378,11 +510,23 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
     op->val_len = vlen;
     op->is_del = is_del;
     txn->pending_count++;
+
+    /*
+     * Keep the lookup index in step with the array. If it cannot be allocated
+     * we drop it and fall back to the linear scan instead of failing the write.
+     */
+    if (!txn->pending_index_off) {
+        if (pending_index_put(txn, txn->pending_count - 1) != YQ_OK) {
+            free(txn->pending_index);
+            txn->pending_index = NULL;
+            txn->pending_index_cap = 0;
+            txn->pending_index_off = 1;
+        }
+    }
     return YQ_OK;
 }
 
 static void pending_free(yq_txn *txn) {
-    if (!txn->pending) return;
     /* key and value share a single allocation (see pending_push). */
     for (size_t i = 0; i < txn->pending_count; i++) {
         free(txn->pending[i].key);
@@ -391,6 +535,11 @@ static void pending_free(yq_txn *txn) {
     txn->pending = NULL;
     txn->pending_count = 0;
     txn->pending_cap = 0;
+
+    free(txn->pending_index);
+    txn->pending_index = NULL;
+    txn->pending_index_cap = 0;
+    txn->pending_index_off = 0;
 }
 
 static int pending_apply(yq_txn *txn) {
