@@ -76,6 +76,23 @@ static int search_entry(yq_memtable *mt, const yq_slice *key, size_t *idx) {
     return 0;
 }
 
+/*
+ * Ensure the entry array can hold one more slot. Both yq_memtable_put() and
+ * yq_memtable_del() append exactly one entry at the same spot, so they share
+ * the identical grow-then-insert shape. Funnel the grow logic here so the two
+ * call sites cannot drift apart (and stay consistent with the cap == 0 ->
+ * 256 initial capacity used at creation time).
+ */
+static int mt_grow_entries(yq_memtable *mt) {
+    if (mt->num_entries < mt->cap_entries) return YQ_OK;
+    size_t new_cap = mt->cap_entries ? mt->cap_entries * 2 : 256;
+    mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
+    if (!new_entries) return YQ_ERR_NOMEM;
+    mt->entries = new_entries;
+    mt->cap_entries = new_cap;
+    return YQ_OK;
+}
+
 yq_memtable *yq_memtable_create(size_t max_bytes) {
     if (max_bytes == 0) max_bytes = 64 * 1024 * 1024;
 
@@ -129,13 +146,7 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
         return YQ_OK;
     }
 
-    if (mt->num_entries >= mt->cap_entries) {
-        size_t new_cap = mt->cap_entries * 2;
-        mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
-        if (!new_entries) return YQ_ERR_NOMEM;
-        mt->entries = new_entries;
-        mt->cap_entries = new_cap;
-    }
+    if (mt_grow_entries(mt) != YQ_OK) return YQ_ERR_NOMEM;
 
     size_t koff = 0, voff = 0;
     int rc = alloc_copy(mt, key.data, key.size, &koff);
@@ -177,13 +188,7 @@ int yq_memtable_del(yq_memtable *mt, yq_slice key) {
         return YQ_OK;
     }
 
-    if (mt->num_entries >= mt->cap_entries) {
-        size_t new_cap = mt->cap_entries * 2;
-        mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
-        if (!new_entries) return YQ_ERR_NOMEM;
-        mt->entries = new_entries;
-        mt->cap_entries = new_cap;
-    }
+    if (mt_grow_entries(mt) != YQ_OK) return YQ_ERR_NOMEM;
 
     size_t koff = 0;
     int rc = alloc_copy(mt, key.data, key.size, &koff);
