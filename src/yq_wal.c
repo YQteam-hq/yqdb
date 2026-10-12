@@ -8,13 +8,6 @@
 #define YQ_WAL_HEADER_SIZE 29
 #define YQ_WAL_MAX_KEY_SIZE 1024
 #define YQ_WAL_VARINT_MAX   10
-#define YQ_WAL_STACK_ENC    2048
-
-/*
- * yq_wal_append_put() 的栈缓冲上限：payload 不超过 YQ_WAL_STACK_ENC (2 KiB)
- * 就走栈缓冲，否则回退到堆分配。取 2 KiB 是为了覆盖"小 key + 小 value"这一
- * 热路径，同时不至于把栈压得过大。
- */
 
 #define WAL_TYPE_BEGIN   1
 #define WAL_TYPE_PUT     2
@@ -106,8 +99,24 @@ static int ensure_buf_space(yq_wal *wal, size_t need) {
     return YQ_OK;
 }
 
-static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
-                         const uint8_t *payload, size_t paylen) {
+/*
+ * Reserve space for one record and write its (CRC-less) header, handing the
+ * caller a pointer to the payload area to fill in place.
+ *
+ * yq_wal_append_put()/del() used to build the payload in a scratch buffer and
+ * pass it to append_record(), which copied it into the log buffer -- the whole
+ * value was memcpy'd twice (and malloc'd once for anything past the small
+ * stack buffer). Encoders now write straight into the reserved log buffer, so
+ * a PUT/DEL record costs a single copy from the caller's key/value.
+ *
+ * The header/payload CRCs are still stamped by yq_wal_flush(), the only place
+ * that turns buffered bytes into on-disk records.
+ */
+static int append_record_reserve(yq_wal *wal, uint64_t txn_id, int rec_type,
+                                 size_t paylen, uint8_t **out_payload) {
+    /* The length field is 4 bytes; reject anything that cannot be encoded. */
+    if (paylen > 0xFFFFFFFFu) return YQ_ERR_TOOBIG;
+
     size_t total = YQ_WAL_HEADER_SIZE + paylen;
     int rc = ensure_buf_space(wal, total);
     if (rc != YQ_OK) return rc;
@@ -118,18 +127,25 @@ static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
     memcpy(p + 0, &lsn, 8);
     memcpy(p + 8, &txn_id, 8);
     p[16] = (uint8_t)rec_type;
-    memcpy(p + 17, &paylen, 4);
-
-    /* The header/payload CRC fields are NOT computed here. yq_wal_flush()
-     * recomputes both CRCs from scratch (it is the only place that stamps
-     * them) right before any byte is written to disk, so computing them at
-     * encode time would be dead, redundant work on every append. */
-
-    if (paylen > 0 && payload) {
-        memcpy(p + YQ_WAL_HEADER_SIZE, payload, paylen);
-    }
+    /* Write the length as an explicit uint32_t rather than memcpy'ing the low
+     * bytes of a size_t, so the on-disk field width is unambiguous. */
+    uint32_t pl = (uint32_t)paylen;
+    memcpy(p + 17, &pl, 4);
 
     wal->buf_used += total;
+    *out_payload = p + YQ_WAL_HEADER_SIZE;
+    return YQ_OK;
+}
+
+static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
+                         const uint8_t *payload, size_t paylen) {
+    uint8_t *dst = NULL;
+    int rc = append_record_reserve(wal, txn_id, rec_type, paylen, &dst);
+    if (rc != YQ_OK) return rc;
+
+    if (paylen > 0 && payload) {
+        memcpy(dst, payload, paylen);
+    }
     return YQ_OK;
 }
 
@@ -140,11 +156,10 @@ int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id) {
 /*
  * PUT 记录 payload = varint(key_len) + key + varint(val_len) + val。
  *
- * key 上限 1024 字节、val 上限 1 GiB（见 yq_put），所以 payload 不适合放在
- * 栈上定长数组里：旧实现用 uint8_t enc_buf[2048] 且 memcpy 前不做边界检查，
- * 任何 > ~2KB 的 value 都会写爆栈（ASan: stack-buffer-overflow @ yq_wal.c）。
- * 这里改为按需小缓冲：小 payload 走 YQ_WAL_STACK_ENC (2 KiB) 栈缓冲避免堆分配，
- * 大 payload 回退到堆缓冲，两条路径都不再有溢出可能。
+ * 现在直接把 payload 编码进日志缓冲：append_record_reserve() 预留空间并写头，
+ * 这里再顺序写入 varint/key/varint/val。旧的"先编码到栈缓冲(>2KiB 则堆)再让
+ * append_record() memcpy 进日志"的写法对每个 PUT 都要多复制一整份 value
+ * （大 value 还多一次 malloc/free），这条路径在每次提交上都跑。
  */
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) {
     if (!wal) return YQ_ERR_INVAL;
@@ -152,13 +167,6 @@ int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) 
     if (!key.data) return YQ_ERR_INVAL;
     if (val.size > 0 && !val.data) return YQ_ERR_INVAL;
 
-    /*
-     * Payload layout is varint(key_len) key varint(val_len) val. Values are
-     * bounded only by the engine limit (1 GiB), so a fixed stack buffer would
-     * overflow as soon as a value exceeds it. Encode into a stack buffer when
-     * the record is small -- the overwhelmingly common case -- and fall back
-     * to the heap for anything larger.
-     */
     uint8_t klen_buf[YQ_WAL_VARINT_MAX];
     uint8_t vlen_buf[YQ_WAL_VARINT_MAX];
     size_t nk = 0, nv = 0;
@@ -169,45 +177,37 @@ int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) 
     if (val.size > SIZE_MAX - (nk + key.size + nv)) return YQ_ERR_TOOBIG;
     size_t total = nk + key.size + nv + val.size;
 
-    uint8_t stack_buf[YQ_WAL_STACK_ENC];
-    uint8_t *enc = stack_buf;
-    if (total > sizeof(stack_buf)) {
-        enc = (uint8_t *)malloc(total);
-        if (!enc) return YQ_ERR_NOMEM;
-    }
+    uint8_t *dst = NULL;
+    int rc = append_record_reserve(wal, txn_id, WAL_TYPE_PUT, total, &dst);
+    if (rc != YQ_OK) return rc;
 
     size_t pos = 0;
-    memcpy(enc + pos, klen_buf, nk);
+    memcpy(dst + pos, klen_buf, nk);
     pos += nk;
-    memcpy(enc + pos, key.data, key.size);
+    memcpy(dst + pos, key.data, key.size);
     pos += key.size;
-    memcpy(enc + pos, vlen_buf, nv);
+    memcpy(dst + pos, vlen_buf, nv);
     pos += nv;
-    if (val.size) memcpy(enc + pos, val.data, val.size);
-
-    int rc = append_record(wal, txn_id, WAL_TYPE_PUT, enc, total);
-    if (enc != stack_buf) free(enc);
-    return rc;
+    if (val.size) memcpy(dst + pos, val.data, val.size);
+    return YQ_OK;
 }
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
     if (!wal) return YQ_ERR_INVAL;
     if (!key.data || key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
 
-    uint8_t enc_buf[YQ_WAL_MAX_KEY_SIZE + YQ_WAL_VARINT_MAX];
+    /* payload = varint(key_len) + key, written straight into the log buffer. */
+    uint8_t klen_buf[YQ_WAL_VARINT_MAX];
     size_t nk = 0;
-    if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
-    /*
-     * Overflow-safe upper bound: nk and key.size are both size_t, so their sum
-     * cannot wrap and the comparison is exact. The previous form subtracted nk
-     * from a size_t and leaned on unsigned underflow to produce a huge bound
-     * when nk > sizeof(enc_buf) -- an impossible input today, but a fragile
-     * construct the moment the buffer size or key limit is ever retuned.
-     */
-    if (nk + key.size > sizeof(enc_buf)) return YQ_ERR_TOOBIG;
-    memcpy(enc_buf + nk, key.data, key.size);
+    if (yq_varint_encode(key.size, klen_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
 
-    return append_record(wal, txn_id, WAL_TYPE_DEL, enc_buf, nk + key.size);
+    uint8_t *dst = NULL;
+    int rc = append_record_reserve(wal, txn_id, WAL_TYPE_DEL, nk + key.size, &dst);
+    if (rc != YQ_OK) return rc;
+
+    memcpy(dst, klen_buf, nk);
+    memcpy(dst + nk, key.data, key.size);
+    return YQ_OK;
 }
 
 int yq_wal_append_commit(yq_wal *wal, uint64_t txn_id) {
