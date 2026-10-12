@@ -135,10 +135,43 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
 
     if (found) {
         mt_entry *e = &mt->entries[idx];
-        if (!e->tombstone) mt->used_bytes -= entry_cost(e->key_len, e->val_len);
+
+        /*
+         * Overwrite in place when the new value fits the slot the entry already
+         * owns. The arena is a bump allocator that never reclaims, so
+         * re-allocating on every update left the previous value bytes stranded
+         * and grew the arena without bound for update-heavy workloads -- after
+         * enough overwrites yq_memblk_alloc() fails and the PUT returns
+         * YQ_ERR_NOMEM even though used_bytes (the logical accounting) stayed
+         * tiny. Writing into the existing slot bounds arena usage by the number
+         * of distinct live keys instead of the total number of writes.
+         *
+         * A tombstone owns no value region (val_len == 0), so it still falls
+         * through to a fresh allocation.
+         */
+        if (!e->tombstone && val.size <= e->val_len) {
+            if (val.size) {
+                uint8_t *base = (uint8_t *)yq_memblk_base(mt->arena);
+                memcpy(base + e->val_offset, val.data, val.size);
+            }
+            mt->used_bytes -= entry_cost(e->key_len, e->val_len);
+            e->val_len = val.size;
+            e->tombstone = 0;
+            mt->used_bytes += cost;
+            return YQ_OK;
+        }
+
+        /*
+         * The value must move to a fresh slot. Allocate first and only adjust
+         * the accounting once the allocation succeeded: the previous order
+         * (subtract, then allocate) left used_bytes permanently short by the
+         * old entry's cost whenever the allocation failed, even though the
+         * entry itself was left untouched.
+         */
         size_t voff = 0;
         int rc = alloc_copy(mt, val.data, val.size, &voff);
         if (rc != YQ_OK) return rc;
+        if (!e->tombstone) mt->used_bytes -= entry_cost(e->key_len, e->val_len);
         e->val_offset = voff;
         e->val_len = val.size;
         e->tombstone = 0;
