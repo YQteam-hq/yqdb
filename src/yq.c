@@ -353,29 +353,39 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
         txn->pending = na;
         txn->pending_cap = nc;
     }
+    /*
+     * Key and value live in one allocation, the value immediately after the
+     * key. yq_put()/yq_del() stage every write of a transaction here, so this
+     * runs once per write and used to cost two malloc() calls and later two
+     * free() calls per staged operation. One call halves the allocator traffic
+     * and puts the two halves of a record next to each other, which is also
+     * the order pending_apply() reads them back in.
+     */
+    size_t klen = key.size;
+    size_t vlen = is_del ? 0 : val.size;
+    size_t total = klen + vlen;
+
+    uint8_t *block = (uint8_t *)malloc(total ? total : 1);
+    if (!block) return YQ_ERR_NOMEM;
+
     pending_op *op = &txn->pending[txn->pending_count];
-    op->key = malloc(key.size ? key.size : 1);
-    if (!op->key) return YQ_ERR_NOMEM;
-    memcpy(op->key, key.data, key.size);
-    op->key_len = key.size;
-    op->val = NULL;
-    op->val_len = 0;
+    op->key = block;
+    if (klen) memcpy(block, key.data, klen);
+    op->key_len = klen;
+    /* Deletes keep val NULL; the pointer is never read for those. */
+    op->val = vlen ? block + klen : NULL;
+    if (vlen) memcpy(block + klen, val.data, vlen);
+    op->val_len = vlen;
     op->is_del = is_del;
-    if (!is_del) {
-        op->val = malloc(val.size ? val.size : 1);
-        if (!op->val) { free(op->key); return YQ_ERR_NOMEM; }
-        memcpy(op->val, val.data, val.size);
-        op->val_len = val.size;
-    }
     txn->pending_count++;
     return YQ_OK;
 }
 
 static void pending_free(yq_txn *txn) {
     if (!txn->pending) return;
+    /* key and value share a single allocation (see pending_push). */
     for (size_t i = 0; i < txn->pending_count; i++) {
         free(txn->pending[i].key);
-        free(txn->pending[i].val);
     }
     free(txn->pending);
     txn->pending = NULL;
