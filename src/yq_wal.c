@@ -228,21 +228,20 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
 int yq_wal_flush(yq_wal *wal) {
     if (!wal || wal->buf_used == 0) return YQ_OK;
 
-    size_t offset = wal->file_size;
+    /*
+     * Pass 1 -- stamp both CRCs for every buffered record. The header CRC
+     * covers YQ_WAL_HEADER_SIZE bytes with the two CRC fields (header_crc at
+     * +21, payload_crc at +25) zeroed out. Instead of copying the whole header
+     * into a scratch buffer and zeroing it there, zero the two fields in place,
+     * CRC the record directly, then stamp header_crc -- one small memcpy instead
+     * of five.
+     */
     size_t pos = 0;
-
     while (pos < wal->buf_used) {
         uint8_t *rec = wal->buf + pos;
         uint64_t lsn = ++wal->last_lsn;
         memcpy(rec + 0, &lsn, 8);
 
-        /*
-         * The header CRC covers YQ_WAL_HEADER_SIZE bytes with the two CRC
-         * fields (header_crc at +21, payload_crc at +25) zeroed out. Instead
-         * of copying the whole header into a scratch buffer and zeroing it
-         * there, zero the two fields in place, CRC the record directly, then
-         * stamp header_crc -- one small memcpy instead of five.
-         */
         uint32_t zero = 0;
         memcpy(rec + 21, &zero, 4);
         memcpy(rec + 25, &zero, 4);
@@ -257,14 +256,20 @@ int yq_wal_flush(yq_wal *wal) {
         }
         memcpy(rec + 25, &payload_crc, 4);
 
-        int rc = yq_file_pwrite(wal->file, rec, YQ_WAL_HEADER_SIZE + payload_len, offset);
-        if (rc != YQ_OK) return rc;
-
-        offset += YQ_WAL_HEADER_SIZE + payload_len;
         pos += YQ_WAL_HEADER_SIZE + payload_len;
     }
 
-    int rc = yq_file_sync(wal->file);
+    /*
+     * Pass 2 -- write the whole buffer in a single pwrite instead of one
+     * syscall per record. The records are already contiguous starting at
+     * file_size, and yq_file_pwrite() loops internally for short writes /
+     * EINTR, so one call transfers exactly buf_used bytes. This removes one
+     * write() syscall per committed record from the commit hot path.
+     */
+    int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, wal->file_size);
+    if (rc != YQ_OK) return rc;
+
+    rc = yq_file_sync(wal->file);
     if (rc != YQ_OK) return rc;
 
     wal->file_size += wal->buf_used;
