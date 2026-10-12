@@ -15,6 +15,7 @@ embedded storage engines of the same class — **SQLite** (B-tree, WAL mode) and
 - [Workload](#workload)
 - [Results](#results)
 - [Analysis](#analysis)
+- [1.0.0 → 1.1.0 Upgrade Benchmark](#100--110-upgrade-benchmark)
 - [On-disk Footprint](#on-disk-footprint)
 - [Known Limitations Behind the Numbers](#known-limitations-behind-the-numbers)
 - [Reproducing](#reproducing)
@@ -181,6 +182,132 @@ reported in **seconds** (lower is better).
 - For **SQLite** and **LMDB**, `nosync` substantially lifts write throughput
   (for example LMDB sequential insert climbs from ~1.0 M to ~2.8 M ops/s), at the
   expected cost of durability.
+
+---
+
+## 1.0.0 → 1.1.0 Upgrade Benchmark
+
+A targeted 1.0.0 vs 1.1.0 comparison on the **same machine, same driver, same
+workload** (the matrix above is across engines; this section is across
+releases of the same engine). Headline:
+
+> **1.1.0's only meaningful performance gain over 1.0.0 is `reopen` — WAL
+> replay + recovery — about 1.45× on random keys and 9.4× on sequential keys.
+> `insert`, `read`, `scan`, `update`, and `delete` are all statistically
+> unchanged (within ±20% noise).**
+
+### What changed under the hood
+
+The write path (`src/yq_memtable.c`, `yq_put`, `pending_apply`,
+`yq_txn_commit`) is **byte-for-byte identical** between 1.0.0 and 1.1.0 (md5
+match), so `insert` cannot have moved. The wins live entirely in the recovery
+path:
+
+- **`yq_wal_scan()` rewritten as a 64 KiB buffered reader**
+  (`src/yq_wal.c`). 1.0 issued **two `pread` calls plus one `malloc` per
+  record** — replaying 100k PUTs + 200 begin/commit records meant
+  ≈ 200,000 syscalls. 1.1 reads 64 KiB chunks into a single buffer and
+  parses in place — the same 14.7 MB log is covered in ≈ 224 `pread` calls,
+  and payloads are reused out of a single scratch buffer.
+- **Open-addressed hash set for the "is this txn committed?" check**
+  (`src/yq_recover.c`). 1.0's `ctx_is_committed()` linearly scanned the
+  committed-txn array — **O(operations × txns)**. 1.1 hashes the txn id,
+  collapsing recovery to **O(operations)**, and folds keys/values into two
+  append-only arenas (saving 100k per-record `malloc` calls).
+
+### Why `rand` only reaps 1.45× but `seq` reaps 9.4×
+
+Reopen time decomposes as:
+
+```
+reopen  ≈  memtable replay cost  +  WAL scan/recovery fixed overhead
+          (same in both versions,    (the part 1.1 optimized away)
+           memtable unchanged)
+
+seq :  1.0 = ~0   + 2.06 s   →   1.1 = ~0   + 0.22 s    →  ~9.4×
+rand:  1.0 = ~3.0 + 2.06 s   →   1.1 = ~3.3 + 0.22 s    →  ~1.45×
+```
+
+The fixed overhead saved (~1.84 s) is identical in both cases. With
+sequential keys the memtable replay cost is ~0 (tail append), so the savings
+dominate. With random keys the same ~3 s of `memmove` cost is paid in both
+versions, diluting the speedup to 1.45×.
+
+### Results — `normal` mode (seconds, best of 3)
+
+| Phase | 1.0.0 rand | 1.1.0 rand | rand speedup | 1.0.0 seq | 1.1.0 seq | seq speedup |
+|-------|-----------:|-----------:|-------------:|----------:|----------:|------------:|
+| insert | 3.565 | 3.575 | ×1.00 | 0.352 | 0.362 | ×0.97 |
+| read_hit | 0.052 | 0.045 | ×1.14 | 0.043 | 0.043 | ×1.00 |
+| read_miss | 0.013 | 0.011 | ×1.18 | 0.013 | 0.011 | ×1.17 |
+| scan | 0.001 | 0.001 | ×1.08 | 0.001 | 0.001 | ×1.04 |
+| update | 0.464 | 0.391 | ×1.19 | 0.396 | 0.398 | ×1.00 |
+| delete | 0.313 | 0.306 | ×1.02 | 0.305 | 0.313 | ×0.97 |
+| **reopen** | **4.977** | **3.363** | **×1.48** | **2.004** | **0.210** | **×9.55** |
+
+### Results — `nosync` mode (seconds, best of 3)
+
+| Phase | 1.0.0 rand | 1.1.0 rand | rand speedup | 1.0.0 seq | 1.1.0 seq | seq speedup |
+|-------|-----------:|-----------:|-------------:|----------:|----------:|------------:|
+| insert | 3.382 | 3.547 | ×0.95 | 0.345 | 0.355 | ×0.97 |
+| read_hit | 0.045 | 0.050 | ×0.91 | 0.040 | 0.043 | ×0.93 |
+| read_miss | 0.013 | 0.011 | ×1.20 | 0.013 | 0.012 | ×1.12 |
+| scan | 0.001 | 0.001 | ×1.00 | 0.001 | 0.001 | ×1.02 |
+| update | 0.392 | 0.413 | ×0.95 | 0.383 | 0.395 | ×0.97 |
+| delete | 0.306 | 0.312 | ×0.98 | 0.291 | 0.305 | ×0.95 |
+| **reopen** | **5.117** | **3.311** | **×1.55** | **2.032** | **0.210** | **×9.66** |
+
+> "speedup" = `1.0 time / 1.1 time`; > 1 means 1.1 is faster.
+
+### Environmental sanity check
+
+To confirm the comparison itself is valid, the local 1.0.0 numbers were
+diffed against the official 1.0.0 numbers used to produce the matrix above:
+
+| Config | Phase | Official 1.0.0 (s) | Local 1.0.0 (s) | Δ |
+|---|---|---:|---:|---:|
+| normal / rand | insert | 3.043 | 3.565 | +17.2 % |
+| normal / rand | reopen | 4.761 | 4.977 | +4.5 % |
+| normal / seq | insert | 0.341 | 0.352 | +3.4 % |
+| normal / seq | reopen | 2.110 | 2.004 | −5.0 % |
+
+`reopen` and `seq insert` agree within ±5 %; the local machine produces
+slightly slower `rand insert` (Windows/MinGW vs the official Linux host).
+**Because both 1.0 and 1.1 were re-run on the same local box, the 1.0↔1.1
+ratio is unaffected by the absolute drift.**
+
+### Data-safety fixes (no perf impact, but shipped in 1.1.0)
+
+These do not move the benchmark numbers but are part of what 1.1.0 delivers:
+
+- `yq_checkpoint()` no longer calls `yq_wal_truncate(wal, 0)` (which in 1.0
+  erased the only durable copy of the data). 1.1.0 uses
+  `wal_compact_from_memtable()` — rewrite the memtable's live contents into
+  a new log and rename it atomically.
+- `YQ_TXN_READONLY` was 0 in 1.0, so `flags & YQ_TXN_READONLY` was always
+  false — read-only transactions never registered a snapshot (MVCC
+  effectively broken) and could still write. 1.1.0 checks the read-only bit
+  explicitly and rejects writes on read-only handles (`YQ_ERR_READONLY`).
+- `yq_wal_append_put`'s 2 KiB on-stack buffer overflowed for larger values;
+  1.1.0 adds a bound check and falls back to a heap buffer.
+- The auxiliary `log_path[512]` silently truncated long db names; 1.1.0
+  promotes it to `YQ_MAX_PATH` with explicit length validation.
+
+### Reading these numbers
+
+- The 1.0↔1.1 comparison is **not a cross-engine** comparison: the
+  matrix above already shows yq-DB's standing against SQLite and LMDB, and
+  this section only says what changed *within* yq-DB between releases.
+- A 1.0↔1.1 insert number drifting in either direction by up to 20 % is
+  measurement noise; the write path is identical, so the **expected delta
+  is 1.0×** and any deviation is a sign to rerun, not a regression.
+- The reopening speedup is the headline. 1.1.0 takes yq-DB from
+  "seconds" down to "sub-second" for sequential data — still much slower
+  than SQLite/LMDB (milliseconds), but no longer the multi-second
+  open-time cliff the matrix above attributes to 1.0.0.
+
+The full unedited report is preserved as
+[`docs/COMPARE-1.0-1.1.md`](COMPARE-1.0-1.1.md).
 
 ---
 

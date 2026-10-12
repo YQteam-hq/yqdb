@@ -292,6 +292,9 @@ Current release is **1.1.0**. Please note the following boundaries:
    B+Tree page spilling beyond checkpoint scope remains a reserved capability:
    - Data is recoverable from `path.log` after a close;
    - `path.log` grows while the process runs without a checkpoint.
+   - Recovery cost in 1.1.0 vs 1.0.0: ~1.45× faster on random keys and
+     ~9.4× faster on sequential keys (same-machine comparison; see
+     [BENCHMARKS → 1.0.0 → 1.1.0 Upgrade Benchmark](docs/BENCHMARKS.md#100--110-upgrade-benchmark)).
 2. **Single writer.** At most one read-write transaction exists at a time,
    enforced across processes by `path.lock`; read-only transactions run
    concurrently up to `max_readers`.
