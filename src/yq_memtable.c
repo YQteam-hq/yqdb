@@ -312,6 +312,33 @@ int yq_memtable_iter_prev(yq_memtable_iter *it) {
     return YQ_OK;
 }
 
+int yq_memtable_iter_seek(yq_memtable_iter *it, yq_slice key) {
+    if (!it || !it->mt) return YQ_ERR_INVAL;
+
+    yq_memtable *mt = it->mt;
+
+    /*
+     * search_entry() already does a binary search and hands back the index of
+     * the first entry whose key is >= the target (or num_entries when every
+     * key is smaller). Tombstones keep their key in the sorted array, so the
+     * returned index is the correct lower bound across both live and deleted
+     * entries; we then skip any deleted entries to land on the first *live*
+     * key >= target.
+     */
+    size_t idx;
+    search_entry(mt, &key, &idx);
+
+    while (idx < mt->num_entries && mt->entries[idx].tombstone) idx++;
+
+    if (idx >= mt->num_entries) {
+        it->pos = mt->num_entries;   /* leave the iterator invalid */
+        return YQ_ERR_NOTFOUND;
+    }
+
+    it->pos = idx;
+    return YQ_OK;
+}
+
 int yq_memtable_iter_key(yq_memtable_iter *it, yq_slice *out) {
     if (!it || !it->mt || it->pos >= it->mt->num_entries) {
         return YQ_ERR_CURSOR;

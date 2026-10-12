@@ -722,16 +722,12 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
         else if (rc != YQ_ERR_NOTFOUND) return rc;
     }
 
-    /* Position the memtable iterator at the first key >= target. */
+    /* Position the memtable iterator at the first key >= target. The iterator
+     * seeks with a binary search (O(log n)) instead of a linear scan over every
+     * entry, which matters for the memtable's merge-order cursor positioning. */
     int mt_found = 0;
     if (c->mt_iter) {
-        int rc = yq_memtable_iter_first(c->mt_iter);
-        while (rc == YQ_OK) {
-            yq_slice k;
-            if (yq_memtable_iter_key(c->mt_iter, &k) != YQ_OK) break;
-            if (yq_slice_compare(&k, &key) >= 0) { mt_found = 1; break; }
-            rc = yq_memtable_iter_next(c->mt_iter);
-        }
+        if (yq_memtable_iter_seek(c->mt_iter, key) == YQ_OK) mt_found = 1;
     }
 
     /* Merge order visits the memtable first, then the tree; pick the first
