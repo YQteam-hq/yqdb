@@ -844,6 +844,21 @@ int yq_btree_cursor_last(yq_btree_cursor *c) {
 
 int yq_btree_cursor_next(yq_btree_cursor *c) {
     if (!c->valid) return YQ_ERR_CURSOR;
+
+    /*
+     * Fast path: another slot exists in the current leaf.
+     *
+     * slot_count mirrors the leaf's nkeys -- every entry point that lands on a
+     * leaf (first/last/seek and the cross-leaf step below) sets it -- so
+     * stepping forward inside the leaf needs neither the page data nor the
+     * page header. This is the common case in a forward scan and it removes a
+     * page lookup plus a header parse from every step that stays in the leaf.
+     */
+    if ((int)c->slot_idx + 1 < (int)c->slot_count) {
+        c->slot_idx++;
+        return YQ_OK;
+    }
+
     yq_btree *bt = c->bt;
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
@@ -852,6 +867,7 @@ int yq_btree_cursor_next(yq_btree_cursor *c) {
 
     c->slot_idx++;
     if (c->slot_idx < hdr.nkeys) {
+        c->slot_count = hdr.nkeys;
         return YQ_OK;
     }
 
@@ -875,16 +891,23 @@ int yq_btree_cursor_next(yq_btree_cursor *c) {
 
 int yq_btree_cursor_prev(yq_btree_cursor *c) {
     if (!c->valid) return YQ_ERR_CURSOR;
+
+    /*
+     * Fast path: step back inside the current leaf. The page data and its
+     * header are only consulted when the step crosses into the left sibling,
+     * so this branch runs before either is fetched -- one less page lookup and
+     * header parse per key in a backward scan.
+     */
+    if (c->slot_idx > 0) {
+        c->slot_idx--;
+        return YQ_OK;
+    }
+
     yq_btree *bt = c->bt;
     uint8_t *page = get_page_data(bt, c->leaf_page);
     if (!page) return YQ_ERR_IO;
     yq_page_header hdr;
     read_page_header(page, &hdr);
-
-    if (c->slot_idx > 0) {
-        c->slot_idx--;
-        return YQ_OK;
-    }
 
     if (hdr.left_sibling == 0) {
         c->valid = 0;
