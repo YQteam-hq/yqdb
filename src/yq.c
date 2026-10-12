@@ -746,8 +746,16 @@ int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
      */
     int rc = yq_cur_seek(c, key);
     if (rc != YQ_OK) {
-        /* yq_cur_seek() already left the cursor in its not-found state. */
-        return YQ_ERR_NOTFOUND;
+        /*
+         * Propagate yq_cur_seek()'s error verbatim. It returns NOTFOUND for a
+         * genuine miss, but it also forwards YQ_ERR_IO and YQ_ERR_CORRUPT from
+         * the B+Tree descent (unreadable page, failed page CRC, undecodable
+         * slot). Flattening those into NOTFOUND would tell a caller that a key
+         * is absent when the database is in fact damaged -- and YQ_ERR_CORRUPT
+         * is documented in yq.h as the signal that the library has stopped
+         * offering write capability.
+         */
+        return rc;
     }
 
     yq_slice k;
