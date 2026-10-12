@@ -152,6 +152,20 @@ uint32_t yq_crc32c(const void *data, size_t len) {
 }
 
 int yq_varint_encode(uint64_t val, uint8_t *out, size_t *nout) {
+    /*
+     * Single-byte fast path, mirroring the decode side's up-front check. Values
+     * below 128 cover the overwhelming majority of key/value lengths, the small
+     * page offsets used throughout the B+Tree, and most WAL payload sizes. This
+     * routine runs on every WAL append (yq_wal_append_put/del), every B+Tree
+     * cell encode, and every meta-block serialization, so handling the common
+     * case first skips the loop, the per-iteration mask/shift, and the branchy
+     * tail.
+     */
+    if (val < 0x80) {
+        if (out) out[0] = (uint8_t)val;
+        *nout = 1;
+        return YQ_OK;
+    }
     size_t n = 0;
     while (val >= 0x80) {
         if (out) out[n] = (uint8_t)((val & 0x7F) | 0x80);
