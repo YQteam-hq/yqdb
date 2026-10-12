@@ -452,9 +452,32 @@ static int insert_into_internal(yq_btree *bt, uint64_t page_no, uint8_t *page,
     uint8_t *rightmost = (uint8_t *)(page + ps - 8);
     *(uint64_t *)(new_page + ps - 8) = *(uint64_t *)rightmost;
 
+    /*
+     * Decide which half of the split the new separator belongs to by comparing
+     * it against the key sitting at split_pos.
+     *
+     * That key is stored as varint(key_len) key, exactly like every other cell
+     * in the tree, so both its length and its start have to be decoded -- the
+     * previous form read the length as a raw uint16 at the cell start and took
+     * the key to begin at cell+1. That only ever looked right while the length
+     * varint was a single byte (keys shorter than 128 bytes); for a longer key
+     * the varint spills into a second byte, so the comparison was made against
+     * a bogus length and a pointer that started in the middle of the varint.
+     * The separator then landed on the wrong side of the split, silently
+     * misrouting lookups once B+Tree spilling is wired up.
+     */
+    uint16_t split_off = get_slot(page, split_pos);
+    const uint8_t *split_cell = page + split_off;
+    size_t split_kpos = 0;
+    uint64_t split_klen = 0;
+    if (yq_varint_decode(split_cell, ps - split_off, &split_klen, &split_kpos) != 0 ||
+        split_kpos + split_klen > (size_t)(ps - split_off)) {
+        free(new_page);
+        return YQ_ERR_CORRUPT;
+    }
+
     if (compare_key((const uint8_t *)key.data, key.size,
-                    page + get_slot(page, split_pos) + 1,
-                    *(uint16_t *)(page + get_slot(page, split_pos))) >= 0) {
+                    split_cell + split_kpos, (size_t)split_klen) >= 0) {
         uint16_t new_offset = (uint16_t)(new_hdr.free_bytes - cell_total);
         write_internal_cell(new_page + new_offset, key_len_buf, key_len_enc,
                             key.data, key.size, right_child);
