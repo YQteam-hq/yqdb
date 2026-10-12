@@ -209,6 +209,35 @@ static int find_slot(const uint8_t *page, const uint8_t *key, size_t key_len, ui
     return lo;
 }
 
+/*
+ * Resolve the child page to descend into from an internal page when a search has
+ * landed at `slot` (0..nkeys). When slot == nkeys the search ran past every key
+ * and the rightmost child pointer -- stored in the page tail -- is followed;
+ * otherwise the child is the 8-byte field trailing the key in cell[slot].
+ *
+ * This block was duplicated verbatim in every internal-page descent (insert,
+ * lookup, delete and cursor seek). The copies must stay byte-for-byte identical
+ * or the traversals diverge, so they are consolidated here. Returns YQ_OK, or
+ * YQ_ERR_CORRUPT on a malformed/overflowing cell.
+ */
+static int read_child_ptr(const uint8_t *page, uint32_t ps,
+                          int slot, int nkeys, uint64_t *child) {
+    if (slot >= nkeys) {
+        *child = *(const uint64_t *)(page + ps - 8);
+        return YQ_OK;
+    }
+    uint16_t offset = get_slot(page, (uint16_t)slot);
+    const uint8_t *cell = page + offset;
+    size_t n = 0;
+    uint64_t klen;
+    size_t avail = ps - offset;
+    if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
+        return YQ_ERR_CORRUPT;
+    }
+    *child = *(const uint64_t *)(cell + n + klen);
+    return YQ_OK;
+}
+
 static int read_key_from_slot(const uint8_t *page, uint16_t slot_idx, uint8_t *key_buf, size_t *key_len, uint32_t page_size) {
     uint16_t offset = get_slot(page, slot_idx);
     uint8_t *cell = (uint8_t *)page + offset;
@@ -583,18 +612,8 @@ int yq_btree_insert(yq_btree *bt, yq_slice key, yq_slice val) {
 
         int slot = find_slot(page, (const uint8_t *)key.data, key.size, hdr.nkeys, bt->page_size);
         uint64_t child;
-        if (slot >= (int)hdr.nkeys) {
-            child = *(uint64_t *)(page + bt->page_size - 8);
-        } else {
-            uint16_t offset = get_slot(page, (uint16_t)slot);
-            uint8_t *cell = page + offset;
-            size_t n = 0;
-            uint64_t klen;
-            size_t avail = bt->page_size - offset;
-            if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
-                return YQ_ERR_CORRUPT;
-            }
-            child = *(uint64_t *)(cell + n + klen);
+        if (read_child_ptr(page, bt->page_size, slot, (int)hdr.nkeys, &child) != YQ_OK) {
+            return YQ_ERR_CORRUPT;
         }
         cur_page = child;
     }
@@ -645,18 +664,8 @@ int yq_btree_lookup(yq_btree *bt, yq_slice key, yq_slice *out) {
 
         int slot = find_slot(page, (const uint8_t *)key.data, key.size, hdr.nkeys, ps);
         uint64_t child;
-        if (slot >= (int)hdr.nkeys) {
-            child = *(uint64_t *)(page + ps - 8);
-        } else {
-            uint16_t offset = get_slot(page, (uint16_t)slot);
-            uint8_t *cell = page + offset;
-            size_t n = 0;
-            uint64_t klen;
-            size_t avail = ps - offset;
-            if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
-                return YQ_ERR_CORRUPT;
-            }
-            child = *(uint64_t *)(cell + n + klen);
+        if (read_child_ptr(page, ps, slot, (int)hdr.nkeys, &child) != YQ_OK) {
+            return YQ_ERR_CORRUPT;
         }
         cur_page = child;
     }
@@ -699,18 +708,8 @@ int yq_btree_delete(yq_btree *bt, yq_slice key) {
 
         int slot = find_slot(page, (const uint8_t *)key.data, key.size, hdr.nkeys, ps);
         uint64_t child;
-        if (slot >= (int)hdr.nkeys) {
-            child = *(uint64_t *)(page + ps - 8);
-        } else {
-            uint16_t offset = get_slot(page, (uint16_t)slot);
-            uint8_t *cell = page + offset;
-            size_t n = 0;
-            uint64_t klen;
-            size_t avail = ps - offset;
-            if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
-                return YQ_ERR_CORRUPT;
-            }
-            child = *(uint64_t *)(cell + n + klen);
+        if (read_child_ptr(page, ps, slot, (int)hdr.nkeys, &child) != YQ_OK) {
+            return YQ_ERR_CORRUPT;
         }
         cur_page = child;
     }
@@ -789,15 +788,10 @@ static int find_rightmost_leaf(yq_btree *bt, uint64_t page_no, uint64_t *leaf_pa
             return YQ_OK;
         }
         uint16_t last_slot = hdr.nkeys > 0 ? hdr.nkeys - 1 : 0;
-        uint16_t offset = get_slot(page, last_slot);
-        uint8_t *cell = page + offset;
-        size_t n = 0;
-        uint64_t klen;
-        size_t avail = ps - offset;
-        if (yq_varint_decode(cell, avail, &klen, &n) != 0 || n + klen + 8 > avail) {
+        uint64_t child;
+        if (read_child_ptr(page, ps, (int)last_slot, (int)hdr.nkeys, &child) != YQ_OK) {
             return YQ_ERR_CORRUPT;
         }
-        uint64_t child = *(uint64_t *)(cell + n + klen);
         cur = child;
     }
 }
