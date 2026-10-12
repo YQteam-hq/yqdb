@@ -111,16 +111,23 @@ static uint8_t *alloc_page(yq_btree *bt, int is_leaf) {
     return page;
 }
 
-static int cell_size(const uint8_t *page, uint16_t slot_idx, uint32_t page_size) {
+/*
+ * Byte size of the cell stored at slot_idx, measured from its start offset to
+ * the end of the last field it holds.
+ *
+ * `is_leaf` tells the function whether the page is a leaf or an internal page.
+ * It used to call read_page_header() itself to find out, but both call sites in
+ * the split paths walk every cell of a page they already know the type of, so
+ * that re-parsed the same header once per cell. The type is passed in instead.
+ */
+static int cell_size(const uint8_t *page, uint16_t slot_idx, uint32_t page_size, int is_leaf) {
     uint16_t offset = get_slot(page, slot_idx);
     uint8_t *cell = (uint8_t *)page + offset;
     size_t n = 0;
     uint64_t key_len;
     if (yq_varint_decode(cell, page_size - offset, &key_len, &n) != 0) return -1;
     size_t pos = n + key_len;
-    yq_page_header hdr;
-    read_page_header(page, &hdr);
-    if (hdr.page_type == YQ_PAGE_TYPE_LEAF) {
+    if (is_leaf) {
         uint64_t val_len;
         if (yq_varint_decode(cell + pos, page_size - offset - pos, &val_len, &n) != 0) return -1;
         pos += n;
@@ -313,11 +320,12 @@ static int insert_into_leaf(yq_btree *bt, uint64_t page_no, uint8_t *page,
 
     for (uint16_t i = 0; i < nkeys - split_pos; i++) {
         /*
-         * cell_size() parses the page header and decodes up to three varints,
-         * and it was called twice per cell -- once for the offset and once for
-         * the copy length. Both uses need the same value, so compute it once.
+         * cell_size() decodes up to three varints, and it was called twice per
+         * cell -- once for the offset and once for the copy length. Both uses
+         * need the same value, so compute it once. The page type is passed in
+         * (leaf) rather than re-derived from the header on every cell.
          */
-        int csz = cell_size(page, split_pos + i, ps);
+        int csz = cell_size(page, split_pos + i, ps, 1);
         if (csz < 0) {
             free(new_page);
             return YQ_ERR_CORRUPT;
@@ -437,7 +445,7 @@ static int insert_into_internal(yq_btree *bt, uint64_t page_no, uint8_t *page,
     uint16_t new_slot_area_size = (nkeys - split_pos) * YQ_PAGE_SLOT_SIZE;
     for (uint16_t i = 0; i < nkeys - split_pos; i++) {
         /* Same hoist as the leaf split: cell_size() was called twice. */
-        int csz = cell_size(page, split_pos + i, ps);
+        int csz = cell_size(page, split_pos + i, ps, 0);
         if (csz < 0) {
             free(new_page);
             return YQ_ERR_CORRUPT;
@@ -691,7 +699,7 @@ int yq_btree_delete(yq_btree *bt, yq_slice key) {
 
             uint16_t offset = get_slot(page, (uint16_t)slot);
             (void)offset;
-            int csz = cell_size(page, (uint16_t)slot, ps);
+            int csz = cell_size(page, (uint16_t)slot, ps, 1);
             if (csz < 0) return YQ_ERR_CORRUPT;
 
             for (uint16_t i = (uint16_t)slot; i < hdr.nkeys - 1; i++) {
