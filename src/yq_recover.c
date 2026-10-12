@@ -128,9 +128,21 @@ typedef struct {
 
 static int arena_put(uint8_t **buf, size_t *used, size_t *cap,
                      const uint8_t *src, size_t n, size_t *out_off) {
+    /*
+     * Guard *used + n against size_t overflow. n is bounded by a single WAL
+     * record payload (<= 1 GiB by yq_put), but *used accumulates the whole
+     * replayed log, so on a 32-bit build the sum can wrap and let the growth
+     * loop below settle on a far-too-small capacity, after which the memcpy
+     * would write out of bounds.
+     */
+    if (n > SIZE_MAX - *used) return YQ_ERR_NOMEM;
     if (*buf == NULL || *used + n > *cap) {
         size_t ncap = *cap ? *cap : 4096;
-        while (ncap < *used + n) ncap *= 2;
+        while (ncap < *used + n) {
+            /* Guard ncap *= 2 against wrapping to 0 on a 32-bit platform. */
+            if (ncap > SIZE_MAX / 2) return YQ_ERR_NOMEM;
+            ncap *= 2;
+        }
         uint8_t *nb = (uint8_t *)realloc(*buf, ncap);
         if (!nb) return YQ_ERR_NOMEM;
         *buf = nb;
