@@ -236,15 +236,17 @@ int yq_wal_flush(yq_wal *wal) {
         uint64_t lsn = ++wal->last_lsn;
         memcpy(rec + 0, &lsn, 8);
 
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
-        memcpy(header_for_crc + 0, rec + 0, 8);
-        memcpy(header_for_crc + 8, rec + 8, 8);
-        header_for_crc[16] = rec[16];
-        memcpy(header_for_crc + 17, rec + 17, 4);
-        memset(header_for_crc + 21, 0, 4);
-        memset(header_for_crc + 25, 0, 4);
-
-        uint32_t header_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        /*
+         * The header CRC covers YQ_WAL_HEADER_SIZE bytes with the two CRC
+         * fields (header_crc at +21, payload_crc at +25) zeroed out. Instead
+         * of copying the whole header into a scratch buffer and zeroing it
+         * there, zero the two fields in place, CRC the record directly, then
+         * stamp header_crc -- one small memcpy instead of five.
+         */
+        uint32_t zero = 0;
+        memcpy(rec + 21, &zero, 4);
+        memcpy(rec + 25, &zero, 4);
+        uint32_t header_crc = yq_crc32c(rec, YQ_WAL_HEADER_SIZE);
         memcpy(rec + 21, &header_crc, 4);
 
         uint32_t payload_len;
@@ -426,12 +428,12 @@ int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx)
 
     while (pos + YQ_WAL_HEADER_SIZE <= b->file_size) {
         uint8_t header[YQ_WAL_HEADER_SIZE];
-        uint8_t header_for_crc[YQ_WAL_HEADER_SIZE];
         uint64_t lsn;
         uint64_t txn_id;
         int rec_type;
         uint32_t payload_len;
         uint32_t stored_crc;
+        uint32_t stored_payload_crc;
         uint32_t calc_crc;
         const uint8_t *payload = NULL;
         int g;
@@ -447,19 +449,18 @@ int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx)
         rec_type = header[16];
         memcpy(&payload_len, header + 17, 4);
 
-        memcpy(header_for_crc + 0, header + 0, 8);
-        memcpy(header_for_crc + 8, header + 8, 8);
-        header_for_crc[16] = header[16];
-        memcpy(header_for_crc + 17, header + 17, 4);
-        memset(header_for_crc + 21, 0, 4);
-        memset(header_for_crc + 25, 0, 4);
-
+        /* Both stored CRCs must be read before the header CRC is computed,
+         * which zero-fills the CRC fields in this local copy. */
         memcpy(&stored_crc, header + 21, 4);
-        calc_crc = yq_crc32c(header_for_crc, YQ_WAL_HEADER_SIZE);
+        memcpy(&stored_payload_crc, header + 25, 4);
+        /* The header CRC excludes the two CRC fields (+21..+28). Zero them in
+         * this local copy and CRC the header directly instead of copying it
+         * into a scratch buffer first. */
+        memset(header + 21, 0, 8);
+        calc_crc = yq_crc32c(header, YQ_WAL_HEADER_SIZE);
         if (stored_crc != calc_crc) break; /* 坏记录：停止，保持截断语义 */
 
         if (payload_len > 0) {
-            uint32_t stored_payload_crc;
             uint32_t calc_payload_crc;
 
             /* 记录不完整（尾部截断）：停止 */
@@ -490,7 +491,6 @@ int yq_wal_scan(yq_wal *wal, uint64_t from_lsn, yq_wal_visitor visit, void *ctx)
                 b->block_pos = 0;
             }
 
-            memcpy(&stored_payload_crc, header + 25, 4);
             calc_payload_crc = yq_crc32c(b->payload, payload_len);
             if (stored_payload_crc != calc_payload_crc) break; /* 坏记录：停止 */
 
