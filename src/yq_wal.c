@@ -192,13 +192,19 @@ int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val) 
 
 int yq_wal_append_del(yq_wal *wal, uint64_t txn_id, yq_slice key) {
     if (!wal) return YQ_ERR_INVAL;
-    if (key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
-    if (!key.data) return YQ_ERR_INVAL;
+    if (!key.data || key.size == 0 || key.size > YQ_WAL_MAX_KEY_SIZE) return YQ_ERR_INVAL;
 
     uint8_t enc_buf[YQ_WAL_MAX_KEY_SIZE + YQ_WAL_VARINT_MAX];
-    size_t nk;
+    size_t nk = 0;
     if (yq_varint_encode(key.size, enc_buf, &nk) != YQ_OK) return YQ_ERR_INVAL;
-    if (key.size > sizeof(enc_buf) - nk) return YQ_ERR_TOOBIG;
+    /*
+     * Overflow-safe upper bound: nk and key.size are both size_t, so their sum
+     * cannot wrap and the comparison is exact. The previous form subtracted nk
+     * from a size_t and leaned on unsigned underflow to produce a huge bound
+     * when nk > sizeof(enc_buf) -- an impossible input today, but a fragile
+     * construct the moment the buffer size or key limit is ever retuned.
+     */
+    if (nk + key.size > sizeof(enc_buf)) return YQ_ERR_TOOBIG;
     memcpy(enc_buf + nk, key.data, key.size);
 
     return append_record(wal, txn_id, WAL_TYPE_DEL, enc_buf, nk + key.size);
