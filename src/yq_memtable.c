@@ -135,7 +135,17 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
 
     if (found) {
         mt_entry *e = &mt->entries[idx];
+        /*
+         * Reclaim whatever the entry currently accounts for before charging
+         * the new value. A live entry was billed key+value+slot; a tombstone
+         * was billed key+slot only. The tombstone case used to subtract
+         * nothing, so reviving a deleted key counted it twice -- the stale
+         * tombstone cost stayed on top of the fresh live cost. used_bytes then
+         * drifted above reality and pushed the memtable into a spurious
+         * YQ_ERR_NOMEM (or an early spill) for data it never held.
+         */
         if (!e->tombstone) mt->used_bytes -= entry_cost(e->key_len, e->val_len);
+        else mt->used_bytes -= entry_cost(e->key_len, 0);
         size_t voff = 0;
         int rc = alloc_copy(mt, val.data, val.size, &voff);
         if (rc != YQ_OK) return rc;
