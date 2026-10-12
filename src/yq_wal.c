@@ -228,9 +228,18 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
 int yq_wal_flush(yq_wal *wal) {
     if (!wal || wal->buf_used == 0) return YQ_OK;
 
-    size_t offset = wal->file_size;
+    /*
+     * Stamp every buffered record in place: assign a monotonic LSN and compute
+     * both the header and payload CRCs. The records sit contiguously in
+     * wal->buf and are written contiguously to disk starting at wal->file_size,
+     * so after stamping we can issue a single yq_file_pwrite() for the whole
+     * buffer instead of one syscall per record (the previous code called
+     * yq_file_pwrite() once per record). On the commit-hot path this collapses
+     * N writes into 1; the resulting on-disk bytes are identical because the
+     * single write covers exactly the same [file_size, file_size + buf_used)
+     * span that the per-record loop did.
+     */
     size_t pos = 0;
-
     while (pos < wal->buf_used) {
         uint8_t *rec = wal->buf + pos;
         uint64_t lsn = ++wal->last_lsn;
@@ -257,14 +266,13 @@ int yq_wal_flush(yq_wal *wal) {
         }
         memcpy(rec + 25, &payload_crc, 4);
 
-        int rc = yq_file_pwrite(wal->file, rec, YQ_WAL_HEADER_SIZE + payload_len, offset);
-        if (rc != YQ_OK) return rc;
-
-        offset += YQ_WAL_HEADER_SIZE + payload_len;
         pos += YQ_WAL_HEADER_SIZE + payload_len;
     }
 
-    int rc = yq_file_sync(wal->file);
+    int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, wal->file_size);
+    if (rc != YQ_OK) return rc;
+
+    rc = yq_file_sync(wal->file);
     if (rc != YQ_OK) return rc;
 
     wal->file_size += wal->buf_used;
