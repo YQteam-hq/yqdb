@@ -41,6 +41,15 @@ uint64_t yq_file_size(yq_file *f);
  * the caller is responsible for removing the source.
  */
 int yq_file_rename(const char *from, const char *to);
+/*
+ * Do both handles refer to the same underlying file?
+ *
+ * Returns 1 when they do, 0 when they do not, -1 when the identity could not
+ * be determined. Identity is (volume serial, file index) on Win32 and
+ * (st_dev, st_ino) on POSIX -- not the path, so two different names for the
+ * same file still compare equal.
+ */
+int yq_file_same_target(yq_file *a, yq_file *b);
 int yq_file_lock(yq_file *f, int exclusive);
 /*
  * Non-blocking variant of yq_file_lock().
