@@ -17,6 +17,16 @@ int yq_wal_append_abort(yq_wal *wal, uint64_t txn_id);
 int yq_wal_append_ckpt_begin(yq_wal *wal, uint64_t root_page, uint64_t txn_id);
 int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn);
 int yq_wal_flush(yq_wal *wal);
+/*
+ * Discard every record still buffered in memory without writing it.
+ *
+ * A failed flush leaves the buffered bytes in place (flush bails out before
+ * advancing buf_used), so without this the records of an aborted transaction
+ * -- including its COMMIT marker -- would be reflushed together with the next
+ * transaction and resurrected during recovery. Callers drop the buffer on the
+ * commit failure path to keep an aborted transaction aborted.
+ */
+void yq_wal_discard(yq_wal *wal);
 int yq_wal_truncate(yq_wal *wal, uint64_t lsn);
 uint64_t yq_wal_size(yq_wal *wal);
 uint64_t yq_wal_last_lsn(yq_wal *wal);
