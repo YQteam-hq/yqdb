@@ -62,6 +62,10 @@ add_executable(yq_test_seek src/yq_test_seek.c)
 target_link_libraries(yq_test_seek yqdb)
 add_test(NAME seek_test COMMAND yq_test_seek)
 
+add_executable(yq_test_crc src/yq_test_crc.c)
+target_link_libraries(yq_test_crc yqdb)
+add_test(NAME crc_test COMMAND yq_test_crc)
+
 add_executable(yq_test_mvcc src/yq_test_mvcc.c)
 target_link_libraries(yq_test_mvcc yqdb)
 add_test(NAME mvcc_test COMMAND yq_test_mvcc)
