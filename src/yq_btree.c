@@ -991,17 +991,18 @@ int yq_btree_cursor_seek(yq_btree_cursor *c, yq_slice key) {
             return YQ_OK;
         }
 
-        /* Internal page: follow the same descent rule as yq_btree_lookup. */
+        /*
+         * Internal page: resolve the child through the shared helper so this
+         * descent cannot drift from yq_btree_lookup(), yq_btree_insert() and
+         * yq_btree_delete(). Beyond de-duplicating the traversal rule, that
+         * also pulls in read_child_ptr()'s bound check on the decoded cell:
+         * the inline copy kept here read the child pointer without verifying
+         * that varint(key_len) key child actually fits inside the page, so a
+         * malformed internal cell could drive an out-of-bounds read.
+         */
         uint64_t child;
-        if (slot >= (int)hdr.nkeys) {
-            child = *(uint64_t *)(page + ps - 8);
-        } else {
-            uint16_t offset = get_slot(page, (uint16_t)slot);
-            uint8_t *cell = page + offset;
-            size_t n = 0;
-            uint64_t klen;
-            if (yq_varint_decode(cell, ps - offset, &klen, &n) != 0) return YQ_ERR_CORRUPT;
-            child = *(uint64_t *)(cell + n + klen);
+        if (read_child_ptr(page, ps, slot, (int)hdr.nkeys, &child) != YQ_OK) {
+            return YQ_ERR_CORRUPT;
         }
         cur_page = child;
     }
