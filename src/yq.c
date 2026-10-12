@@ -328,9 +328,12 @@ int yq_close(yq_db *db) {
     if (!db) return YQ_OK;
     if (db->closed) { free_db(db); return YQ_OK; }
     db->closed = 1;
-    if (db->write_enabled) yq_sync(db);
+    /* Surface a flush/sync failure that happens during the final drain, then
+     * release the handle regardless so the caller can always reclaim it. */
+    int rc = YQ_OK;
+    if (db->write_enabled) rc = yq_sync(db);
     free_db(db);
-    return YQ_OK;
+    return rc;
 }
 
 static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
@@ -467,7 +470,16 @@ int yq_txn_commit(yq_txn *txn) {
 
     if (txn->flags & YQ_TXN_READWRITE) {
         int rc = yq_wal_append_commit(db->wal, txn->snapshot_txn);
+        if (rc == YQ_OK) rc = yq_wal_flush(db->wal);
         if (rc != YQ_OK) {
+            /*
+             * The commit marker could not be made durable. Report the failure
+             * instead of swallowing it -- otherwise yq_txn_commit() returns
+             * YQ_OK for data that is not on disk -- and drop the records still
+             * buffered for this transaction so an aborted transaction can never
+             * be replayed by recovery.
+             */
+            yq_wal_discard(db->wal);
             txn->state = YQ_TXN_STATE_ABORTED;
             pending_free(txn);
             yq_mvcc_release_writer(db->mvcc);
@@ -475,7 +487,6 @@ int yq_txn_commit(yq_txn *txn) {
             free(txn);
             return rc;
         }
-        yq_wal_flush(db->wal);
         if (db->opts.sync_mode == YQ_SYNC_FULL && db->db_file) yq_file_sync(db->db_file);
 
         int rc_apply = pending_apply(txn);
@@ -504,6 +515,19 @@ int yq_txn_commit(yq_txn *txn) {
         rc2 = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
 
         yq_mvcc_release_writer(db->mvcc);
+
+        /*
+         * The durable log already holds the committed records, but the meta
+         * page publishes the new transaction id / root. If that write failed
+         * the commit is not fully durable, so surface the error rather than
+         * returning YQ_OK for a half-published commit.
+         */
+        if (rc2 != YQ_OK) {
+            txn->state = YQ_TXN_STATE_ABORTED;
+            if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
+            free(txn);
+            return rc2;
+        }
     }
 
     txn->state = YQ_TXN_STATE_COMMITTED;
@@ -971,7 +995,8 @@ int yq_checkpoint(yq_db *db) {
     if (wal_sz == 0 && yq_memtable_size(db->memtable) == 0) return YQ_OK;
 
     uint64_t new_txn_id = 0;
-    yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
+    rc = yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
+    if (rc != YQ_OK) return rc;
 
     uint64_t cur_txn = 0, cur_root = 0, cur_free = 0, cur_npages = 0, cur_ckpt = 0;
     yq_mvcc_meta_read(db->mvcc, &cur_txn, &cur_root, &cur_free, &cur_npages, &cur_ckpt);
@@ -982,7 +1007,8 @@ int yq_checkpoint(yq_db *db) {
         cur_npages = yq_btree_npages(db->btree);
     }
 
-    yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    rc = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+    if (rc != YQ_OK) return rc;
 
     /*
      * The log can only be rewritten while it is the sole durable copy of the
@@ -1004,8 +1030,14 @@ int yq_sync(yq_db *db) {
     if (!db) return YQ_ERR_INVAL;
     /* See the note in yq_checkpoint(). */
     if (!db->write_enabled) return YQ_ERR_READONLY;
-    yq_wal_flush(db->wal);
-    if (db->db_file) yq_file_sync(db->db_file);
+    /* A failed flush means the buffered writes never reached the file, so the
+     * caller must be told rather than handed YQ_OK. */
+    int rc = yq_wal_flush(db->wal);
+    if (rc != YQ_OK) return rc;
+    if (db->db_file) {
+        rc = yq_file_sync(db->db_file);
+        if (rc != YQ_OK) return rc;
+    }
     return YQ_OK;
 }
 

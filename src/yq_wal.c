@@ -284,6 +284,21 @@ int yq_wal_flush(yq_wal *wal) {
     return YQ_OK;
 }
 
+/*
+ * Drop buffered-but-unwritten records.
+ *
+ * yq_wal_flush() bails out before it advances buf_used, so a failed flush
+ * leaves every record of the failing transaction (BEGIN / PUT... / COMMIT) in
+ * the buffer. Left there, the next successful flush would persist them too and
+ * the COMMIT marker would make recovery replay a transaction the caller was
+ * told had failed. Discarding the buffer on the failure path keeps the aborted
+ * transaction out of the durable log. The partially written bytes, if any,
+ * start at the old file_size and are overwritten by the next flush.
+ */
+void yq_wal_discard(yq_wal *wal) {
+    if (wal) wal->buf_used = 0;
+}
+
 int yq_wal_truncate(yq_wal *wal, uint64_t lsn) {
     if (lsn == 0) return YQ_OK;
 
