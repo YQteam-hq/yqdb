@@ -83,3 +83,11 @@ endforeach()
 add_executable(yq_test_p4 src/yq_test_p4.c)
 target_link_libraries(yq_test_p4 yqdb)
 add_test(NAME p4_recovery_test COMMAND yq_test_p4)
+
+add_executable(yq_test_meta_reads src/yq_test_meta_reads.c)
+target_link_libraries(yq_test_meta_reads yqdb)
+if(NOT MSVC)
+    # The test counts library pread64() calls via the linker's --wrap.
+    target_link_options(yq_test_meta_reads PRIVATE -Wl,--wrap=pread64)
+endif()
+add_test(NAME meta_reads_test COMMAND yq_test_meta_reads)

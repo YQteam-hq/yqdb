@@ -493,7 +493,11 @@ int yq_txn_commit(yq_txn *txn) {
         if (rc2 != YQ_OK) { txn->state = YQ_TXN_STATE_ABORTED; yq_mvcc_release_writer(db->mvcc); if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx); free(txn); return rc2; }
 
         uint64_t cur_txn = 0, cur_root = 0, cur_free = 0, cur_npages = 0, cur_ckpt = 0;
-        yq_mvcc_meta_read(db->mvcc, &cur_txn, &cur_root, &cur_free, &cur_npages, &cur_ckpt);
+        uint8_t meta_slot = 0;
+        /* One pair of meta-page reads feeds both the current fields and the
+         * choice of target slot, instead of reading the pair twice. */
+        yq_mvcc_meta_read_select(db->mvcc, &cur_txn, &cur_root, &cur_free, &cur_npages, &cur_ckpt,
+                                 &meta_slot);
 
         uint64_t root_page = cur_root;
         if (db->btree) {
@@ -501,7 +505,7 @@ int yq_txn_commit(yq_txn *txn) {
             cur_npages = yq_btree_npages(db->btree);
         }
 
-        rc2 = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+        rc2 = yq_mvcc_meta_pwrite_at(db->mvcc, meta_slot, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
 
         yq_mvcc_release_writer(db->mvcc);
     }

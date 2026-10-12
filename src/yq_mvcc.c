@@ -448,28 +448,52 @@ static int read_meta_page(yq_mvcc *mvcc, uint32_t page_idx, meta_block *out) {
     return YQ_OK;
 }
 
-int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint64_t *free_head, uint64_t *npages, uint64_t *ckpt_lsn) {
-    meta_block meta_a, meta_b;
-    int rc_a = read_meta_page(mvcc, 0, &meta_a);
-    int rc_b = read_meta_page(mvcc, 1, &meta_b);
+/*
+ * Both meta pages, read once, with each read's status.
+ *
+ * The commit path used to read both pages twice: yq_mvcc_meta_read() to fetch
+ * the current fields, then select_meta_index() (inside
+ * yq_mvcc_meta_pwrite_full()) to choose the target slot. Funnelling every
+ * consumer through a single read makes the commit path read the pair once.
+ */
+typedef struct {
+    meta_block a;
+    meta_block b;
+    int rc_a;
+    int rc_b;
+} meta_pair;
 
-    meta_block *chosen = NULL;
+static void read_meta_pair(yq_mvcc *mvcc, meta_pair *mp) {
+    mp->rc_a = read_meta_page(mvcc, 0, &mp->a);
+    mp->rc_b = read_meta_page(mvcc, 1, &mp->b);
+}
 
-    if (rc_a == YQ_OK && rc_b == YQ_OK) {
-        if (meta_a.txn_id > meta_b.txn_id ||
-            (meta_a.txn_id == meta_b.txn_id && meta_a.meta_seq > meta_b.meta_seq)) {
-            chosen = &meta_a;
-        } else {
-            chosen = &meta_b;
+/* Index of the newest valid meta block (0 or 1), or -1 if neither is readable.
+ * Ties on txn_id are broken by meta_seq, matching the original rule. */
+static int newest_meta_index(const meta_pair *mp) {
+    if (mp->rc_a == YQ_OK && mp->rc_b == YQ_OK) {
+        if (mp->a.txn_id > mp->b.txn_id ||
+            (mp->a.txn_id == mp->b.txn_id && mp->a.meta_seq > mp->b.meta_seq)) {
+            return 0;
         }
-    } else if (rc_a == YQ_OK) {
-        chosen = &meta_a;
-    } else if (rc_b == YQ_OK) {
-        chosen = &meta_b;
-    } else {
-        return YQ_ERR_CORRUPT;
+        return 1;
     }
+    if (mp->rc_a == YQ_OK) return 0;
+    if (mp->rc_b == YQ_OK) return 1;
+    return -1;
+}
 
+/* Slot the next meta write must target: the one that is NOT the newest valid
+ * copy, so a crash can never leave both copies stale at once. When neither page
+ * is valid, slot 0 is (re)initialised -- the behaviour select_meta_index() had. */
+static uint8_t next_meta_write_index(const meta_pair *mp) {
+    int newest = newest_meta_index(mp);
+    return (uint8_t)(newest < 0 ? 0 : (newest ^ 1));
+}
+
+static void meta_fields_from(const meta_block *chosen,
+                             uint64_t *txn_id, uint64_t *root_page, uint64_t *free_head,
+                             uint64_t *npages, uint64_t *ckpt_lsn) {
     if (chosen->txn_id != 0) {
         if (txn_id) *txn_id = chosen->txn_id;
         if (root_page) *root_page = chosen->root_page;
@@ -483,9 +507,34 @@ int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint
         if (npages) *npages = 2;
         if (ckpt_lsn) *ckpt_lsn = 0;
     }
+}
 
+int yq_mvcc_meta_read(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page, uint64_t *free_head, uint64_t *npages, uint64_t *ckpt_lsn) {
+    meta_pair mp;
+    read_meta_pair(mvcc, &mp);
+
+    int newest = newest_meta_index(&mp);
+    if (newest < 0) return YQ_ERR_CORRUPT;
+
+    meta_fields_from(newest == 0 ? &mp.a : &mp.b, txn_id, root_page, free_head, npages, ckpt_lsn);
     return YQ_OK;
 }
+
+int yq_mvcc_meta_read_select(yq_mvcc *mvcc, uint64_t *txn_id, uint64_t *root_page,
+                             uint64_t *free_head, uint64_t *npages, uint64_t *ckpt_lsn,
+                             uint8_t *write_index) {
+    meta_pair mp;
+    read_meta_pair(mvcc, &mp);
+
+    if (write_index) *write_index = next_meta_write_index(&mp);
+
+    int newest = newest_meta_index(&mp);
+    if (newest < 0) return YQ_ERR_CORRUPT;
+
+    meta_fields_from(newest == 0 ? &mp.a : &mp.b, txn_id, root_page, free_head, npages, ckpt_lsn);
+    return YQ_OK;
+}
+
 
 /*
  * Build a meta block in *mb from the supplied fields, filling every member so
@@ -539,28 +588,13 @@ int yq_mvcc_meta_pwrite(yq_mvcc *mvcc, uint8_t meta_index) {
 }
 
 static int select_meta_index(yq_mvcc *mvcc) {
-    meta_block meta_a, meta_b;
-    int rc_a = read_meta_page(mvcc, 0, &meta_a);
-    int rc_b = read_meta_page(mvcc, 1, &meta_b);
-
-    if (rc_a == YQ_OK && rc_b == YQ_OK) {
-        if (meta_a.txn_id > meta_b.txn_id ||
-            (meta_a.txn_id == meta_b.txn_id && meta_a.meta_seq > meta_b.meta_seq)) {
-            return 1;
-        }
-        return 0;
-    } else if (rc_a == YQ_OK) {
-        return 1;
-    } else if (rc_b == YQ_OK) {
-        return 0;
-    }
-    return 0;
+    meta_pair mp;
+    read_meta_pair(mvcc, &mp);
+    return next_meta_write_index(&mp);
 }
 
-int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
-                              uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
-    int target_idx = select_meta_index(mvcc);
-
+int yq_mvcc_meta_pwrite_at(yq_mvcc *mvcc, uint8_t meta_index, uint64_t txn_id, uint64_t root_page,
+                           uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
     uint8_t *buf = mvcc->io_buf;
     /*
      * Only the tail of the page beyond the packed meta block needs zeroing for
@@ -587,12 +621,19 @@ int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
         }
     }
 
-    uint64_t off = (uint64_t)target_idx * mvcc->page_size;
+    uint64_t off = (uint64_t)meta_index * mvcc->page_size;
     if (yq_file_pwrite(mvcc->db_file, buf, mvcc->page_size, off) != YQ_OK) {
         return YQ_ERR_IO;
     }
 
     return YQ_OK;
+}
+
+int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
+                              uint64_t free_head, uint64_t npages, uint64_t ckpt_lsn) {
+    int target_idx = select_meta_index(mvcc);
+    return yq_mvcc_meta_pwrite_at(mvcc, (uint8_t)target_idx,
+                                  txn_id, root_page, free_head, npages, ckpt_lsn);
 }
 
 static void sleep_ms(int ms) {
