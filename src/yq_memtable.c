@@ -4,6 +4,7 @@
 #include "yq_slice.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #define TOMBSTONE_VAL 0xFF
 
@@ -131,6 +132,15 @@ int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val) {
 
     if (mt->num_entries >= mt->cap_entries) {
         size_t new_cap = mt->cap_entries * 2;
+        /*
+         * Guard the element-count -> byte-size multiplication below against
+         * size_t overflow. The entry array grows by doubling, so on a 32-bit
+         * platform with a very large memtable the byte size could wrap and hand
+         * realloc() a far-too-small request instead of failing -- which would
+         * then corrupt the array on the following memmove(). Fail cleanly here
+         * instead (the same contract reallocarray() provides).
+         */
+        if (new_cap > SIZE_MAX / sizeof(mt_entry)) return YQ_ERR_NOMEM;
         mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
         if (!new_entries) return YQ_ERR_NOMEM;
         mt->entries = new_entries;
@@ -179,6 +189,8 @@ int yq_memtable_del(yq_memtable *mt, yq_slice key) {
 
     if (mt->num_entries >= mt->cap_entries) {
         size_t new_cap = mt->cap_entries * 2;
+        /* See yq_memtable_put(): overflow-guard the realloc size. */
+        if (new_cap > SIZE_MAX / sizeof(mt_entry)) return YQ_ERR_NOMEM;
         mt_entry *new_entries = realloc(mt->entries, new_cap * sizeof(mt_entry));
         if (!new_entries) return YQ_ERR_NOMEM;
         mt->entries = new_entries;
