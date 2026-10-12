@@ -62,9 +62,26 @@ int yq_varint_decode(const uint8_t *in, size_t inlen, uint64_t *out, size_t *nco
     if (inlen == 0) {
         return YQ_ERR_INVAL;
     }
-    uint64_t val = 0;
-    size_t n = 0;
-    int shift = 0;
+
+    /*
+     * Fast path: the overwhelmingly common case is a single-byte varint, i.e.
+     * a value below 128. That covers most key/value lengths, the small page
+     * offsets used throughout the B+Tree, and a large share of WAL payload
+     * sizes. Handling it up front skips the multi-byte loop, the per-iteration
+     * shift/overflow bookkeeping and the branchy tail entirely -- and this
+     * routine runs on every B+Tree probe, every memtable comparison and every
+     * WAL record scan, so the saving is paid back constantly.
+     */
+    uint8_t first = in[0];
+    if ((first & 0x80) == 0) {
+        *out = first;
+        *nconsumed = 1;
+        return YQ_OK;
+    }
+
+    uint64_t val = first & 0x7F;
+    size_t n = 1;
+    int shift = 7;
     while (n < inlen) {
         uint8_t b = in[n];
         if (shift == 63 && (b & 0x7F) > 1) {
