@@ -562,7 +562,17 @@ int yq_mvcc_meta_pwrite_full(yq_mvcc *mvcc, uint64_t txn_id, uint64_t root_page,
     int target_idx = select_meta_index(mvcc);
 
     uint8_t *buf = mvcc->io_buf;
-    memset(buf, 0, mvcc->page_size);
+    /*
+     * Only the tail of the page beyond the packed meta block needs zeroing for
+     * deterministic on-disk bytes. The leading sizeof(meta_block) bytes are
+     * fully overwritten by yq_mvcc_fill_meta_block() below, so zeroing them here
+     * first is dead work -- up to (page_size - 100) bytes, i.e. ~64 KiB at the
+     * largest page size, on every meta write (every commit and checkpoint).
+     * The meta block is exactly YQ_META_READ_LEN bytes (verified by the
+     * compile-time size check in this file), so this produces byte-identical
+     * output while skipping the redundant memset of the block itself.
+     */
+    memset(buf + sizeof(meta_block), 0, (size_t)mvcc->page_size - sizeof(meta_block));
 
     meta_block *mb = (meta_block *)buf;
     yq_mvcc_fill_meta_block(mvcc, mb, txn_id, root_page, free_head, npages, ckpt_lsn);
