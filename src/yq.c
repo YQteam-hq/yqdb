@@ -103,8 +103,10 @@ struct yq_db {
     int write_enabled;
     int closed;
     int auto_ckpt_armed;
+    uint64_t checkpoints;         /* checkpoints run on this handle (yq_stat) */
+    uint64_t log_ckpt_bytes;      /* floor for the next automatic log checkpoint */
     yq_mempool *pend_pool;        /* arena for staged writes, reused across txns */
-    int pend_pool_busy;          /* owned by one txn at a time (under pend_pool_lock) */
+    int pend_pool_busy;           /* owned by one txn at a time (under pend_pool_lock) */
     yq_spin_t pend_pool_lock;     /* memtable threshold may fire again (hysteresis) */
 };
 
@@ -800,24 +802,39 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
  *
  * The two thresholds are not symmetric:
  *
- *   - log_bytes is self-limiting. Compaction rewrites the log down to the
- *     live dataset, so once it fires it cannot fire again until the log has
- *     grown back past the threshold.
- *   - memtable_bytes is NOT self-limiting until B+Tree spilling exists:
- *     compaction rewrites the log but leaves the memtable full. Firing it on
- *     every commit after a crossing would rewrite the whole log on every
- *     commit -- an O(dataset) cost per commit. It therefore fires once per
- *     crossing (disarm on fire, regardless of the outcome) and re-arms only
- *     after usage has fallen back below half the threshold. That hysteresis
- *     becomes unnecessary once checkpoint can drain the memtable into the
- *     tree.
+ *   - log_bytes is self-limiting in the common case. Compaction rewrites the
+ *     log down to the live dataset, so the next crossing is a fresh one and
+ *     the threshold stays put. It stops being self-limiting when the live
+ *     dataset alone is larger than log_bytes: compaction cannot produce a log
+ *     under the threshold, so every later commit would rewrite the whole log to
+ *     no effect. Measured on 20k keys (3.2 MB live) with log_bytes = 64 KiB,
+ *     that was 19,622 checkpoints for 20,000 commits and a 19.8x slowdown
+ *     against log_bytes large enough to never fire. So after a compaction the
+ *     floor is raised to twice the size the compaction actually produced
+ *     (log_ckpt_bytes), never below log_bytes. The log then oscillates between
+ *     the live set and twice it: compaction work stays amortized O(1) per byte
+ *     appended, and the log stays within 2x of the data a reopen has to replay.
+ *   - memtable_bytes is NOT self-limiting at all until B+Tree spilling exists:
+ *     compaction rewrites the log but leaves the memtable full, because readers
+ *     resolve against the memtable until the tree holds the data. Firing it on
+ *     every commit after a crossing would rewrite the whole log on every commit
+ *     -- the same O(dataset) cost per commit, with nothing gained. It therefore
+ *     fires once per crossing (disarm on fire, regardless of the outcome) and
+ *     re-arms only after usage has fallen back below half the threshold. Note
+ *     that today the memtable's admission check refuses the write that would
+ *     cross the threshold first, so this arm is a safety net rather than the
+ *     main path. That hysteresis becomes unnecessary once checkpoint can drain
+ *     the memtable into the tree.
  *
  * Called from the commit path while the writer lock is held.
  */
 static int auto_ckpt_due(yq_db *db) {
     if (!db->write_enabled) return 0;
 
-    if (yq_wal_size(db->wal) >= db->opts.log_bytes) return 1;
+    uint64_t log_floor = db->log_ckpt_bytes > db->opts.log_bytes
+                             ? db->log_ckpt_bytes
+                             : db->opts.log_bytes;
+    if (yq_wal_size(db->wal) >= log_floor) return 1;
 
     uint64_t mt_bytes = (uint64_t)yq_memtable_bytes(db->memtable);
     if (db->auto_ckpt_armed) {
@@ -1383,10 +1400,24 @@ int yq_checkpoint(yq_db *db) {
     if (root_page == 0 && wal_sz > 0) {
         rc = wal_compact_from_memtable(db, new_txn_id);
         if (rc != YQ_OK) return rc;
+
+        /*
+         * Re-arm the log trigger against what compaction actually produced, not
+         * against opts.log_bytes. When the live set fits under the configured
+         * threshold this is the old behaviour (the floor stays below log_bytes
+         * and is ignored). When it does not, the configured threshold is
+         * unreachable by construction, so keying the next trigger to it would
+         * compact the entire log on every following commit -- see the note on
+         * auto_ckpt_due(). Doubling bounds both the compaction work and the log
+         * a reopen must replay.
+         */
+        uint64_t compacted = yq_wal_size(db->wal);
+        db->log_ckpt_bytes = compacted > UINT64_MAX / 2 ? compacted : compacted * 2;
     }
 
     if (db->db_file) yq_file_sync(db->db_file);
 
+    db->checkpoints++;
     return YQ_OK;
 }
 
@@ -1414,6 +1445,8 @@ int yq_db_stat(yq_db *db, yq_stat *out) {
     out->free_pages = free_head;
     out->log_bytes = yq_wal_size(db->wal);
     out->active_readers = yq_mvcc_active_readers(db->mvcc);
+    out->memtable_bytes = yq_memtable_bytes(db->memtable);
+    out->checkpoints = db->checkpoints;
     return YQ_OK;
 }
 

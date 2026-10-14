@@ -612,6 +612,116 @@ static void test_bulk_load(void) {
     printf("OK\n");
 }
 
+/* ── bulk_load preconditions: sorted, strictly increasing, all or nothing ── */
+
+/*
+ * bulk_load lays the run out across chunks in key order and binary-searches
+ * every chunk on the assumption that the keys are strictly increasing. Input
+ * that breaks the assumption is not a partial load, it is a corrupt table:
+ * chunks that look sorted on their own but not globally, so a key that was
+ * written goes missing and a chunk can grow without bound. The precondition is
+ * therefore checked rather than assumed, and a rejected run must leave the
+ * table exactly as it was -- otherwise a caller that retries with fixed input
+ * gets a table that is already half-loaded.
+ */
+static void test_bulk_load_preconditions(void) {
+    printf("test_bulk_load_preconditions... ");
+
+    yq_memtable *mt = yq_memtable_create(1024 * 1024);
+    CHECK(mt != NULL);
+
+    /* Nothing to load is not an error. */
+    CHECK(yq_memtable_bulk_load(mt, NULL, 0) == YQ_OK);
+    CHECK(yq_memtable_size(mt) == 0);
+
+    /* One entry: the degenerate run. */
+    yq_bulk_entry one;
+    memset(&one, 0, sizeof(one));
+    one.key.data = "a";  one.key.size = 1;
+    one.val.data = "1";  one.val.size = 1;
+    CHECK(yq_memtable_bulk_load(mt, &one, 1) == YQ_OK);
+    CHECK(yq_memtable_size(mt) == 1);
+    yq_slice k1 = {"a", 1}, v1 = {0};
+    CHECK(yq_memtable_get(mt, k1, &v1) == YQ_OK);
+    CHECK(v1.size == 1);
+
+    yq_memtable_reset(mt);
+
+    /* Keys are compared byte-wise, shorter first on a prefix. */
+    yq_bulk_entry run[3];
+    memset(run, 0, sizeof(run));
+    run[0].key.data = "k";  run[0].key.size = 1;
+    run[0].val.data = "0";  run[0].val.size = 1;
+    run[1].key.data = "k";  run[1].key.size = 1;   /* duplicate: rejected */
+    run[1].val.data = "1";  run[1].val.size = 1;
+    run[2].key.data = "l";  run[2].key.size = 1;
+    run[2].val.data = "2";  run[2].val.size = 1;
+
+    CHECK(yq_memtable_bulk_load(mt, run, 3) == YQ_ERR_INVAL);
+    CHECK(yq_memtable_size(mt) == 0);      /* nothing was written */
+
+    /* Out of order, same keys. */
+    run[1].key.data = "m"; run[1].key.size = 1;
+    CHECK(yq_memtable_bulk_load(mt, run, 3) == YQ_ERR_INVAL);
+    CHECK(yq_memtable_size(mt) == 0);
+
+    /* Descending order is caught too, not just an adjacent inversion. */
+    yq_bulk_entry desc[3];
+    memset(desc, 0, sizeof(desc));
+    desc[0].key.data = "z"; desc[0].key.size = 1; desc[0].val.data = "0"; desc[0].val.size = 1;
+    desc[1].key.data = "y"; desc[1].key.size = 1; desc[1].val.data = "1"; desc[1].val.size = 1;
+    desc[2].key.data = "x"; desc[2].key.size = 1; desc[2].val.data = "2"; desc[2].val.size = 1;
+    CHECK(yq_memtable_bulk_load(mt, desc, 3) == YQ_ERR_INVAL);
+    CHECK(yq_memtable_size(mt) == 0);
+
+    /* A prefix is shorter and sorts first: "k" < "k!" is NOT increasing. */
+    yq_bulk_entry pref[2];
+    memset(pref, 0, sizeof(pref));
+    pref[0].key.data = "k!"; pref[0].key.size = 2; pref[0].val.data = "0"; pref[0].val.size = 1;
+    pref[1].key.data = "k";  pref[1].key.size = 1; pref[1].val.data = "1"; pref[1].val.size = 1;
+    CHECK(yq_memtable_bulk_load(mt, pref, 2) == YQ_ERR_INVAL);
+    CHECK(yq_memtable_size(mt) == 0);
+
+    /* ...and the same pair in order is accepted, so the rule is the ordering
+     * and not a size comparison. */
+    pref[0].key.data = "k";  pref[0].key.size = 1;
+    pref[1].key.data = "k!"; pref[1].key.size = 2;
+    CHECK(yq_memtable_bulk_load(mt, pref, 2) == YQ_OK);
+    CHECK(yq_memtable_size(mt) == 2);
+    yq_slice kp = {"k!", 2}, vp = {0};
+    CHECK(yq_memtable_get(mt, kp, &vp) == YQ_OK);
+    CHECK(vp.size == 1);
+
+    /* A rejection part-way through a long run leaves nothing behind either:
+     * the offender is past the first chunk boundary. */
+    yq_memtable_reset(mt);
+    enum { BIG = 5000 };
+    yq_bulk_entry *many = (yq_bulk_entry *)calloc(BIG, sizeof(yq_bulk_entry));
+    CHECK(many != NULL);
+    char (*keys)[16] = (char (*)[16])calloc(BIG, 16);
+    CHECK(keys != NULL);
+    for (int i = 0; i < BIG; i++) {
+        snprintf(keys[i], 16, "k%06d", i);
+        many[i].key.data = keys[i];
+        many[i].key.size = (size_t)strlen(keys[i]);
+        many[i].val.data = "v";
+        many[i].val.size = 1;
+    }
+    memcpy(keys[BIG - 1], "k000000", 8);      /* last key now duplicates the first */
+    CHECK(yq_memtable_bulk_load(mt, many, BIG) == YQ_ERR_INVAL);
+    CHECK(yq_memtable_size(mt) == 0);
+
+    memcpy(keys[BIG - 1], "k999999", 8);
+    CHECK(yq_memtable_bulk_load(mt, many, BIG) == YQ_OK);
+    CHECK(yq_memtable_size(mt) == (size_t)BIG);
+
+    free(many);
+    free(keys);
+    yq_memtable_destroy(mt);
+
+    printf("OK\n");
+}
+
 /* ── recovery semantics through the real WAL: last write wins ─────────── */
 
 static void test_recover_last_write_wins(void) {
@@ -689,6 +799,7 @@ int main(void) {
     test_reverse_bulk_order();
     test_reset_invalidates();
     test_bulk_load();
+    test_bulk_load_preconditions();
     test_recover_last_write_wins();
 
     printf("\n=== ALL TESTS PASSED ===\n");

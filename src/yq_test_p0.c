@@ -337,6 +337,122 @@ static void test_memtable_threshold_still_rejects(void) {
     printf("OK\n");
 }
 
+/*
+ * The automatic log checkpoint is only allowed to fire once per threshold
+ * crossing, and the next crossing is defined relative to what the previous
+ * compaction actually produced.
+ *
+ * The case that matters is the one where the two limits disagree: the live set
+ * is larger than log_bytes, so compaction can never produce a log under the
+ * configured threshold. Keying the trigger to log_bytes alone then rewrites the
+ * entire log on every subsequent commit and produces a log that is still over
+ * the threshold -- pure cost, no progress. Measured on 20k keys (3.2 MB live
+ * set, log_bytes = 64 KiB, one txn per key) that was 19,622 checkpoints for
+ * 20,000 commits and 19.8x the runtime of a database that never checkpoints;
+ * with the geometric re-arm it is 8 checkpoints and 1.0x.
+ *
+ * This pins the bound, because the regression it guards is invisible in every
+ * other test: it does not lose data, it only gets slower, and by a factor that
+ * grows with the live set.
+ */
+static void test_auto_checkpoint_log_geometric_rearm(void) {
+    printf("test_auto_checkpoint_log_geometric_rearm... ");
+
+    remove_files();
+
+    yq_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size     = sizeof(yq_opts);
+    opts.flags           = YQ_OPEN_CREATE;
+    opts.log_bytes       = 64 * 1024;           /* far below the live set */
+    opts.memtable_bytes  = 256u * 1024 * 1024;  /* the live set fits, so writes never fail */
+
+    yq_db *db = NULL;
+    CHECK(yq_open(TEST_DB, &opts, &db) == YQ_OK);
+
+    yq_stat st;
+    st.struct_size = sizeof(yq_stat);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.checkpoints == 0);               /* opening must not checkpoint */
+    CHECK(st.log_bytes == 0);
+
+    uint8_t val[128];
+    memset(val, 'g', sizeof(val));
+
+    /* Below the threshold: one commit, and the log must still be under it. */
+    yq_txn *txn = NULL;
+    CHECK(yq_txn_begin(db, YQ_TXN_READWRITE, &txn) == YQ_OK);
+    {
+        char kbuf[32];
+        snprintf(kbuf, sizeof(kbuf), "%06d", 0);
+        yq_slice k = { kbuf, strlen(kbuf) };
+        yq_slice v = { val, sizeof(val) };
+        CHECK(yq_put(txn, k, v, YQ_PUT_UPSERT) == YQ_OK);
+    }
+    CHECK(yq_txn_commit(txn) == YQ_OK);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.checkpoints == 0);               /* under the threshold: no fire */
+    CHECK(st.log_bytes < opts.log_bytes);
+
+    /*
+     * Now grow past the live-set-vs-threshold conflict. 2000 commits of ~160 B
+     * is ~320 KB of live set against a 64 KiB threshold.
+     */
+    const int N = 2000;
+    for (int i = 1; i < N; i++) {
+        CHECK(yq_txn_begin(db, YQ_TXN_READWRITE, &txn) == YQ_OK);
+        char kbuf[32];
+        snprintf(kbuf, sizeof(kbuf), "%06d", i);
+        yq_slice k = { kbuf, strlen(kbuf) };
+        yq_slice v = { val, sizeof(val) };
+        CHECK(yq_put(txn, k, v, YQ_PUT_UPSERT) == YQ_OK);
+        CHECK(yq_txn_commit(txn) == YQ_OK);
+    }
+
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+
+    /* The threshold did fire -- this is not "checkpoints never happen". */
+    CHECK(st.checkpoints > 0);
+    CHECK(st.checkpoints <= 32);              /* ~2000 without the re-arm */
+
+    /*
+     * And the log stayed bounded rather than growing to the full history:
+     * compaction rewrites it to the live set, so the end state has to be a
+     * small multiple of the data, not of everything ever written.
+     */
+    const uint64_t live_bytes = (uint64_t)N * 160;
+    CHECK(st.log_bytes < live_bytes * 3);
+
+    /* The data is all there, and it survives a reopen through the bounded log. */
+    yq_txn *rtxn = NULL;
+    CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &rtxn) == YQ_OK);
+    for (int i = 0; i < N; i++) {
+        char kbuf[32];
+        snprintf(kbuf, sizeof(kbuf), "%06d", i);
+        yq_slice k = { kbuf, strlen(kbuf) };
+        yq_slice out = {0};
+        CHECK(yq_get(rtxn, k, &out) == YQ_OK);
+        CHECK(out.size == sizeof(val));
+    }
+    CHECK(yq_txn_commit(rtxn) == YQ_OK);
+
+    CHECK(yq_close(db) == YQ_OK);
+    CHECK(yq_open(TEST_DB, &opts, &db) == YQ_OK);
+    CHECK(yq_txn_begin(db, YQ_TXN_READONLY, &rtxn) == YQ_OK);
+    for (int i = 0; i < N; i += 97) {
+        char kbuf[32];
+        snprintf(kbuf, sizeof(kbuf), "%06d", i);
+        yq_slice k = { kbuf, strlen(kbuf) };
+        yq_slice out = {0};
+        CHECK(yq_get(rtxn, k, &out) == YQ_OK);
+    }
+    CHECK(yq_txn_commit(rtxn) == YQ_OK);
+
+    CHECK(yq_close(db) == YQ_OK);
+    remove_files();
+    printf("OK\n");
+}
+
 int main(void) {
     printf("=== yq-DB P0 Regression Tests ===\n\n");
 
@@ -344,6 +460,7 @@ int main(void) {
     test_recovery_exceeds_memtable_threshold();
     test_sync_off_roundtrip();
     test_memtable_threshold_still_rejects();
+    test_auto_checkpoint_log_geometric_rearm();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

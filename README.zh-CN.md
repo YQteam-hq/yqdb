@@ -298,6 +298,23 @@ WAL、opts、seek 独立测试套件）。
 - **错误码**一经发布即固定，不重排、不复用。
 - **ABI**：公开结构体只允许在尾部追加字段，且必须同步更新 `struct_size`。
 
+### 升级说明：`yq_wal_open()` 增加了同步模式参数
+
+```c
+int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size,
+                uint32_t sync_mode);   /* 新增的第 4 个参数 */
+```
+
+通过 `yq_db` 打开数据库时由引擎代为打开日志并透传 `yq_opts.sync_mode`，因此
+该变更只影响直接操作日志的调用方。传入 `YQ_SYNC_NORMAL` 可保持原有行为（每次
+`yq_wal_flush` 都落盘）；`YQ_SYNC_FULL` 为每条记录落盘；`YQ_SYNC_OFF` 把持久化
+交给操作系统——这正是此前只写在文档里、实际被忽略的 `yq_opts.sync_mode` 的作用，
+下文给出的吞吐数据即在该模式下测得。
+
+同样属于新增、且源码级兼容的改动：`yq_stat` 现在会报告 `checkpoints`（本次
+句柄上执行过的 checkpoint 次数），并真正填充此前恒为 0 的 `memtable_bytes`。
+两者都占用 `yq_stat` 原有的保留位，`sizeof(yq_stat)` 不变。
+
 ## 文档索引
 
 | 文档 | 语言 | 内容 |

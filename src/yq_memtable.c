@@ -586,9 +586,30 @@ int yq_memtable_bulk_load(yq_memtable *mt, const yq_bulk_entry *entries,
     if (n == 0) return YQ_OK;
     if (mt->num_entries != 0) return YQ_ERR_INVAL;   /* empty table only */
 
+    /*
+     * Validate the preconditions instead of trusting them.
+     *
+     * bulk_load lays the run out in key order across chunks and binary-searches
+     * every chunk on the assumption that keys are strictly increasing. A caller
+     * that hands over unsorted or duplicated keys does not get a rejected load
+     * -- it gets a table whose chunks each look sorted to themselves while the
+     * global order is broken, which surfaces much later as a key that cannot be
+     * found or a chunk that grows without bound. That is the worst shape of bug
+     * to chase back to here, and the check is a single O(n) pass with an early
+     * exit, next to a call that has just sorted the same keys.
+     */
     for (size_t i = 0; i < n; i++) {
         if (entries[i].key.size == 0 || entries[i].key.size > 1024) {
             return YQ_ERR_INVAL;
+        }
+        if (i > 0) {
+            const yq_slice *prev = &entries[i - 1].key;
+            const yq_slice *cur = &entries[i].key;
+            size_t m = prev->size < cur->size ? prev->size : cur->size;
+            int cmp = memcmp(prev->data, cur->data, m);
+            if (cmp == 0 && prev->size != cur->size) cmp = prev->size < cur->size ? -1 : 1;
+            /* >= 0 means "not strictly increasing": duplicate or out of order */
+            if (cmp >= 0) return YQ_ERR_INVAL;
         }
     }
 

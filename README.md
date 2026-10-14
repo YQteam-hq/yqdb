@@ -317,6 +317,25 @@ Current release is **1.1.0**. Please note the following boundaries:
 - **ABI**: public structs may only gain fields at the end, and `struct_size`
   must be updated in lockstep.
 
+### Upgrading: `yq_wal_open()` now takes a sync mode
+
+```c
+int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size,
+                uint32_t sync_mode);   /* new fourth argument */
+```
+
+`yq_db` opens the log for you and passes `yq_opts.sync_mode` through, so this
+only affects code that drives the log directly. Pass `YQ_SYNC_NORMAL` to keep
+the previous behaviour (a sync on every `yq_wal_flush`), `YQ_SYNC_FULL` to sync
+on every append, or `YQ_SYNC_OFF` to leave durability to the operating system —
+which is the point of the `yq_opts.sync_mode` field that was previously
+documented but ignored, and what the throughput numbers below are measured with.
+
+Also new, and source-compatible: `yq_stat` reports `checkpoints` (the number of
+checkpoints run on this handle) and now actually fills in `memtable_bytes`,
+which used to always read 0. Both fit in the space `yq_stat` had reserved, so
+`sizeof(yq_stat)` is unchanged.
+
 ## Documentation
 
 | Document | Language | Contents |
