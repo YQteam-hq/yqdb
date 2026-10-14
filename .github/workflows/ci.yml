@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build benchmark harness
         run: |
-          CORE="src/yq.c src/yq_btree.c src/yq_enc.c src/yq_memblk.c src/yq_memtable.c src/yq_mvcc.c src/yq_recover.c src/yq_slice.c src/yq_vfs.c src/yq_wal.c"
+          CORE="src/yq.c src/yq_btree.c src/yq_enc.c src/yq_memblk.c src/yq_memtable.c src/yq_mvcc.c src/yq_page.c src/yq_mempool.c src/yq_recover.c src/yq_slice.c src/yq_vfs.c src/yq_wal.c"
           gcc -O2 -std=c11 -Wall -Wextra -I include -DENGINE_YQ bench/bench_kv.c $CORE -o bench_yq
           gcc -O2 -std=c11 -Wall -Wextra -I bench/third_party -DENGINE_SQLITE bench/bench_kv.c bench/third_party/sqlite3.c -o bench_sqlite
           gcc -O2 -std=c11 -Wall -Wextra -I bench/third_party -DENGINE_LMDB bench/bench_kv.c bench/third_party/mdb.c bench/third_party/midl.c -lpthread -o bench_lmdb
