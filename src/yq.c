@@ -5,6 +5,7 @@
 #include "yq_memtable.h"
 #include "yq_mvcc.h"
 #include "yq_slice.h"
+#include "yq_mempool.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -27,6 +28,63 @@ extern int yq_recover(yq_wal *wal, yq_memtable *mt);
 
 static _Thread_local int g_last_io_err = 0;
 
+/*
+ * Pending-operation arena.
+ *
+ * pending_push() used to malloc() the key+value block of every staged write,
+ * and pending_free() walked the array to free them again: one allocator round
+ * trip per yq_put()/yq_del() inside a transaction. The mempool is a chunked
+ * bump allocator that is a better fit for exactly this shape -- nothing is
+ * released until the transaction ends, so the free list it keeps is never used
+ * and yq_mempool_reset() hands the whole thing back in one call while KEEPING
+ * the chunks.
+ *
+ * Keeping the chunks is the point. A pool per transaction would be a pessimisation
+ * for small ones: on this platform creating a pool's first chunk costs ~3.6us
+ * (VirtualAlloc + VirtualFree) against ~70ns for a single malloc, so the arena
+ * would only pay off past ~30 staged writes per transaction and every shorter
+ * transaction would get slower. The pool therefore belongs to the database and
+ * is reused across transactions.
+ *
+ * Two properties make the sharing safe:
+ *
+ *   - ownership is exclusive. `pend_pool_busy` hands the pool to one
+ *     transaction at a time; a transaction that finds it busy simply keeps
+ *     mallocing, exactly as before. That means yq_mempool itself is only ever
+ *     touched by a single thread at a time and needs no locking of its own.
+ *   - the handoff is serialised by a spinlock (the same Interlocked/C11-atomic
+ *     pair yq_wal.c uses), which is taken twice per transaction, never per
+ *     write, so the hot path stays lock-free.
+ *
+ * Blocks larger than the pool's small-object limit still go to malloc. Values
+ * run to 1 GiB in this engine (yq_put accepts up to 1<<30 bytes), so the
+ * fallback is not an edge case; pending_op records which allocator owns each
+ * block so pending_free() frees exactly the right ones.
+ */
+
+#if defined(_WIN32)
+#include <windows.h>
+typedef volatile LONG yq_spin_t;
+#define YQ_SPIN_INIT 0
+static void yq_spin_lock(yq_spin_t *l) {
+    while (InterlockedCompareExchange(l, 1, 0) != 0) { }
+}
+static void yq_spin_unlock(yq_spin_t *l) {
+    InterlockedExchange(l, 0);
+}
+#else
+#include <stdatomic.h>
+typedef atomic_int yq_spin_t;
+#define YQ_SPIN_INIT 0
+static void yq_spin_lock(yq_spin_t *l) {
+    int expected = 0;
+    while (!atomic_compare_exchange_weak(l, &expected, 1)) { expected = 0; }
+}
+static void yq_spin_unlock(yq_spin_t *l) {
+    atomic_store(l, 0);
+}
+#endif
+
 struct yq_db {
     yq_opts opts;
     char path[YQ_MAX_PATH];
@@ -44,6 +102,10 @@ struct yq_db {
     int btree_arena_owned;
     int write_enabled;
     int closed;
+    int auto_ckpt_armed;
+    yq_mempool *pend_pool;        /* arena for staged writes, reused across txns */
+    int pend_pool_busy;          /* owned by one txn at a time (under pend_pool_lock) */
+    yq_spin_t pend_pool_lock;     /* memtable threshold may fire again (hysteresis) */
 };
 
 typedef struct pending_op {
@@ -52,7 +114,13 @@ typedef struct pending_op {
     uint8_t *val;
     size_t val_len;
     int is_del;
+    uint8_t pooled;            /* block came from the db arena, not malloc */
 } pending_op;
+
+typedef struct pending_slot {
+    size_t op_idx;   /* index into txn->pending */
+    uint8_t used;
+} pending_slot;
 
 struct yq_txn {
     yq_db *db;
@@ -65,6 +133,10 @@ struct yq_txn {
     pending_op *pending;
     size_t pending_count;
     size_t pending_cap;
+    pending_slot *pending_index;   /* key -> newest pending op index */
+    size_t pending_index_cap;      /* power of two; 0 when unallocated */
+    int pending_index_off;         /* set once indexing is abandoned */
+    int uses_pool;                 /* this txn owns db->pend_pool */
 };
 
 struct yq_cur {
@@ -182,6 +254,7 @@ static void free_db(yq_db *db) {
      */
     if (db->btree) yq_btree_destroy(db->btree);
     if (db->btree_arena_owned) free(db->btree_arena);
+    if (db->pend_pool) yq_mempool_destroy(db->pend_pool);
     if (db->wal) yq_wal_close(db->wal);
     if (db->mvcc) yq_mvcc_close(db->mvcc);
     if (db->lock_file) yq_file_close(db->lock_file);
@@ -214,7 +287,9 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     if (!db) return YQ_ERR_NOMEM;
 
     db->opts = def;
+    db->pend_pool_lock = YQ_SPIN_INIT;   /* calloc already zeroes it; be explicit */
     db->write_enabled = !(def.flags & YQ_OPEN_READONLY);
+    db->auto_ckpt_armed = 1;
 
     /*
      * Reject paths that cannot hold the longest auxiliary suffix. The limit is
@@ -290,7 +365,7 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
         db->mmap_len = map_len;
     }
 
-    rc = yq_wal_open(&db->wal, db_path_buf, def.page_size);
+    rc = yq_wal_open(&db->wal, db_path_buf, def.page_size, def.sync_mode);
     if (rc != YQ_OK) { free_db(db); return rc; }
 
     if (has_existing && db->mmap_base) {
@@ -328,15 +403,199 @@ int yq_close(yq_db *db) {
     if (!db) return YQ_OK;
     if (db->closed) { free_db(db); return YQ_OK; }
     db->closed = 1;
-    if (db->write_enabled) yq_sync(db);
+    if (db->write_enabled) {
+        yq_sync(db);
+        /*
+         * Clean shutdown compacts the log (README: "close forces a
+         * checkpoint"), so the next open replays one record per live key
+         * instead of the whole run's history.
+         *
+         * The writer lock is taken non-blockingly first: compaction renames
+         * the log file and rewrites the meta pages, neither of which may
+         * race another process's in-flight commit. When the lock is held
+         * the compaction is skipped -- the log stays and the next open
+         * replays it, which is safe, merely slower. A failure of the
+         * compaction itself is likewise not the close's failure: the data
+         * is durable in the log either way.
+         */
+        int got = 0;
+        if (yq_mvcc_elect_writer(db->mvcc, 0, &got) == YQ_OK && got) {
+            (void)yq_checkpoint(db);
+            yq_mvcc_release_writer(db->mvcc);
+        }
+    }
     free_db(db);
     return YQ_OK;
 }
 
-static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
+/* Take the database arena for this transaction, or report that it is taken. */
+static int pending_pool_acquire(yq_db *db) {
+    yq_spin_lock(&db->pend_pool_lock);
+    int got = 0;
+    if (!db->pend_pool_busy) {
+        if (!db->pend_pool) {
+            /* Created outside the lock on a miss would race; do it inside. */
+            db->pend_pool = yq_mempool_create();
+        }
+        if (db->pend_pool) {
+            db->pend_pool_busy = 1;
+            got = 1;
+        }
+    }
+    yq_spin_unlock(&db->pend_pool_lock);
+    return got;
+}
+
+/* Give it back, wiping the previous owner's blocks but keeping the chunks. */
+static void pending_pool_release(yq_db *db) {
+    yq_spin_lock(&db->pend_pool_lock);
+    if (db->pend_pool_busy) {
+        yq_mempool_reset(db->pend_pool);
+        db->pend_pool_busy = 0;
+    }
+    yq_spin_unlock(&db->pend_pool_lock);
+}
+
+/*
+ * Stage one key+value block. Returns arena memory when this transaction owns
+ * the pool and the block fits its small-object limit; otherwise malloc. On
+ * failure the caller must not treat the operation as staged.
+ */
+static uint8_t *pending_block_alloc(yq_txn *txn, size_t total, int *out_pooled) {
+    if (!txn->uses_pool && total <= YQ_MEMPOOL_SMALL_OBJ_SIZE) {
+        txn->uses_pool = pending_pool_acquire(txn->db);
+    }
+    if (txn->uses_pool && total <= YQ_MEMPOOL_SMALL_OBJ_SIZE) {
+        uint8_t *p = (uint8_t *)yq_mempool_alloc(txn->db->pend_pool, total);
+        if (p) {
+            *out_pooled = 1;
+            return p;
+        }
+        /* Out of arena memory for a block this size: stay on malloc for the
+         * rest of the transaction rather than failing the write. */
+        txn->uses_pool = 0;
+        pending_pool_release(txn->db);
+    }
+    *out_pooled = 0;
+    return (uint8_t *)malloc(total ? total : 1);
+}
+
+static void pending_block_free(pending_op *op) {
+    /* Arena blocks die with the pool; only malloc'd ones are ours to free. */
+    if (!op->pooled) free(op->key);
+}
+
+/*
+ * Auxiliary index over a transaction's pending operations.
+ *
+ * pending_find() walked the pending array backwards comparing every key, so a
+ * transaction that staged N writes and then issued M reads (yq_get) or M
+ * NOOVERWRITE puts paid O(N*M) key comparisons. That lookup sits on both
+ * yq_get() and the YQ_PUT_NOOVERWRITE path of yq_put(), so a write-then-re-read
+ * loop inside one transaction degrades quadratically -- measured at 48s for a
+ * 200000-put + 200000-NOOVERWRITE transaction.
+ *
+ * The index is an open-addressing table keyed by the pending key bytes, holding
+ * the NEWEST op index per key, which is exactly what the backwards scan
+ * returned. It is strictly auxiliary: pending_apply() still replays the array in
+ * insertion order, so last-write-wins and the WAL replay order are untouched.
+ *
+ * If the table cannot be allocated or grown, indexing is abandoned (off = 1) and
+ * lookups fall back to the linear scan, so a write never fails because the index
+ * could not grow.
+ */
+
+static uint64_t pending_key_hash(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int pending_key_eq(const pending_op *op, yq_slice key) {
+    return op->key_len == key.size &&
+           (key.size == 0 || memcmp(op->key, key.data, key.size) == 0);
+}
+
+/*
+ * Find the slot holding `key`. Returns the occupied slot when present, else NULL
+ * with *slot_out pointing at the free slot an insert would claim.
+ */
+static pending_slot *pending_index_lookup(yq_txn *txn, yq_slice key, size_t *slot_out) {
+    size_t mask = txn->pending_index_cap - 1;
+    size_t i = (size_t)(pending_key_hash(key.data, key.size) & mask);
+    for (;;) {
+        pending_slot *s = &txn->pending_index[i];
+        if (!s->used) {
+            if (slot_out) *slot_out = i;
+            return NULL;
+        }
+        if (pending_key_eq(&txn->pending[s->op_idx], key)) {
+            if (slot_out) *slot_out = i;
+            return s;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/*
+ * (Re)build the index at `new_cap`. Iterating in insertion order and updating
+ * the existing slot on a repeated key is what leaves each key pointing at its
+ * newest op -- the same answer the backwards scan gave.
+ */
+static int pending_index_build(yq_txn *txn, size_t new_cap) {
+    pending_slot *ns = (pending_slot *)calloc(new_cap, sizeof(pending_slot));
+    if (!ns) return YQ_ERR_NOMEM;
+
+    size_t mask = new_cap - 1;
+    for (size_t j = 0; j < txn->pending_count; j++) {
+        pending_op *op = &txn->pending[j];
+        yq_slice k;
+        yq_slice_set(&k, op->key, op->key_len);
+        size_t i = (size_t)(pending_key_hash(op->key, op->key_len) & mask);
+        while (ns[i].used && !pending_key_eq(&txn->pending[ns[i].op_idx], k)) {
+            i = (i + 1) & mask;
+        }
+        ns[i].used = 1;
+        ns[i].op_idx = j;
+    }
+
+    free(txn->pending_index);
+    txn->pending_index = ns;
+    txn->pending_index_cap = new_cap;
+    return YQ_OK;
+}
+
+/*
+ * Index the op that was just appended. Returns YQ_ERR_NOMEM only when the table
+ * itself cannot be allocated; the caller then drops the index and keeps the
+ * linear scan.
+ */
+static int pending_index_put(yq_txn *txn, size_t op_idx) {
+    /* Stay under a 0.75 load factor so a free slot always exists. */
+    if (txn->pending_index_cap == 0 ||
+        (txn->pending_count) * 4 >= txn->pending_index_cap * 3) {
+        size_t new_cap = txn->pending_index_cap ? txn->pending_index_cap * 2 : 64;
+        return pending_index_build(txn, new_cap);
+    }
+
+    pending_op *op = &txn->pending[op_idx];
+    yq_slice k;
+    yq_slice_set(&k, op->key, op->key_len);
+    size_t slot = 0;
+    (void)pending_index_lookup(txn, k, &slot);
+    txn->pending_index[slot].used = 1;
+    txn->pending_index[slot].op_idx = op_idx;
+    return YQ_OK;
+}
+
+static pending_op *pending_find_linear(yq_txn *txn, yq_slice key, size_t *idx_out) {
     for (size_t i = txn->pending_count; i > 0; i--) {
         pending_op *op = &txn->pending[i - 1];
-        if (op->key_len == key.size && memcmp(op->key, key.data, key.size) == 0) {
+        if (pending_key_eq(op, key)) {
             if (idx_out) *idx_out = i - 1;
             return op;
         }
@@ -345,27 +604,74 @@ static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
     return NULL;
 }
 
+/*
+ * The index is built on the first lookup that could plausibly need it, not on
+ * every put.
+ *
+ * Maintaining it eagerly costs a hash and a probe per staged write -- around
+ * 150ns here -- which is pure overhead for the common shapes: a transaction
+ * that only writes, or one that writes and immediately reads the key it just
+ * wrote, where the backwards scan finds the key on its first probe. Paying that
+ * on every put to speed up a lookup that was already O(1) is a bad trade, and
+ * it measured as one.
+ *
+ * So: below YQ_PENDING_INDEX_MIN staged ops the linear scan is used (it is
+ * faster than any index at that size); at the threshold the table is built once,
+ * right-sized for the ops staged so far, and updated incrementally from then
+ * on. Put-only transactions never build it at all.
+ */
+#define YQ_PENDING_INDEX_MIN 32
+
+static pending_op *pending_find(yq_txn *txn, yq_slice key, size_t *idx_out) {
+    if (txn->pending_index_off || txn->pending_count < YQ_PENDING_INDEX_MIN) {
+        return pending_find_linear(txn, key, idx_out);
+    }
+
+    if (txn->pending_index_cap == 0) {
+        /* Start big enough for what is already staged, so the first handful of
+         * further writes do not immediately force a rebuild. */
+        size_t cap = YQ_PENDING_INDEX_MIN * 2;
+        while (cap * 3 <= txn->pending_count * 4) cap *= 2;
+        if (pending_index_build(txn, cap) != YQ_OK) {
+            /* No table, no failure: the linear scan answers everything. */
+            txn->pending_index_off = 1;
+            return pending_find_linear(txn, key, idx_out);
+        }
+    }
+
+    size_t slot = 0;
+    pending_slot *s = pending_index_lookup(txn, key, &slot);
+    if (!s) {
+        if (idx_out) *idx_out = (size_t)-1;
+        return NULL;
+    }
+    if (idx_out) *idx_out = s->op_idx;
+    return &txn->pending[s->op_idx];
+}
+
 static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
     if (txn->pending_count >= txn->pending_cap) {
         size_t nc = txn->pending_cap ? txn->pending_cap * 2 : 64;
-        pending_op *na = realloc(txn->pending, nc * sizeof(pending_op));
+        pending_op *na = (pending_op *)realloc(txn->pending, nc * sizeof(pending_op));
         if (!na) return YQ_ERR_NOMEM;
         txn->pending = na;
         txn->pending_cap = nc;
     }
+
     /*
-     * Key and value live in one allocation, the value immediately after the
-     * key. yq_put()/yq_del() stage every write of a transaction here, so this
-     * runs once per write and used to cost two malloc() calls and later two
-     * free() calls per staged operation. One call halves the allocator traffic
-     * and puts the two halves of a record next to each other, which is also
+     * Key and value live in one block, the value immediately after the key, and
+     * the block now comes from the database arena whenever it fits (see the
+     * arena notes above). One allocation per staged write either way; with the
+     * arena it is a bump of the pointer instead of a trip through the
+     * allocator, and the two halves of a record stay adjacent, which is also
      * the order pending_apply() reads them back in.
      */
     size_t klen = key.size;
     size_t vlen = is_del ? 0 : val.size;
     size_t total = klen + vlen;
 
-    uint8_t *block = (uint8_t *)malloc(total ? total : 1);
+    int pooled = 0;
+    uint8_t *block = pending_block_alloc(txn, total, &pooled);
     if (!block) return YQ_ERR_NOMEM;
 
     pending_op *op = &txn->pending[txn->pending_count];
@@ -377,20 +683,46 @@ static int pending_push(yq_txn *txn, yq_slice key, yq_slice val, int is_del) {
     if (vlen) memcpy(block + klen, val.data, vlen);
     op->val_len = vlen;
     op->is_del = is_del;
+    op->pooled = (uint8_t)pooled;
     txn->pending_count++;
+
+    /*
+     * Index the new op. A failure here only costs the O(1) lookup, so the
+     * index is dropped and the linear scan takes over rather than failing a
+     * write that has already been appended to the WAL.
+     */
+    if (txn->pending_index_cap != 0) {
+        if (pending_index_put(txn, txn->pending_count - 1) != YQ_OK) {
+            free(txn->pending_index);
+            txn->pending_index = NULL;
+            txn->pending_index_cap = 0;
+            txn->pending_index_off = 1;
+        }
+    }
     return YQ_OK;
 }
 
 static void pending_free(yq_txn *txn) {
-    if (!txn->pending) return;
-    /* key and value share a single allocation (see pending_push). */
-    for (size_t i = 0; i < txn->pending_count; i++) {
-        free(txn->pending[i].key);
+    if (txn->pending) {
+        for (size_t i = 0; i < txn->pending_count; i++) {
+            pending_block_free(&txn->pending[i]);
+        }
+        free(txn->pending);
+        txn->pending = NULL;
     }
-    free(txn->pending);
-    txn->pending = NULL;
     txn->pending_count = 0;
     txn->pending_cap = 0;
+
+    free(txn->pending_index);
+    txn->pending_index = NULL;
+    txn->pending_index_cap = 0;
+    txn->pending_index_off = 0;
+
+    /* Hand the arena back so the next transaction can reuse its chunks. */
+    if (txn->uses_pool) {
+        txn->uses_pool = 0;
+        pending_pool_release(txn->db);
+    }
 }
 
 static int pending_apply(yq_txn *txn) {
@@ -459,6 +791,46 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     return YQ_OK;
 }
 
+/*
+ * Should this commit run a checkpoint? (FORMAT.md §9 trigger conditions.)
+ *
+ * Both thresholds are opts fields that were previously documented but never
+ * consulted, so the log could grow without bound for the lifetime of the
+ * process and reopen replayed every byte of it.
+ *
+ * The two thresholds are not symmetric:
+ *
+ *   - log_bytes is self-limiting. Compaction rewrites the log down to the
+ *     live dataset, so once it fires it cannot fire again until the log has
+ *     grown back past the threshold.
+ *   - memtable_bytes is NOT self-limiting until B+Tree spilling exists:
+ *     compaction rewrites the log but leaves the memtable full. Firing it on
+ *     every commit after a crossing would rewrite the whole log on every
+ *     commit -- an O(dataset) cost per commit. It therefore fires once per
+ *     crossing (disarm on fire, regardless of the outcome) and re-arms only
+ *     after usage has fallen back below half the threshold. That hysteresis
+ *     becomes unnecessary once checkpoint can drain the memtable into the
+ *     tree.
+ *
+ * Called from the commit path while the writer lock is held.
+ */
+static int auto_ckpt_due(yq_db *db) {
+    if (!db->write_enabled) return 0;
+
+    if (yq_wal_size(db->wal) >= db->opts.log_bytes) return 1;
+
+    uint64_t mt_bytes = (uint64_t)yq_memtable_bytes(db->memtable);
+    if (db->auto_ckpt_armed) {
+        if (mt_bytes >= db->opts.memtable_bytes) {
+            db->auto_ckpt_armed = 0;   /* one shot per crossing */
+            return 1;
+        }
+    } else if (mt_bytes < db->opts.memtable_bytes / 2) {
+        db->auto_ckpt_armed = 1;       /* well below the threshold again */
+    }
+    return 0;
+}
+
 int yq_txn_commit(yq_txn *txn) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
@@ -502,6 +874,23 @@ int yq_txn_commit(yq_txn *txn) {
         }
 
         rc2 = yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, cur_free, cur_npages, cur_ckpt);
+
+        /*
+         * Auto-checkpoint while this commit still holds the writer lock.
+         * Compaction rewrites the log file and swaps db->wal (see
+         * wal_compact_from_memtable), and writes a fresh meta page -- none
+         * of which may race another writer, and the file lock is the only
+         * cross-process exclusion there is.
+         *
+         * The commit is already durable at this point (its COMMIT record
+         * was flushed above) and already applied to the memtable, so the
+         * compacted log contains it. A checkpoint failure is deliberately
+         * NOT the commit's failure: the data is safe in the log, so the
+         * error is dropped here and the next threshold crossing retries.
+         */
+        if (auto_ckpt_due(db)) {
+            (void)yq_checkpoint(db);
+        }
 
         yq_mvcc_release_writer(db->mvcc);
     }
@@ -855,7 +1244,7 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
     memcpy(tmp_db + plen, ".ckpt-tmp", 10);
 
     yq_wal *tmp = NULL;
-    int rc = yq_wal_open(&tmp, tmp_db, db->opts.page_size);
+    int rc = yq_wal_open(&tmp, tmp_db, db->opts.page_size, db->opts.sync_mode);
     if (rc != YQ_OK) return rc;
 
     rc = yq_wal_append_begin(tmp, txn_id);
@@ -922,7 +1311,8 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
          * 不是踩 NULL），然后把错误透出去。
          */
         yq_wal *reopen_wal = NULL;
-        int reopen_rc = yq_wal_open(&reopen_wal, db->path, db->opts.page_size);
+        int reopen_rc = yq_wal_open(&reopen_wal, db->path, db->opts.page_size,
+                                    db->opts.sync_mode);
         if (reopen_rc != YQ_OK) {
             db->write_enabled = 0;
             return rc;
@@ -937,7 +1327,7 @@ static int wal_compact_from_memtable(yq_db *db, uint64_t txn_id) {
      * 悬空 NULL。
      */
     yq_wal *new_wal = NULL;
-    rc = yq_wal_open(&new_wal, db->path, db->opts.page_size);
+    rc = yq_wal_open(&new_wal, db->path, db->opts.page_size, db->opts.sync_mode);
     if (rc != YQ_OK) {
         /*
          * 数据已安全落在 <db>.log 上，只是这次没能在进程内重新打开它。

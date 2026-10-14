@@ -69,7 +69,7 @@ static void test_scan_from_lsn(void) {
     cleanup_files();
 
     yq_wal *wal = NULL;
-    check(yq_wal_open(&wal, DB_PATH, 4096) == YQ_OK, "open wal");
+    check(yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL) == YQ_OK, "open wal");
     if (!wal) return;
 
     yq_slice k, v;
@@ -82,7 +82,7 @@ static void test_scan_from_lsn(void) {
     check(yq_wal_flush(wal) == YQ_OK, "flush wal");
     check(yq_wal_close(wal) == YQ_OK, "close wal");
 
-    check(yq_wal_open(&wal, DB_PATH, 4096) == YQ_OK, "reopen wal");
+    check(yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL) == YQ_OK, "reopen wal");
     if (!wal) return;
 
     scan_probe all = { 0, 0, 1 };
@@ -105,7 +105,7 @@ static void test_replay_committed_only(void) {
     cleanup_files();
 
     yq_wal *wal = NULL;
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "open wal"); return; }
 
     yq_slice k, v;
@@ -132,7 +132,7 @@ static void test_replay_committed_only(void) {
     yq_wal_flush(wal);
     yq_wal_close(wal);
 
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "reopen wal"); return; }
     yq_memtable *mt = yq_memtable_create(1u << 20);
     check(mt != NULL, "create memtable");
@@ -167,7 +167,7 @@ static void test_cross_block_records(void) {
     vbuf[sizeof(vbuf) - 1] = '\0';
 
     yq_wal *wal = NULL;
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "open wal"); return; }
 
     for (int i = 0; i < N; i++) {
@@ -184,7 +184,7 @@ static void test_cross_block_records(void) {
     yq_wal_close(wal);
     check(total > 3u * 64u * 1024u, "wal spans more than three 64 KiB blocks");
 
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "reopen wal"); return; }
     yq_memtable *mt = yq_memtable_create(1u << 24);
     check(mt != NULL, "create memtable");
@@ -218,7 +218,7 @@ static void test_large_payload(void) {
     for (int i = 0; i < VLEN; i++) big[i] = (char)('a' + (i % 26));
 
     yq_wal *wal = NULL;
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "open wal"); free(big); return; }
 
     yq_slice k, v;
@@ -233,7 +233,7 @@ static void test_large_payload(void) {
     check(yq_wal_flush(wal) == YQ_OK, "flush");
     yq_wal_close(wal);
 
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "reopen wal"); free(big); return; }
 
     /* 扫描必须把这 96 KiB payload 完整交给 visitor */
@@ -267,7 +267,7 @@ static void test_crc_truncation(void) {
     cleanup_files();
 
     yq_wal *wal = NULL;
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "open wal"); return; }
 
     yq_slice k, v;
@@ -289,7 +289,7 @@ static void test_crc_truncation(void) {
         yq_file_close(f);
     }
 
-    yq_wal_open(&wal, DB_PATH, 4096);
+    yq_wal_open(&wal, DB_PATH, 4096, YQ_SYNC_NORMAL);
     if (!wal) { check(0, "reopen wal"); return; }
     yq_memtable *mt = yq_memtable_create(1u << 20);
     check(mt != NULL, "create memtable");

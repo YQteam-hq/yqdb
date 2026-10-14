@@ -90,3 +90,33 @@ void *yq_memblk_base(yq_memblk *b) {
 size_t yq_memblk_used(yq_memblk *b) {
     return b ? b->used : 0;
 }
+
+size_t yq_memblk_size(yq_memblk *b) {
+    return b ? b->size : 0;
+}
+
+yq_memblk *yq_memblk_grow(yq_memblk *b, size_t new_size) {
+    if (!b) return NULL;
+
+    size_t used = b->used;
+    if (new_size < used) new_size = used;   /* never lose live bytes */
+    new_size = round_up(new_size, 4096);
+    if (new_size <= b->size) return b;      /* already large enough */
+
+    yq_memblk *nb = yq_memblk_create(new_size);
+    if (!nb) return NULL;
+
+    if (used) memcpy(nb->base, b->base, used);
+    nb->used = used;
+
+    /*
+     * Destroy the old block without walking its `next` chain: alloc() never
+     * links blocks (see the header note), so next is always NULL here, but
+     * keep the field explicitly NULL so the assumption is enforced rather
+     * than assumed.
+     */
+    b->next = NULL;
+    yq_memblk_destroy(b);
+
+    return nb;
+}

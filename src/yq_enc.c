@@ -92,8 +92,105 @@ static void crc32c_init_table_once(void) {
     crc32c_ready_set();
 }
 
+/*
+ * Hardware path (SSE4.2).
+ *
+ * The CRC32 instruction folds 8 bytes per instruction with a 3-cycle
+ * dependency chain, which is roughly an order of magnitude faster than the
+ * table lookups -- and every B+Tree page read verifies one of these checksums,
+ * so it is worth having. The instruction is not part of the base x86 ISA, so it
+ * needs three things this build does not otherwise assume:
+ *
+ *   - GCC/Clang intrinsics plus a target attribute, because the translation
+ *     unit is not compiled with -msse4.2 and the compiler would otherwise
+ *     refuse to emit the instruction;
+ *   - a run-time CPU check, so the same binary still runs on pre-Haswell parts;
+ *   - an MSVC / non-x86 fallback, which keeps using slicing-by-8.
+ *
+ * The result is bit-identical to the software path (same reflected polynomial,
+ * same init and final xor), so nothing on disk changes.
+ */
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <nmmintrin.h>
+#define YQ_CRC32C_HAVE_INTRINSIC 1
+#endif
+
+#if defined(YQ_CRC32C_HAVE_INTRINSIC)
+
+__attribute__((target("sse4.2")))
+static uint32_t crc32c_hw(const uint8_t *p, size_t len, uint32_t crc) {
+    const uint8_t *end = p + len;
+
+#if defined(__x86_64__)
+    while (p + 8 <= end) {
+        uint64_t v;
+        memcpy(&v, p, sizeof(v));
+        crc = (uint32_t)_mm_crc32_u64((uint64_t)crc, v);
+        p += 8;
+    }
+#endif
+    while (p + 4 <= end) {
+        uint32_t v;
+        memcpy(&v, p, sizeof(v));
+        crc = _mm_crc32_u32(crc, v);
+        p += 4;
+    }
+    while (p < end) {
+        crc = _mm_crc32_u8(crc, *p);
+        p++;
+    }
+    return crc;
+}
+
+/*
+ * Cached CPU probe.
+ *
+ * __builtin_cpu_supports() itself is cheap but not free, and this sits on the
+ * page-read path, so the answer is memoised. The flag is an atomic rather than
+ * a plain int for the same reason crc32c_ready is: a torn or stale read of a
+ * plain int is undefined behaviour, and two threads racing here would both
+ * compute the same value anyway.
+ */
+#if defined(_WIN32)
+static volatile LONG crc32c_hw_ready = -1;
+#else
+static atomic_int crc32c_hw_ready;
+#endif
+
+static int crc32c_hw_available(void) {
+#if defined(_WIN32)
+    LONG v = InterlockedCompareExchange(&crc32c_hw_ready, -1, -1);
+    if (v == -1) {
+        v = __builtin_cpu_supports("sse4.2") ? 1 : 0;
+        InterlockedExchange(&crc32c_hw_ready, v);
+    }
+    return (int)v;
+#else
+    int v = atomic_load_explicit(&crc32c_hw_ready, memory_order_acquire);
+    if (v < 0) {
+        v = __builtin_cpu_supports("sse4.2") ? 1 : 0;
+        atomic_store_explicit(&crc32c_hw_ready, v, memory_order_release);
+    }
+    return v;
+#endif
+}
+
+#endif /* YQ_CRC32C_HAVE_INTRINSIC */
+
 uint32_t yq_crc32c(const void *data, size_t len) {
     if (len == 0) return 0;
+
+    /*
+     * The hardware path does not touch the tables, so on a CPU with
+     * SSE4.2 the 8 KiB of slicing-by-8 tables are never built at all -- and
+     * the init call disappears from the page-read hot path.
+     */
+#if defined(YQ_CRC32C_HAVE_INTRINSIC)
+    if (crc32c_hw_available()) {
+        return crc32c_hw((const uint8_t *)data, len, 0xFFFFFFFFu) ^ 0xFFFFFFFFu;
+    }
+#endif
+
     crc32c_init_table_once();
 
     const uint8_t *p = (const uint8_t *)data;

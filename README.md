@@ -291,7 +291,10 @@ Current release is **1.1.0**. Please note the following boundaries:
    `yq_checkpoint` merges the memtable into the B+Tree and truncates the log.
    B+Tree page spilling beyond checkpoint scope remains a reserved capability:
    - Data is recoverable from `path.log` after a close;
-   - `path.log` grows while the process runs without a checkpoint.
+   - `path.log` is compacted automatically once it passes `opts.log_bytes`
+     (default 256 MiB), so it no longer grows without bound for the lifetime
+     of a process; without spilling, `memtable_bytes` (default 64 MiB) remains
+     a hard ceiling on live data in memory.
    - Recovery cost in 1.1.0 vs 1.0.0: ~1.45× faster on random keys and
      ~9.4× faster on sequential keys (same-machine comparison; see
      [BENCHMARKS → 1.0.0 → 1.1.0 Upgrade Benchmark](docs/BENCHMARKS.md#100--110-upgrade-benchmark)).

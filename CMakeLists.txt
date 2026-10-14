@@ -20,6 +20,7 @@ set(SOURCES
     src/yq_memblk.c
     src/yq_vfs.c
     src/yq_slice.c
+    src/yq_page.c
     src/yq_btree.c
     src/yq_memtable.c
     src/yq_wal.c
@@ -83,3 +84,19 @@ endforeach()
 add_executable(yq_test_p4 src/yq_test_p4.c)
 target_link_libraries(yq_test_p4 yqdb)
 add_test(NAME p4_recovery_test COMMAND yq_test_p4)
+
+add_executable(yq_test_p0 src/yq_test_p0.c)
+target_link_libraries(yq_test_p0 yqdb)
+add_test(NAME p0_blowup_fixes_test COMMAND yq_test_p0)
+
+add_executable(yq_test_memtable src/yq_test_memtable.c)
+target_link_libraries(yq_test_memtable yqdb)
+add_test(NAME memtable_model_test COMMAND yq_test_memtable)
+
+add_executable(yq_test_btree src/yq_test_btree.c)
+target_link_libraries(yq_test_btree yqdb)
+add_test(NAME btree_build_test COMMAND yq_test_btree)
+
+add_executable(yq_test_pending src/yq_test_pending.c)
+target_link_libraries(yq_test_pending yqdb)
+add_test(NAME pending_test COMMAND yq_test_pending)

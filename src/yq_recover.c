@@ -220,6 +220,127 @@ static int recovery_visitor(void *ctx_arg, uint64_t lsn, uint64_t txn_id, int re
     return YQ_OK;
 }
 
+/*
+ * P2: index build by sort, not by replay.
+ *
+ * The previous phase-2 loop replayed every committed operation into the
+ * memtable one record at a time. That is O(n) inserts into an ordered
+ * structure -- O(n^2) in the worst case (random key order in the log) --
+ * and it dominated reopen for anything but trivial logs.
+ *
+ * Replay semantics only ever look at the FINAL state of each key, so the
+ * per-record application order can be replaced by: collect the committed
+ * operations, sort once by (key, log order), keep the last operation per
+ * key, and hand the deduplicated run to yq_memtable_bulk_load(), which
+ * builds the chunk layout directly. The observable result is identical --
+ * last write wins per key, a trailing DEL hides earlier PUTs -- but the
+ * cost is one sort (O(n log n)) plus a linear bulk build.
+ *
+ * Bytes are referenced in place from the scan arenas; the bulk load copies
+ * them into the memtable arena, after which both areas are released by the
+ * caller.
+ */
+typedef struct rec_candidate {
+    const uint8_t *key;
+    const uint8_t *val;               /* NULL for DEL */
+    size_t key_len;
+    size_t val_len;
+    int is_del;
+    size_t seq;                       /* position in the scan order */
+} rec_candidate;
+
+/* Byte-string order: memcmp over the common prefix, then shorter first.
+ * Matches yq_slice_compare_raw(). */
+static int key_order_cmp(const uint8_t *a, size_t alen,
+                         const uint8_t *b, size_t blen) {
+    size_t min = alen < blen ? alen : blen;
+    if (min) {
+        int c = memcmp(a, b, min);
+        if (c) return c < 0 ? -1 : 1;
+    }
+    if (alen != blen) return alen < blen ? -1 : 1;
+    return 0;
+}
+
+static int candidate_cmp(const void *pa, const void *pb) {
+    const rec_candidate *a = (const rec_candidate *)pa;
+    const rec_candidate *b = (const rec_candidate *)pb;
+
+    int c = key_order_cmp(a->key, a->key_len, b->key, b->key_len);
+    if (c) return c;
+    /* Same key: log order decides, so the LAST element of a run is the
+     * operation that must survive. Totally ordered -> qsort stays honest. */
+    if (a->seq != b->seq) return a->seq < b->seq ? -1 : 1;
+    return 0;
+}
+
+static int recover_build_index(yq_memtable *mt, recover_ctx *ctx) {
+    int rc = YQ_OK;
+    rec_candidate *cand = NULL;
+    yq_bulk_entry *bulk = NULL;
+
+    /* 1. Collect the committed operations in scan (log) order. */
+    size_t ncommit = 0;
+    for (size_t i = 0; i < ctx->ops_count; i++) {
+        if (rc_hash_contains(&ctx->committed, ctx->ops[i].txn_id)) ncommit++;
+    }
+    if (ncommit == 0) return YQ_OK;
+
+    cand = (rec_candidate *)malloc(ncommit * sizeof(rec_candidate));
+    if (!cand) return YQ_ERR_NOMEM;
+
+    size_t w = 0;
+    for (size_t i = 0; i < ctx->ops_count; i++) {
+        const rec_op *op = &ctx->ops[i];
+        if (!rc_hash_contains(&ctx->committed, op->txn_id)) continue;
+
+        rec_candidate *c = &cand[w];
+        c->key = ctx->keys ? ctx->keys + op->key_off : NULL;
+        c->key_len = op->key_len;
+        c->is_del = (op->type == 3);
+        c->val = c->is_del ? NULL
+                           : (ctx->vals ? ctx->vals + op->val_off : NULL);
+        c->val_len = c->is_del ? 0 : op->val_len;
+        c->seq = w++;
+    }
+
+    /* 2. One sort by (key, log order). */
+    qsort(cand, ncommit, sizeof(rec_candidate), candidate_cmp);
+
+    /*
+     * 3. Keep the last operation per key: runs of equal keys are contiguous
+     *    after the sort, and the run's final element carries the highest
+     *    sequence number (the latest write in log order).
+     */
+    bulk = (yq_bulk_entry *)malloc(ncommit * sizeof(yq_bulk_entry));
+    if (!bulk) { free(cand); return YQ_ERR_NOMEM; }
+
+    size_t nb = 0;
+    for (size_t i = 0; i < ncommit; ) {
+        size_t j = i;
+        while (j + 1 < ncommit &&
+               key_order_cmp(cand[j + 1].key, cand[j + 1].key_len,
+                             cand[i].key, cand[i].key_len) == 0) {
+            j++;
+        }
+        const rec_candidate *win = &cand[j];   /* last write for this key */
+        bulk[nb].key.data = win->key;
+        bulk[nb].key.size = win->key_len;
+        bulk[nb].val.data = win->is_del ? NULL : win->val;
+        bulk[nb].val.size = win->is_del ? 0 : win->val_len;
+        bulk[nb].tombstone = win->is_del;
+        nb++;
+        i = j + 1;
+    }
+
+    /* 4. Build the index in one pass. */
+    rc = yq_memtable_bulk_load(mt, bulk, nb);
+
+    free(bulk);
+    free(cand);
+    return rc;
+}
+
 int yq_recover(yq_wal *wal, yq_memtable *mt) {
     if (!wal || !mt) return YQ_ERR_INVAL;
     if (yq_wal_size(wal) == 0) return YQ_OK;
@@ -231,27 +352,27 @@ int yq_recover(yq_wal *wal, yq_memtable *mt) {
     int rc = rc_hash_init(&ctx.committed);
     if (rc != YQ_OK) return rc;
 
+    /*
+     * Two changes make a live dataset larger than memtable_bytes replayable:
+     *
+     *  1. Grow the arena to fit at most the whole log. The replayed live set
+     *     can never exceed the bytes that were appended, so the log size is
+     *     a safe upper bound; without this the arena (2x memtable_bytes)
+     *     would run out mid-replay and the database would stay unopenable.
+     *  2. Lift the max_bytes admission check (see
+     *     yq_memtable_set_limit_enforcement).
+     *
+     * Both matter: failing to open the database is data loss caused by a
+     * memory threshold, which is strictly worse than exceeding it.
+     */
+    rc = yq_memtable_reserve(mt, (size_t)yq_wal_size(wal));
+    if (rc != YQ_OK) return rc;
+    yq_memtable_set_limit_enforcement(mt, 0);
+
     rc = yq_wal_scan(wal, 0, recovery_visitor, &ctx);
 
     if (rc == YQ_OK || rc == YQ_ERR_CORRUPT) {
-        int replay_rc = YQ_OK;
-        for (size_t i = 0; i < ctx.ops_count; i++) {
-            rec_op *op = &ctx.ops[i];
-            if (!rc_hash_contains(&ctx.committed, op->txn_id)) continue;
-            yq_slice k;
-            k.data = ctx.keys ? ctx.keys + op->key_off : NULL;
-            k.size = op->key_len;
-            if (op->type == 2) {
-                yq_slice v;
-                v.data = ctx.vals ? ctx.vals + op->val_off : NULL;
-                v.size = op->val_len;
-                int op_rc = yq_memtable_put(mt, k, v);
-                if (op_rc != YQ_OK) { replay_rc = op_rc; break; }
-            } else if (op->type == 3) {
-                int op_rc = yq_memtable_del(mt, k);
-                if (op_rc != YQ_OK) { replay_rc = op_rc; break; }
-            }
-        }
+        int replay_rc = recover_build_index(mt, &ctx);
         if (replay_rc != YQ_OK) {
             rc = replay_rc;
         } else if (rc == YQ_ERR_CORRUPT) {
@@ -263,6 +384,9 @@ int yq_recover(yq_wal *wal, yq_memtable *mt) {
     free(ctx.ops);
     free(ctx.keys);
     free(ctx.vals);
+
+    /* Restore the write path's admission check before handing the handle over. */
+    yq_memtable_set_limit_enforcement(mt, 1);
 
     return rc;
 }

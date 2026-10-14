@@ -44,7 +44,7 @@ int main(void) {
 
     printf("[11] yq_wal_open\n"); fflush(stdout);
     yq_wal *wal = NULL;
-    rc = yq_wal_open(&wal, "build\\yqtest.yqdb", 4096);
+    rc = yq_wal_open(&wal, "build\\yqtest.yqdb", 4096, YQ_SYNC_NORMAL);
     printf("[12] wal=%p rc=%d\n", (void*)wal, rc); fflush(stdout);
     if (rc != 0 || !wal) { printf("FAIL wal rc=%d\n", rc); return 1; }
 

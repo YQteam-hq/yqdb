@@ -12,7 +12,16 @@
  *      covers the 8-byte main loop, the 8-way tail, and the boundary between
  *      them without hard-coding any expected magic numbers;
  *   3. buffer alignment offsets, since the implementation assembles its 32-bit
- *      words by hand and must stay correct on unaligned input.
+ *      words by hand and must stay correct on unaligned input;
+ *   4. an offset/length sweep over a 64 KiB buffer, which walks every
+ *      combination of the 8/4/1-byte steps of the hardware loop and of the
+ *      8-byte-plus-tail loop of the software one.
+ *
+ * yq_crc32c() picks its implementation at run time: SSE4.2 where the CPU has
+ * it, slicing-by-8 otherwise. These tests hold whichever path this machine
+ * selects to the same output, because a checksum written by one build is
+ * verified by every other -- a mismatch here is silent data corruption, not a
+ * failing build.
  */
 
 #include "yq_enc.h"
@@ -21,6 +30,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 /*
  * Bitwise reference CRC32C: one bit per step, no tables. Slow but trivially
@@ -112,6 +127,101 @@ static void test_page_sized(void) {
     free(buf);
 }
 
+/*
+ * A sweep over a buffer much larger than any single checksummed object, with
+ * offset and length varied together. This is what makes the two paths
+ * comparable rather than merely self-consistent: it walks every combination of
+ * the 8-byte, 4-byte and 1-byte steps in the SSE4.2 loop and the 8-byte main
+ * loop plus every tail length in the slicing-by-8 loop, at every alignment.
+ * Whichever path this CPU selects, its result has to equal the bitwise
+ * reference, and a page CRC written by one build is verified by every other.
+ */
+static void test_large_sweep(void) {
+    size_t n = 64 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(n);
+    CHECK(buf != NULL);
+
+    unsigned seed = 0xC0FFEEu;
+    for (size_t i = 0; i < n; i++) {
+        seed = seed * 1103515245u + 12345u;
+        buf[i] = (uint8_t)(seed >> 16);
+    }
+
+    int checked = 0;
+    for (size_t off = 0; off < 16; off++) {
+        for (size_t len = 1; len + off <= n; len = len * 3 + 1) {
+            uint32_t got = yq_crc32c(buf + off, len);
+            uint32_t want = crc32c_reference(buf + off, len);
+            if (got != want) {
+                fprintf(stderr, "\nFAIL: sweep off=%zu len=%zu: got 0x%08" PRIx32
+                                ", want 0x%08" PRIx32 "\n", off, len, got, want);
+                free(buf);
+                exit(1);
+            }
+            checked++;
+        }
+    }
+
+    free(buf);
+    printf("     (%d offset/length combinations over %zu KiB)\n", checked, n / 1024);
+}
+
+/* Informational: what the checksum costs per call at record and page sizes. */
+static void test_throughput(void) {
+    size_t n = 1 << 20;
+    uint8_t *buf = (uint8_t *)malloc(n);
+    CHECK(buf != NULL);
+    memset(buf, 0x5A, n);
+
+#if defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+#else
+    struct timespec t0, t1;
+#endif
+
+    volatile uint32_t sink = 0;
+    const int reps = 200;
+#if defined(_WIN32)
+    QueryPerformanceCounter(&c);
+    double t_start = (double)c.QuadPart / (double)f.QuadPart;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
+    for (int i = 0; i < reps; i++) sink ^= yq_crc32c(buf, n);
+#if defined(_WIN32)
+    QueryPerformanceCounter(&c);
+    double dt = (double)(c.QuadPart - (LONGLONG)(t_start * f.QuadPart)) / (double)f.QuadPart;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+#endif
+    (void)sink;
+
+    printf("     1 MiB: %.0f MB/s", (double)n * reps / (1024.0 * 1024.0) / dt);
+
+    /* record-sized, which is what the WAL actually hashes per record */
+    const int rreps = 200000;
+#if defined(_WIN32)
+    QueryPerformanceCounter(&c);
+    t_start = (double)c.QuadPart / (double)f.QuadPart;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
+    for (int i = 0; i < rreps; i++) sink ^= yq_crc32c(buf + (size_t)(i % 1000), 128);
+#if defined(_WIN32)
+    QueryPerformanceCounter(&c);
+    dt = (double)(c.QuadPart - (LONGLONG)(t_start * f.QuadPart)) / (double)f.QuadPart;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    dt = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+#endif
+    (void)sink;
+    printf("   128 B: %.0f ns/call\n", dt * 1e9 / (double)rreps);
+
+    free(buf);
+}
+
 int main(void) {
     test_check_vector();
     printf("ok  crc32c check vector\n");
@@ -121,6 +231,9 @@ int main(void) {
     printf("ok  crc32c unaligned offsets\n");
     test_page_sized();
     printf("ok  crc32c page-sized buffers\n");
+    test_large_sweep();
+    printf("ok  crc32c large offset/length sweep\n");
+    test_throughput();
     printf("crc_test: all cases passed\n");
     return 0;
 }

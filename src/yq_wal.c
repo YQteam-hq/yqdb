@@ -1,9 +1,59 @@
+#if !defined(_WIN32)
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "yq_wal.h"
 #include "yq_vfs.h"
 #include "yq_enc.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <stdatomic.h>
+#include <sched.h>
+#endif
+
+/*
+ * A minimal spinlock for the flush critical section.
+ *
+ * The library links without any threading runtime on POSIX (see README:
+ * "no -lpthread requirement"), so a pthread mutex is not available here; the
+ * Interlocked / C11-atomic pair is the same pattern the Win32 in-process
+ * writer registry in yq_mvcc.c uses. The critical section is only ever held
+ * for the duration of a pwrite/fsync, and the single-writer protocol means
+ * appenders do not contend for it on the hot path.
+ */
+#if defined(_WIN32)
+static void wal_spin_lock(volatile LONG *lock) {
+    while (InterlockedCompareExchange(lock, 1, 0) != 0) {
+        SwitchToThread();
+    }
+}
+
+static void wal_spin_unlock(volatile LONG *lock) {
+    InterlockedExchange(lock, 0);
+}
+#else
+static void wal_spin_lock(atomic_int *lock) {
+    int expected = 0;
+    while (!atomic_compare_exchange_weak(lock, &expected, 1)) {
+        expected = 0;
+        sched_yield();
+    }
+}
+
+static void wal_spin_unlock(atomic_int *lock) {
+    atomic_store(lock, 0);
+}
+#endif
 
 #define YQ_WAL_HEADER_SIZE 29
 #define YQ_WAL_MAX_KEY_SIZE 1024
@@ -32,6 +82,22 @@ struct yq_wal {
     uint64_t default_page_size;
     uint64_t file_size;
     uint64_t last_lsn;
+    /*
+     * Durability configuration (YQ_SYNC_* from yq.h). The WAL owns the
+     * policy for the log file; yq_txn_commit() only decides whether the
+     * database file itself needs an extra sync under YQ_SYNC_FULL.
+     */
+    uint32_t sync_mode;
+    /*
+     * Serialises (stamp CRCs -> pwrite -> sync) as one unit, so the file
+     * offset, the buffer bookkeeping and the CRC pass can never interleave
+     * with another flush. See the note in append_record().
+     */
+#if defined(_WIN32)
+    volatile LONG flush_spin;
+#else
+    atomic_int flush_spin;
+#endif
     char log_path[YQ_MAX_PATH];
 };
 
@@ -43,7 +109,8 @@ static int make_log_path(char *out, size_t out_cap, const char *db_path) {
     return YQ_OK;
 }
 
-int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size) {
+int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size,
+                uint32_t sync_mode) {
     yq_wal *wal = calloc(1, sizeof(yq_wal));
     if (!wal) return YQ_ERR_NOMEM;
 
@@ -68,6 +135,7 @@ int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size) {
         return YQ_ERR_NOMEM;
     }
 
+    wal->sync_mode = sync_mode;
     wal->file_size = yq_file_size(wal->file);
     wal->last_lsn = 0;
 
@@ -109,8 +177,23 @@ static int ensure_buf_space(yq_wal *wal, size_t need) {
 static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
                          const uint8_t *payload, size_t paylen) {
     size_t total = YQ_WAL_HEADER_SIZE + paylen;
+
+    /*
+     * The buffer bookkeeping (grow, fill, publish buf_used) is serialised
+     * against yq_wal_flush() by flush_spin. Without this, a yq_sync() or
+     * yq_checkpoint() running on a thread that does not hold the writer
+     * lock could pwrite while an append is half-done, or two flushes could
+     * pwrite at the same offset and overwrite each other's records. The
+     * realloc inside ensure_buf_space() therefore runs under the lock; it
+     * is uncontended on the normal single-writer path.
+     */
+    wal_spin_lock(&wal->flush_spin);
+
     int rc = ensure_buf_space(wal, total);
-    if (rc != YQ_OK) return rc;
+    if (rc != YQ_OK) {
+        wal_spin_unlock(&wal->flush_spin);
+        return rc;
+    }
 
     uint8_t *p = wal->buf + wal->buf_used;
 
@@ -129,7 +212,10 @@ static int append_record(yq_wal *wal, uint64_t txn_id, int rec_type,
         memcpy(p + YQ_WAL_HEADER_SIZE, payload, paylen);
     }
 
+    /* Published last, so a concurrent flush only ever sees whole records. */
     wal->buf_used += total;
+
+    wal_spin_unlock(&wal->flush_spin);
     return YQ_OK;
 }
 
@@ -232,7 +318,19 @@ int yq_wal_append_ckpt_end(yq_wal *wal, uint64_t ckpt_lsn) {
 }
 
 int yq_wal_flush(yq_wal *wal) {
-    if (!wal || wal->buf_used == 0) return YQ_OK;
+    if (!wal) return YQ_OK;
+
+    /*
+     * Serialise (stamp CRCs -> pwrite -> sync decision) so that the CRC
+     * pass, the file offset, and the durability watermark are always
+     * updated as one unit. See the note in append_record().
+     */
+    wal_spin_lock(&wal->flush_spin);
+
+    if (wal->buf_used == 0) {
+        wal_spin_unlock(&wal->flush_spin);
+        return YQ_OK;
+    }
 
     /*
      * Pass 1 -- stamp both CRCs for every buffered record. The header CRC
@@ -271,16 +369,61 @@ int yq_wal_flush(yq_wal *wal) {
      * file_size, and yq_file_pwrite() loops internally for short writes /
      * EINTR, so one call transfers exactly buf_used bytes. This removes one
      * write() syscall per committed record from the commit hot path.
+     *
+     * The buffer is released as soon as the bytes are in the file, not after
+     * the sync: a later flush syncs the whole file (this call's bytes
+     * included) if this one's sync fails.
      */
     int rc = yq_file_pwrite(wal->file, wal->buf, wal->buf_used, wal->file_size);
-    if (rc != YQ_OK) return rc;
+    if (rc != YQ_OK) {
+        wal_spin_unlock(&wal->flush_spin);
+        return rc;
+    }
 
-    rc = yq_file_sync(wal->file);
-    if (rc != YQ_OK) return rc;
-
-    wal->file_size += wal->buf_used;
+    uint64_t end = wal->file_size + wal->buf_used;
+    wal->file_size = end;
     wal->buf_used = 0;
 
+    /*
+     * Durability policy. YQ_SYNC_OFF used to be indistinguishable from
+     * NORMAL here: this function fsynced unconditionally, so
+     * opts.flags = YQ_OPEN_NOSYNC ("ignore all durability waits") still
+     * paid one fdatasync per commit. Handing the bytes to the OS is the
+     * entire contract of that mode.
+     */
+    if (wal->sync_mode == YQ_SYNC_OFF) {
+        wal_spin_unlock(&wal->flush_spin);
+        return YQ_OK;
+    }
+
+    /*
+     * YQ_SYNC_NORMAL / YQ_SYNC_FULL: one fdatasync per flush that wrote
+     * bytes.
+     *
+     * What "group commit" can mean here, and what it cannot: the flush
+     * critical section is serialised by flush_spin, so at most one
+     * pwrite/fsync pair is in flight and any byte another flusher wrote is
+     * either covered by this fsync or pwritten above `end` after it. A sync
+     * could only be skipped when one that started after this caller's
+     * pwrite had already completed -- with the section fully serialised,
+     * that state is unobservable, so no watermark check is attempted (a
+     * skip that cannot be proven safe is a durability hole, not an
+     * optimisation). The coalescing that does happen: a concurrent or later
+     * flush whose buffer was already drained takes the early return above
+     * and performs no fsync of its own.
+     *
+     * Batching one fsync across several *commits* means releasing the
+     * writer lock around the sync and having followers wait for the
+     * leader's completion -- a commit-protocol change (FORMAT.md §3.3
+     * describes the target semantics), out of scope for this fix.
+     */
+    rc = yq_file_sync(wal->file);
+    if (rc != YQ_OK) {
+        wal_spin_unlock(&wal->flush_spin);
+        return rc;
+    }
+
+    wal_spin_unlock(&wal->flush_spin);
     return YQ_OK;
 }
 
