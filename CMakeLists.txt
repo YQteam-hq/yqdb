@@ -100,3 +100,7 @@ add_test(NAME btree_build_test COMMAND yq_test_btree)
 add_executable(yq_test_pending src/yq_test_pending.c)
 target_link_libraries(yq_test_pending yqdb)
 add_test(NAME pending_test COMMAND yq_test_pending)
+
+add_executable(yq_test_page src/yq_test_page.c)
+target_link_libraries(yq_test_page yqdb)
+add_test(NAME page_store_test COMMAND yq_test_page)

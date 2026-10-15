@@ -22,8 +22,54 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "yq_vfs.h"
 
 typedef struct yq_page_store yq_page_store;
+
+/*
+ * File-backed store (P3 stage 2): the same three operations, with page bytes
+ * that live in a file.
+ *
+ * Pages stay in buffers exactly as the memory store keeps them -- the tree's
+ * insert path holds pointers to a leaf, its parent and a fresh sibling at the
+ * same time, so a page must not move under it, which rules out growing an
+ * mmap() underneath a live tree. Instead, a page is read on first touch
+ * (pread at page_no * page_size) and written back in batches by
+ * yq_page_store_sync(), which also rewrites the free-list links.
+ *
+ * Durability is the caller's to ask for: nothing is written until sync(), and
+ * nothing is ordered before yq_file_sync() by sync() itself.
+ *
+ * A page that exists in the file but has not been read yet reports NULL from
+ * yq_page_store_get() like a freed page; yq_page_store_touch() distinguishes
+ * them, which is how a reopened database reads its tree lazily.
+ */
+yq_page_store *yq_page_store_file_create(yq_file *fh, uint32_t page_size);
+
+/*
+ * Open a store over an existing file, adopting its page count and rebuilding
+ * the free list by walking the chain FORMAT.md section 4.4 threads through the
+ * freed pages' first 8 bytes. npages/free_head come from the meta page, so the
+ * caller reads them from there.
+ */
+yq_page_store *yq_page_store_file_open(yq_file *fh, uint32_t page_size,
+                                       uint64_t npages, uint64_t free_head);
+
+/*
+ * Write back every dirty page, rewrite the free-list links and sync the file.
+ * Returns YQ_OK when there is no file behind the store (nothing to do).
+ */
+int yq_page_store_sync(yq_page_store *st);
+
+/*
+ * Make sure pages[page_no] is populated, reading it from the file when it is
+ * there but unread. Returns NULL when the page was never allocated or has been
+ * freed. yq_page_store_get() is the same call without the read-back.
+ */
+void *yq_page_store_touch(yq_page_store *st, uint64_t page_no);
+
+/* The file behind the store, or NULL for the memory store. */
+yq_file *yq_page_store_file(yq_page_store *st);
 
 /*
  * In-memory store: one page_size buffer per page number. Page 0 and 1 are
