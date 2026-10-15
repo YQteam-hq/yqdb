@@ -386,6 +386,18 @@ reclaim_watermark = min(所有 active==1 槽位的 snapshot_txn)
 
 步骤 3 期间读写继续：读者用旧 root 读到旧数据，写者写新代际。只有步骤 4 的 meta 写入是原子的。
 
+### 9.2 当前阶段（P3-S2 已实现的部分）
+
+上式是目标形态，已实现的是它的一个安全子集，差别必须写清楚，否则规范与代码不一致：
+
+- 步骤 3 是**整体重建**而不是 COW 合并：checkpoint 先把页存储里所有页归还空闲链表（`yq_page_store_reset`），再把内存表当前活集按序整棵重写（`tree_rebuild_from_memtable`），墓碑不进入 B+Tree。代价是每次 checkpoint 重写整棵树，收益是这个阶段不需要代际快照也不会把旧键留在新树里。
+- 页通过页存储写回数据库文件：脏页在 checkpoint 末尾统一 `pwrite` 到 `page_no × page_size`，空闲链表链接按 §4.4 写进被释放页首 8 字节，随后把文件扩到 `npages × page_size` 并 `fsync`。在此之前页只存在于内存缓冲，树是"副本"而不是权威索引。
+- **不截断日志**（步骤 6 暂缓）：日志仍是 reopen 时回放的记录，树只是第二份拷贝。因此"树 + 日志"任一损坏都不致命，而单靠日志（现状）则不然——`remove` 掉 `.log` 后重开，数据由树完整提供（见 `src/yq_test_spill.c`）。
+- **`ckpt_lsn` 仍不写**（步骤 5 暂缓）：meta 里该字段由 checkpoint 原样透传，所以日志无法按 LSN 截断，恢复也没有可依赖的"树已覆盖到此"标记。
+- **内存表不会被排空**（步骤 7 暂缓）：读者仍从内存表解析，所以 checkpoint 后数据在日志、树、内存表里各有一份。`memtable_bytes` 仍是活集上限，直到排空与 MVCC 代际就位。
+
+重建的前提是内存表持有**完整**活集（`yq_db.mt_complete`）。日志可读时它成立；没有日志而树有页时不成立——此时重建会把树抹空，所以 checkpoint 直接跳过重建。这条不变量由 `test_checkpoint_after_logless_reopen_keeps_tree` 钉住。
+
 ### 9.1 页分裂与合并
 
 - 叶节点插入前检查 `free_bytes >= needed + 24`，不足则分裂；分裂点为键数中位数，两半各约 50%。

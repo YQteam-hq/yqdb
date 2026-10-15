@@ -115,4 +115,12 @@ int yq_page_store_set_npages(yq_page_store *st, uint64_t npages);
 uint64_t yq_page_store_live(const yq_page_store *st);
 uint32_t yq_page_store_page_size(const yq_page_store *st);
 
+/*
+ * Return every page in [2, npages) to the free list without shrinking the
+ * file. Used to rebuild the tree from a fresh sorted run: the pages exist but
+ * their contents are about to be replaced wholesale, so the numbers stay
+ * allocated to the file while the buffers go back to the allocator.
+ */
+int yq_page_store_reset(yq_page_store *st);
+
 #endif

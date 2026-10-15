@@ -12,6 +12,23 @@ void yq_memtable_destroy(yq_memtable *mt);
 int yq_memtable_put(yq_memtable *mt, yq_slice key, yq_slice val);
 int yq_memtable_del(yq_memtable *mt, yq_slice key);
 int yq_memtable_get(yq_memtable *mt, yq_slice key, yq_slice *out);
+/*
+ * What the memtable knows about a key, with the tombstone spelled out.
+ *
+ * yq_memtable_get() reports NOTFOUND both for "never seen this key" and for
+ * "the newest entry for this key is a delete", which is right for a memtable
+ * considered on its own and wrong for a caller that has somewhere else to
+ * look: falling through on a tombstone resurrects a deleted key from the next
+ * index. The engine's yq_get() now has one.
+ */
+typedef enum {
+    YQ_MEMTABLE_ABSENT = 0,   /* no entry for this key at all */
+    YQ_MEMTABLE_TOMBSTONE,    /* deleted, and the delete is the newest fact */
+    YQ_MEMTABLE_LIVE          /* a value, returned in *val when val is not NULL */
+} yq_memtable_state;
+
+int yq_memtable_probe(yq_memtable *mt, yq_slice key,
+                      yq_memtable_state *state, yq_slice *val);
 int yq_memtable_size(yq_memtable *mt);
 int yq_memtable_full(yq_memtable *mt);
 size_t yq_memtable_bytes(yq_memtable *mt);

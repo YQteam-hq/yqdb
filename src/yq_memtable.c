@@ -539,6 +539,34 @@ int yq_memtable_size(yq_memtable *mt) {
     return (int)mt->num_entries;
 }
 
+int yq_memtable_probe(yq_memtable *mt, yq_slice key,
+                      yq_memtable_state *state, yq_slice *val) {
+    if (!mt || !state) return YQ_ERR_INVAL;
+    if (val) { val->data = NULL; val->size = 0; }
+
+    size_t ci = 0, ii = 0;
+    if (!locate(mt, &key, &ci, &ii)) {
+        *state = YQ_MEMTABLE_ABSENT;
+        return YQ_OK;
+    }
+
+    mt_chunk *c = &mt->chunks[ci];
+    const uint8_t *base = (const uint8_t *)yq_memblk_base(mt->arena);
+    if (entry_cmp_raw(base, &c->entries[ii], key.data, key.size) != 0) {
+        *state = YQ_MEMTABLE_ABSENT;
+        return YQ_OK;
+    }
+
+    mt_entry *e = &c->entries[ii];
+    if (e->tombstone) {
+        *state = YQ_MEMTABLE_TOMBSTONE;
+        return YQ_OK;
+    }
+    *state = YQ_MEMTABLE_LIVE;
+    if (val) yq_slice_set(val, base + e->val_offset, e->val_len);
+    return YQ_OK;
+}
+
 int yq_memtable_full(yq_memtable *mt) {
     if (!mt) return 0;
     return mt->used_bytes >= mt->max_bytes;

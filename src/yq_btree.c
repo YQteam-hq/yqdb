@@ -112,8 +112,15 @@ static void set_slot(uint8_t *page, uint16_t idx, uint16_t offset) {
 }
 
 static uint8_t *get_page_data(yq_btree *bt, uint64_t page_no) {
+    /*
+     * touch(), not get(): a file-backed store has not read a page just because
+     * it exists on disk, and a tree opened from a file reads almost every page
+     * it walks on the way down. get() would return NULL for an unread page and
+     * a reopened tree would look empty. For the memory store the two are
+     * identical (NULL means freed either way).
+     */
     if (bt->store) {
-        return (uint8_t *)yq_page_store_get(bt->store, page_no);
+        return (uint8_t *)yq_page_store_touch(bt->store, page_no);
     }
     if (bt->mmap_base) {
         return (uint8_t *)bt->mmap_base + page_no * bt->page_size;

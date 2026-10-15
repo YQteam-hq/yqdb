@@ -217,6 +217,29 @@ uint32_t yq_page_store_page_size(const yq_page_store *st) {
     return st ? st->page_size : 0;
 }
 
+int yq_page_store_reset(yq_page_store *st) {
+    if (!st) return YQ_ERR_INVAL;
+
+    /*
+     * Everything in [2, npages) goes onto the free list, newest page first, so
+     * the next allocations reuse the highest numbers and the file's live set
+     * ends up densely packed at the bottom. The buffers are released: what
+     * matters afterwards is the page NUMBERS, and a rebuild writes every one
+     * of them before it is read again.
+     */
+    for (uint64_t i = YQ_FIRST_DATA_PAGE; i < st->npages; i++) {
+        if (st->freed[i]) continue;          /* already linked: do not relink */
+        st->freed[i] = 1;
+        st->dirty[i] = 0;
+        free(st->pages[i]);
+        st->pages[i] = NULL;
+        st->free_next[i] = st->free_head;
+        st->free_head = i;
+    }
+    st->live = 0;
+    return YQ_OK;
+}
+
 /* ── file-backed store (P3 stage 2) ───────────────────────────────────── */
 
 yq_page_store *yq_page_store_file_create(yq_file *fh, uint32_t page_size) {
