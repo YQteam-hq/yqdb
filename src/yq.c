@@ -1073,9 +1073,14 @@ int yq_cur_next(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
     if (c->at_end) return YQ_ERR_NOTFOUND;
     if (c->state == 1) {
+        /*
+         * next() returning YQ_OK already means "positioned on a live entry":
+         * it runs valid() itself on the way out and reports NOTFOUND when it
+         * is not. Re-checking here is a second descent through the chunk
+         * index on every single scanned entry.
+         */
         if (c->mt_iter) {
-            int rc = yq_memtable_iter_next(c->mt_iter);
-            if (rc == YQ_OK && yq_memtable_iter_valid(c->mt_iter)) { c->state = 1; return YQ_OK; }
+            if (yq_memtable_iter_next(c->mt_iter) == YQ_OK) { c->state = 1; return YQ_OK; }
         }
         if (c->bt_cur) {
             int rc = yq_btree_cursor_first(c->bt_cur);
@@ -1108,9 +1113,9 @@ int yq_cur_prev(yq_cur *c) {
         c->at_end = 1; c->state = 0; return YQ_ERR_NOTFOUND;
     }
     if (c->state == 1) {
+        /* See the note in yq_cur_next(): YQ_OK implies "on a live entry". */
         if (c->mt_iter) {
-            int rc = yq_memtable_iter_prev(c->mt_iter);
-            if (rc == YQ_OK && yq_memtable_iter_valid(c->mt_iter)) { c->state = 1; return YQ_OK; }
+            if (yq_memtable_iter_prev(c->mt_iter) == YQ_OK) { c->state = 1; return YQ_OK; }
         }
         c->at_end = 1; c->state = 0; return YQ_ERR_NOTFOUND;
     }
