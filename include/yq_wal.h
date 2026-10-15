@@ -7,7 +7,8 @@
 
 typedef struct yq_wal yq_wal;
 
-int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size);
+int yq_wal_open(yq_wal **out, const char *db_path, uint64_t default_page_size,
+                uint32_t sync_mode);
 int yq_wal_close(yq_wal *wal);
 int yq_wal_append_begin(yq_wal *wal, uint64_t txn_id);
 int yq_wal_append_put(yq_wal *wal, uint64_t txn_id, yq_slice key, yq_slice val);

@@ -148,7 +148,8 @@ typedef struct yq_stat {
     uint64_t memtable_bytes;   /* 当前内存表占用字节数 */
     uint32_t active_readers;   /* 当前活跃读者数 */
     uint32_t max_readers;      /* 读者槽位总数 */
-    uint32_t reserved[4];      /* 必须为 0 */
+    uint64_t checkpoints;      /* 本会话已执行的 checkpoint 次数 */
+    uint32_t reserved[2];      /* 必须为 0 */
 } yq_stat;
 
 /* ═══════════════════════════════════════════════════════════════════════

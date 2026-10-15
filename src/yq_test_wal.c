@@ -48,7 +48,7 @@ static void write_values(size_t val_size) {
     remove_files();
 
     yq_wal *wal = NULL;
-    CHECK(yq_wal_open(&wal, TEST_DB, 4096) == YQ_OK);
+    CHECK(yq_wal_open(&wal, TEST_DB, 4096, YQ_SYNC_NORMAL) == YQ_OK);
 
     uint8_t *val = (uint8_t *)malloc(val_size ? val_size : 1);
     CHECK(val != NULL);
@@ -80,7 +80,7 @@ static void verify_values(size_t val_size) {
     fill_pattern(expect, val_size, (unsigned)(val_size & 0xFFFF));
 
     yq_wal *wal = NULL;
-    CHECK(yq_wal_open(&wal, TEST_DB, 4096) == YQ_OK);
+    CHECK(yq_wal_open(&wal, TEST_DB, 4096, YQ_SYNC_NORMAL) == YQ_OK);
 
     yq_memtable *mt = yq_memtable_create(256u * 1024u * 1024u);
     CHECK(mt != NULL);
@@ -117,7 +117,7 @@ static void test_rejects_bad_input(void) {
     remove_files();
 
     yq_wal *wal = NULL;
-    CHECK(yq_wal_open(&wal, TEST_DB, 4096) == YQ_OK);
+    CHECK(yq_wal_open(&wal, TEST_DB, 4096, YQ_SYNC_NORMAL) == YQ_OK);
 
     yq_slice empty_key = {"", 0};
     yq_slice val = {"v", 1};

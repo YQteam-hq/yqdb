@@ -18,18 +18,18 @@
  *      above that leaf's maximum has to advance along right_sibling. Probes
  *      across the whole range therefore exercise one advance, two advances
  *      and advance-to-exhaustion.
- *      The linear reference is not usable here: find_leftmost_leaf /
- *      find_rightmost_leaf are leaf-only in this baseline (they pick the
- *      wrong child pointer on internal pages) and P2 is add-only per its
- *      scope, so the expectations are computed from the key set directly.
+ *      The linear reference is not usable here, so the expectations are
+ *      computed from the key set directly.
  *
- * Not covered, and not coverable within P2's scope: the
- * "slot >= nkeys -> rightmost child at page + page_size - 8" branch. The
- * engine keeps that child pointer in the last 8 bytes of the page while the
- * 4-byte CRC trailer occupies the last 4, so only the low half of the pointer
- * survives a CRC write and the value read back is garbage. The tree fixture
- * prints what it reads back to make this visible, and routes every probe
- * through a cell child so the branch is never entered.
+ *   3. rightmost-child routing - an internal root whose separator is the first
+ *      key of its second leaf, so probes at or above it take the
+ *      "slot >= nkeys -> rightmost child" path. Fixture 2 cannot reach that
+ *      branch: its separator sits above every key, so every probe resolves to
+ *      slot 0. That gap is how the engine could keep the rightmost child in
+ *      the page tail -- where the 4-byte CRC trailer overwrites half of it --
+ *      while this suite stayed green; the fixtures below now follow the
+ *      FORMAT.md 4.2 layout (rightmost child immediately after the slot array)
+ *      and fixture 3 exercises the branch.
  *
  * get_page_data() only resolves mmap-backed pages or an arena, so the tree is
  * backed by a zeroed buffer standing in for an mmap region and the pages are
@@ -135,12 +135,16 @@ static void build_leaf(uint8_t *map, uint32_t ps, uint64_t page_no,
 }
 
 /*
- * Build an internal page with `n` separator cells plus the rightmost child,
- * using the same layout the descent rule in yq_btree_lookup /
- * yq_btree_cursor_seek reads: cell = varint(klen) + key + 8-byte child, and
- * the child for "greater than every separator" stored at page + ps - 8.
- * Cells are packed downward from ps - 8 so they never overlap that pointer.
- * The rightmost child must be written before the CRC, since the CRC covers it.
+ * Build an internal page with 
+ separator cells plus the rightmost child.
+ *
+ * Layout per FORMAT.md 4.2: cell = varint(klen) + key + 8-byte child, and the
+ * child for "keys above every separator" stored immediately after the slot
+ * array. The engine used to keep it in the last 8 bytes of the page, where the
+ * 4-byte CRC trailer overwrote half of it -- the pointer came back as garbage,
+ * which is why every probe in the tree fixture was routed through a cell child
+ * and this branch had no coverage at all. Cells are packed downward from
+ * ps - PAGE_CRC_SIZE, as in a leaf.
  */
 static void build_internal(uint8_t *map, uint32_t ps, uint64_t page_no,
                            const uint32_t *seps, const uint64_t *children, int n,
@@ -148,7 +152,7 @@ static void build_internal(uint8_t *map, uint32_t ps, uint64_t page_no,
     uint8_t *page = map + page_no * ps;
     memset(page, 0, ps);
 
-    uint16_t off = (uint16_t)(ps - 8);
+    uint16_t off = (uint16_t)(ps - PAGE_CRC_SIZE);
     for (int i = 0; i < n; i++) {
         size_t kl = 0;
         uint8_t kb[10];
@@ -163,14 +167,14 @@ static void build_internal(uint8_t *map, uint32_t ps, uint64_t page_no,
 
         write_u16(page + PAGE_HDR_SIZE + i * SLOT_SIZE, off);
     }
-    write_u64(page + ps - 8, rightmost);
+    write_u64(page + PAGE_HDR_SIZE + n * SLOT_SIZE, rightmost);
 
     page[0] = PAGE_TYPE_INTERNAL;
     page[1] = 0;
     write_u16(page + 2, (uint16_t)n);
     write_u64(page + 4, 0);
     write_u64(page + 12, 0);
-    write_u16(page + 20, (uint16_t)(off - (PAGE_HDR_SIZE + n * SLOT_SIZE)));
+    write_u16(page + 20, (uint16_t)(off - (PAGE_HDR_SIZE + n * SLOT_SIZE + 8)));
     write_u16(page + 22, PAGE_HDR_SIZE);
     write_u32(page + ps - PAGE_CRC_SIZE, yq_crc32c(page, ps - PAGE_CRC_SIZE));
 }
@@ -394,9 +398,9 @@ static int case_multi_leaf(uint32_t ps) {
 
     /* What the "greater than every separator" branch would read back. */
     uint64_t rm_read = 0;
-    memcpy(&rm_read, map + 1 * ps + ps - 8, sizeof(rm_read));
-    printf("tree:   rightmost-child slot reads back 0x%llX (wrote 3): low half is the "
-           "pointer, high half is the CRC trailer\n", (unsigned long long)rm_read);
+    memcpy(&rm_read, map + 1 * ps + PAGE_HDR_SIZE + SLOT_SIZE, sizeof(rm_read));
+    printf("tree:   rightmost-child field reads back %llu (wrote 3, whole pointer survives the CRC)\n",
+           (unsigned long long)rm_read);
 
     yq_btree_cursor *s = NULL;
     yq_btree_cursor_open(bt, &s);
@@ -470,6 +474,111 @@ static int case_multi_leaf(uint32_t ps) {
     return (fail_ge || fail_le) ? 1 : 0;
 }
 
+/*
+ * Fixture 3: rightmost-child routing.
+ *
+ *   root(1)  internal, nkeys=1: sep 50 -> child 2, rightmost 3
+ *   leaf(2)  {10,20,30,40}  right->3
+ *   leaf(3)  {50,60,70}     right->0
+ *
+ * Fixture 2 puts its single separator above every key, so the descent always
+ * resolves to slot 0 and the "past every separator" path is never taken -- which
+ * is exactly how the engine got away with keeping the rightmost child in the
+ * page tail for so long. Here the separator is the first key of the second
+ * leaf, so probes at and above 50 must go through the rightmost-child field and
+ * land in leaf 3.
+ */
+static int case_rightmost_routing(uint32_t ps) {
+    static const uint32_t l1[] = {10, 20, 30, 40};
+    static const uint32_t l2[] = {50, 60, 70};
+    uint32_t all[7];
+    for (int i = 0; i < 4; i++) all[i] = l1[i];
+    for (int i = 0; i < 3; i++) all[4 + i] = l2[i];
+
+    if (internal_capacity(ps) < 1 || leaf_capacity(ps) < 4) {
+        printf("ERROR: page_size=%u too small for the routing fixture\n", ps);
+        return 3;
+    }
+
+    uint8_t *map = NULL; uint64_t map_size = 0; yq_btree *bt = NULL;
+    if (open_tree(ps, &map, &map_size, &bt) != 0) return 2;
+
+    build_leaf(map, ps, 2, l1, 4, 3, 0);
+    build_leaf(map, ps, 3, l2, 3, 0, 2);
+
+    uint32_t seps[1] = {50};
+    uint64_t kids[1] = {2};
+    build_internal(map, ps, 1, seps, kids, 1, 3);
+    yq_btree_set_root(bt, 1);
+
+    /* The pointer has to survive the CRC write now, not just its low half. */
+    uint64_t rm_read = 0;
+    memcpy(&rm_read, map + 1 * ps + PAGE_HDR_SIZE + SLOT_SIZE, sizeof(rm_read));
+    if (rm_read != 3) {
+        printf("        ERROR: rightmost child reads back %llu, wrote 3\n",
+               (unsigned long long)rm_read);
+        free(map);
+        return 1;
+    }
+
+    yq_btree_cursor *s = NULL;
+    yq_btree_cursor_open(bt, &s);
+
+    int fail_ge = 0, fail_le = 0, via_rightmost = 0;
+    for (uint32_t probe = 0; probe <= 80; probe++) {
+        uint8_t pb[4];
+        key4(pb, probe);
+        yq_slice pk; pk.data = pb; pk.size = 4;
+        if (probe >= 50) via_rightmost++;
+
+        int rc_new = yq_btree_cursor_seek(s, pk);
+        uint32_t got = 0xFFFFFFFFu;
+        int new_found = (rc_new == YQ_OK && yq_btree_cursor_valid(s));
+        if (new_found) {
+            yq_slice k;
+            yq_btree_cursor_key(s, &k);
+            got = slice_to_u32(&k);
+        }
+        uint32_t exp = 0xFFFFFFFFu;
+        int exp_found = exp_ge(all, 7, probe, &exp);
+        if (new_found != exp_found || (new_found && got != exp)) {
+            if (fail_ge < 10)
+                printf("        [routing seek mismatch] probe=%u new(rc=%d,found=%d,key=%u) exp(found=%d,key=%u)\n",
+                       probe, rc_new, new_found, got, exp_found, exp);
+            fail_ge++;
+        }
+
+        rc_new = yq_btree_cursor_seek_le(s, pk);
+        got = 0xFFFFFFFFu;
+        new_found = (rc_new == YQ_OK && yq_btree_cursor_valid(s));
+        if (new_found) {
+            yq_slice k;
+            yq_btree_cursor_key(s, &k);
+            got = slice_to_u32(&k);
+        }
+        exp = 0xFFFFFFFFu;
+        exp_found = exp_le(all, 7, probe, &exp);
+        if (new_found != exp_found || (new_found && got != exp)) {
+            if (fail_le < 10)
+                printf("        [routing seek_le mismatch] probe=%u new(rc=%d,found=%d,key=%u) exp(found=%d,key=%u)\n",
+                       probe, rc_new, new_found, got, exp_found, exp);
+            fail_le++;
+        }
+    }
+    yq_btree_cursor_close(s);
+
+    printf("routing: probes=81 via_rightmost_child=%d seek_mismatch=%d seek_le_mismatch=%d\n",
+           via_rightmost, fail_ge, fail_le);
+
+    if (via_rightmost == 0) {
+        printf("        ERROR: fixture no longer exercises the rightmost-child branch\n");
+        fail_ge++;
+    }
+
+    free(map);
+    return (fail_ge || fail_le) ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     int n_keys = (argc > 1) ? atoi(argv[1]) : 32;
@@ -479,9 +588,11 @@ int main(int argc, char **argv) {
     int r1 = case_single_leaf(n_keys, page_size);
     if (r1 == 3) return 3;
     int r2 = case_multi_leaf(page_size);
+    int r3 = case_rightmost_routing(page_size);
+    if (r3 == 3) return 3;
     if (r2 == 3) return 3;
 
-    int ok = (r1 == 0 && r2 == 0);
+    int ok = (r1 == 0 && r2 == 0 && r3 == 0);
     printf("%s\n", ok ? "RESULT: PASS" : "RESULT: FAIL");
     return ok ? 0 : 1;
 }
