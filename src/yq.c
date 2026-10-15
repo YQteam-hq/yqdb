@@ -111,6 +111,23 @@ struct yq_db {
      * happen when it is clear.
      */
     int mt_complete;
+    /*
+     * 1 while the tree may be consulted, 0 while it is being rebuilt.
+     *
+     * The rebuild takes every page away and hands them straight back, so a
+     * reader walking the tree at that moment would meet pages that are
+     * half-written or already freed -- a lifted answer (a spurious NOTFOUND,
+     * or YQ_ERR_CORRUPT from a page that is not there yet). Clearing the flag
+     * makes readers skip the tree for the duration, which is safe because the
+     * memtable holds every live key at that point (mt_complete) and answers
+     * first anyway.
+     *
+     * What this does NOT do is stop a reader that is already mid-descent: the
+     * tree has no versioning, so that reader may still meet a page being
+     * rewritten. The fix for that is a page-level version with COW (S3), which
+     * is also what removes the need to rebuild at all.
+     */
+    int tree_valid;
     yq_memtable *memtable;
     void *mmap_base;
     size_t mmap_len;
@@ -318,6 +335,9 @@ int yq_open(const char *path, const yq_opts *opts, yq_db **out) {
     db->pend_pool_lock = YQ_SPIN_INIT;   /* calloc already zeroes it; be explicit */
     db->write_enabled = !(def.flags & YQ_OPEN_READONLY);
     db->auto_ckpt_armed = 1;
+    /* Readable until a checkpoint starts rewriting its pages; calloc gives 0,
+     * and 0 here would silently stop the engine from ever consulting a tree. */
+    db->tree_valid = 1;
 
     /*
      * Reject paths that cannot hold the longest auxiliary suffix. The limit is
@@ -1028,7 +1048,8 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
                 if (mst == YQ_MEMTABLE_TOMBSTONE) goto exists_checked;
             }
             yq_slice ex = {0};
-            if (db->btree && yq_btree_lookup(db->btree, key, &ex) == YQ_OK) return YQ_ERR_EXISTS;
+            if (db->tree_valid && db->btree &&
+                yq_btree_lookup(db->btree, key, &ex) == YQ_OK) return YQ_ERR_EXISTS;
 exists_checked: ;
         }
     }
@@ -1099,7 +1120,14 @@ int yq_get(yq_txn *txn, yq_slice key, yq_slice *out) {
         }
     }
 
-    if (db->btree) {
+    /*
+     * tree_valid: the tree may be being rebuilt, and a page it is taking away
+     * mid-lookup would answer with whatever is on disk there. The memtable has
+     * already missed, so skipping the tree reports a miss rather than a torn
+     * hit -- and since the memtable holds every live key, the miss IS the
+     * answer in every case where this stage is correct.
+     */
+    if (db->btree && db->tree_valid) {
         int rc = yq_btree_lookup(db->btree, key, out);
         if (rc == YQ_OK) return YQ_OK;
     }
@@ -1120,7 +1148,7 @@ int yq_cur_open(yq_txn *txn, yq_cur **out) {
 
     yq_db *db = txn->db;
 
-    if (db->btree) {
+    if (db->btree && db->tree_valid) {
         int rc = yq_btree_cursor_open(db->btree, &c->bt_cur);
         if (rc != YQ_OK) { free(c); return rc; }
     }
@@ -1212,13 +1240,18 @@ static int cur_head_cmp(yq_cur *c, int *cmp) {
     return YQ_OK;
 }
 
+/* Is the tree readable right now? See yq_db.tree_valid. */
+static int cur_tree_live(yq_cur *c) {
+    return c->txn && c->txn->db && c->txn->db->tree_valid;
+}
+
 /*
  * Choose the source for the next entry, forward. Leaves c->state set and
  * consumes the tree's entry when it ties with the memtable's.
  */
 static int cur_pick_fwd(yq_cur *c) {
-    if (!c->bt_valid) {
-        /* Empty (or absent) tree: the memtable alone, exactly as before. */
+    if (!c->bt_valid || !cur_tree_live(c)) {
+        /* Empty (or absent, or rebuilding) tree: the memtable alone. */
         if (c->mt_valid) { c->at_end = 0; c->state = 1; return YQ_OK; }
         c->at_end = 1; c->state = 0; return YQ_ERR_NOTFOUND;
     }
@@ -1242,7 +1275,7 @@ static int cur_pick_fwd(yq_cur *c) {
 /* The same choice walking backwards: the larger head wins, ties again go to
  * the memtable. */
 static int cur_pick_rev(yq_cur *c) {
-    if (!c->bt_valid) {
+    if (!c->bt_valid || !cur_tree_live(c)) {
         if (c->mt_valid) { c->at_end = 0; c->state = 1; return YQ_OK; }
         c->at_end = 1; c->state = 0; return YQ_ERR_NOTFOUND;
     }
@@ -1548,12 +1581,18 @@ static int tree_rebuild_from_memtable(yq_db *db) {
     if (!db->btree || !db->page_store) return YQ_ERR_INVAL;
     if (!db->mt_complete) return YQ_OK;   /* rebuilding would erase the tree */
 
-    if (yq_page_store_reset(db->page_store) != YQ_OK) return YQ_ERR_IO;
+    /*
+     * Readers stop consulting the tree for the duration (see db->tree_valid).
+     * Their answers come from the memtable, which holds every live key.
+     */
+    db->tree_valid = 0;
+
+    if (yq_page_store_reset(db->page_store) != YQ_OK) { db->tree_valid = 1; return YQ_ERR_IO; }
     yq_btree_set_root(db->btree, 0);
 
     yq_memtable_iter *it = NULL;
     int rc = yq_memtable_iter_open(db->memtable, &it);
-    if (rc != YQ_OK) return rc;
+    if (rc != YQ_OK) { db->tree_valid = 1; return rc; }
 
     for (int more = yq_memtable_iter_first(it); more == YQ_OK;
          more = yq_memtable_iter_next(it)) {
@@ -1566,9 +1605,14 @@ static int tree_rebuild_from_memtable(yq_db *db) {
         if (rc != YQ_OK) break;
     }
     yq_memtable_iter_close(it);
-    if (rc != YQ_OK) return rc;
+    if (rc != YQ_OK) {
+        db->tree_valid = 0;   /* a partial tree must not be consulted */
+        return rc;
+    }
 
-    return yq_page_store_sync(db->page_store);
+    rc = yq_page_store_sync(db->page_store);
+    db->tree_valid = (rc == YQ_OK);   /* synced: safe to read again */
+    return rc;
 }
 
 int yq_checkpoint(yq_db *db) {
@@ -1600,19 +1644,32 @@ int yq_checkpoint(yq_db *db) {
      * have to describe the pages this checkpoint is about to make durable, not
      * whatever the previous checkpoint left behind.
      *
-     * A failure here is not the commit's failure -- the data is in the log and
-     * the memtable -- so it is dropped rather than propagated, and the old
-     * root stays in meta. The next checkpoint retries.
+     * Publishing is conditional on the rebuild having succeeded AND synced. A
+     * partially built tree that was never synced has pages the file does not
+     * have, and pointing meta at them would make the next open read whatever
+     * the file happens to hold at those offsets -- with only a page CRC to
+     * notice. Keeping the previous root, page count and free list instead costs
+     * nothing: they describe pages that are on disk right now, and the log is
+     * still the record a reopen replays.
      */
-    uint64_t root_page = 0;
-    if (db->btree) {
-        (void)tree_rebuild_from_memtable(db);   /* retried on the next crossing */
+    uint64_t root_page  = cur_root;
+    uint64_t npages_out = cur_npages;
+    uint64_t free_out   = cur_free;
+    if (db->btree && tree_rebuild_from_memtable(db) == YQ_OK) {
         yq_btree_get_root(db->btree, &root_page);
-    } else {
-        root_page = cur_root;
+        npages_out = yq_btree_npages(db->btree);
+        free_out   = yq_page_store_free_head(db->page_store);
+        /*
+         * The resident set is now one buffer per tree page, on top of a
+         * memtable that already holds the same bytes. Bound it: the bytes are
+         * on disk since the sync above, so a later touch() reads them back.
+         * The cap is a quarter of the configured memtable, which keeps the
+         * two working sets within a factor of two of each other.
+         */
+        uint64_t keep = (uint64_t)db->opts.memtable_bytes / 4 / 4096;
+        if (keep < 256) keep = 256;
+        (void)yq_page_store_evict_clean(db->page_store, keep);
     }
-    uint64_t npages_out = db->btree ? yq_btree_npages(db->btree) : cur_npages;
-    uint64_t free_out = db->btree ? yq_page_store_free_head(db->page_store) : cur_free;
 
     yq_mvcc_meta_pwrite_full(db->mvcc, new_txn_id, root_page, free_out,
                              npages_out, cur_ckpt);

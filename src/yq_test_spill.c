@@ -448,6 +448,51 @@ static void test_repeated_checkpoints_reuse_pages(void) {
     printf("OK\n");
 }
 
+/* ── the resident page set is bounded ─────────────────────────────────── */
+
+static void test_evicted_pages_read_back(void) {
+    printf("test_evicted_pages_read_back... ");
+    rm_all();
+
+    /*
+     * A checkpoint leaves one buffer per tree page resident, which for a big
+     * tree is a second copy of the dataset on top of the memtable. The
+     * checkpoint therefore releases clean pages past a cap (a quarter of
+     * memtable_bytes, floor 256 pages) -- they are on disk, so a later lookup
+     * has to read them back.
+     *
+     * A small memtable makes the cap bite: 20000 keys x ~170 B is ~3200 pages
+     * against a 256-page cap.
+     */
+    yq_opts o;
+    opts_of(&o, 4u * 1024 * 1024);
+    yq_db *db = NULL;
+    CHECK(yq_open(DB, &o, &db) == YQ_OK);
+    put_keys(db, "k", 0, 20000);
+
+    CHECK(yq_checkpoint(db) == YQ_OK);
+
+    yq_stat st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+    CHECK(yq_db_stat(db, &st) == YQ_OK);
+    CHECK(st.npages > 256);                   /* more pages than the cap */
+
+    yq_close(db);
+    CHECK(remove(LOG) == 0);
+
+    /* Nothing is in memory any more, so every lookup walks down through pages
+     * that must be pread back out of the file. */
+    yq_db *db2 = NULL;
+    CHECK(yq_open(DB, &o, &db2) == YQ_OK);
+    CHECK(count_missing(db2, "k", 0, 20000) == 0);
+    CHECK(scan_count(db2) == 20000);
+    yq_close(db2);
+
+    rm_all();
+    printf("OK\n");
+}
+
 int main(void) {
     printf("=== yq-DB B+Tree Spill Tests (P3-S2) ===\n\n");
 
@@ -458,6 +503,7 @@ int main(void) {
     test_memtable_wins_over_tree();
     test_delete_survives_checkpoint_without_log();
     test_repeated_checkpoints_reuse_pages();
+    test_evicted_pages_read_back();
 
     printf("\n=== ALL TESTS PASSED ===\n");
     return 0;

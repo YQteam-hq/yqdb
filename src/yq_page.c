@@ -223,21 +223,56 @@ int yq_page_store_reset(yq_page_store *st) {
     /*
      * Everything in [2, npages) goes onto the free list, newest page first, so
      * the next allocations reuse the highest numbers and the file's live set
-     * ends up densely packed at the bottom. The buffers are released: what
-     * matters afterwards is the page NUMBERS, and a rebuild writes every one
-     * of them before it is read again.
+     * ends up densely packed at the bottom.
+     *
+     * The buffers are deliberately NOT freed here. A checkpoint rebuilds the
+     * tree by taking every page away and handing them straight back, and a
+     * reader that is mid-lookup holds one of those page pointers; freeing them
+     * is a use-after-free, whereas keeping them means the reader sees either
+     * the old page or the new one. Allocation is what actually reclaims memory
+     * then: the rebuild fills the pages it needs, and pages it does not reuse
+     * keep their buffer until a later checkpoint needs a smaller tree, which
+     * is a bounded amount (the file's high-water mark) and is what the file
+     * would hold anyway.
      */
     for (uint64_t i = YQ_FIRST_DATA_PAGE; i < st->npages; i++) {
         if (st->freed[i]) continue;          /* already linked: do not relink */
         st->freed[i] = 1;
         st->dirty[i] = 0;
-        free(st->pages[i]);
-        st->pages[i] = NULL;
         st->free_next[i] = st->free_head;
         st->free_head = i;
     }
     st->live = 0;
     return YQ_OK;
+}
+
+/*
+ * Release the buffers of clean pages once more than `keep_max` of them are
+ * resident. Their bytes are already on disk, so a later touch() re-reads them;
+ * this is a bound, not a cache policy -- a rebuild leaves every page of the
+ * tree resident, which for a large dataset is memory the memtable has already
+ * paid for once.
+ *
+ * Returns how many buffers were released, or -1 on a bad argument.
+ */
+int64_t yq_page_store_evict_clean(yq_page_store *st, uint64_t keep_max) {
+    if (!st) return -1;
+
+    uint64_t resident = 0;
+    for (uint64_t i = YQ_FIRST_DATA_PAGE; i < st->npages; i++) {
+        if (st->pages[i] && !st->freed[i] && !st->dirty[i]) resident++;
+    }
+    if (resident <= keep_max) return 0;
+
+    int64_t freed = 0;
+    for (uint64_t i = YQ_FIRST_DATA_PAGE; i < st->npages && resident > keep_max; i++) {
+        if (!st->pages[i] || st->freed[i] || st->dirty[i]) continue;
+        free(st->pages[i]);
+        st->pages[i] = NULL;      /* the page stays: touch() re-reads it */
+        resident--;
+        freed++;
+    }
+    return freed;
 }
 
 /* ── file-backed store (P3 stage 2) ───────────────────────────────────── */

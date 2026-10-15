@@ -120,7 +120,18 @@ uint32_t yq_page_store_page_size(const yq_page_store *st);
  * file. Used to rebuild the tree from a fresh sorted run: the pages exist but
  * their contents are about to be replaced wholesale, so the numbers stay
  * allocated to the file while the buffers go back to the allocator.
+ *
+ * Buffers are NOT released -- see the comment in the implementation for why a
+ * reader mid-lookup makes that a use-after-free. Use
+ * yq_page_store_evict_clean() afterwards to bound the resident set.
  */
 int yq_page_store_reset(yq_page_store *st);
+
+/*
+ * Release the buffers of clean pages once more than keep_max are resident.
+ * Returns how many were released, or -1 on a bad argument. The pages stay
+ * allocated and are re-read on demand, so this only trades latency for memory.
+ */
+int64_t yq_page_store_evict_clean(yq_page_store *st, uint64_t keep_max);
 
 #endif
