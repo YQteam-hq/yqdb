@@ -1,3 +1,4 @@
+-----BEGIN FILE-----
 /**	@file midl.h
  *	@brief LMDB ID List header file.
  *
@@ -74,8 +75,10 @@ typedef MDB_ID *MDB_IDL;
 
 	/** Append ID to IDL. The IDL must be big enough. */
 #define mdb_midl_xappend(idl, id) do { \
-		MDB_ID *xidl = (idl), xlen = ++(xidl[0]); \
-		xidl[xlen] = (id); \
+		if (idl) { \
+			MDB_ID *xidl = (idl), xlen = ++(xidl[0]); \
+			xidl[xlen] = (id); \
+		} \
 	} while (0)
 
 	/** Search for an ID in an IDL.
@@ -184,3 +187,4 @@ int mdb_mid2l_append( MDB_ID2L ids, MDB_ID2 *id );
 }
 #endif
 #endif	/* _MDB_MIDL_H_ */
+-----END FILE-----
