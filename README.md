@@ -363,6 +363,7 @@ which used to always read 0. Both fit in the space `yq_stat` had reserved, so
 | [docs/BENCHMARKS.zh-CN.md](docs/BENCHMARKS.zh-CN.md) | 中文 | Benchmark report, in Simplified Chinese |
 | [FORMAT.md](FORMAT.md) | 中文 | On-disk format specification (v1) |
 | [ERRORS.md](ERRORS.md) | 中文 | Error code semantics and retry strategy |
+| [CHANGELOG.md](CHANGELOG.md) | English | Release notes per version (Keep a Changelog) |
 | [include/yq.h](include/yq.h) | — | The authoritative public ABI contract |
 
 ## License
