@@ -1068,11 +1068,19 @@ int yq_cur_open(yq_txn *txn, yq_cur **out) {
     return YQ_OK;
 }
 
+/*
+ * A cursor is alive only while its transaction is. txn_free() detaches the
+ * binding, so this is the single place that decides "may this cursor be used?".
+ */
+static int cur_alive(const yq_cur *c) {
+    return c && c->txn != NULL;
+}
+
 int yq_cur_first(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
     /* Detached by txn_free(): the transaction ended, so this cursor is dead.
      * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
-    if (!c->txn) return YQ_ERR_CURSOR;
+    if (!cur_alive(c)) return YQ_ERR_CURSOR;
     c->at_end = 0; c->state = 0;
     if (c->mt_iter) {
         int rc = yq_memtable_iter_first(c->mt_iter);
@@ -1089,7 +1097,7 @@ int yq_cur_last(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
     /* Detached by txn_free(): the transaction ended, so this cursor is dead.
      * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
-    if (!c->txn) return YQ_ERR_CURSOR;
+    if (!cur_alive(c)) return YQ_ERR_CURSOR;
     c->at_end = 0; c->state = 0;
     if (c->bt_cur) {
         int rc = yq_btree_cursor_last(c->bt_cur);
@@ -1106,7 +1114,7 @@ int yq_cur_next(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
     /* Detached by txn_free(): the transaction ended, so this cursor is dead.
      * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
-    if (!c->txn) return YQ_ERR_CURSOR;
+    if (!cur_alive(c)) return YQ_ERR_CURSOR;
     if (c->at_end) return YQ_ERR_NOTFOUND;
     if (c->state == 1) {
         /*
@@ -1138,7 +1146,7 @@ int yq_cur_prev(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
     /* Detached by txn_free(): the transaction ended, so this cursor is dead.
      * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
-    if (!c->txn) return YQ_ERR_CURSOR;
+    if (!cur_alive(c)) return YQ_ERR_CURSOR;
     if (c->at_end) return yq_cur_last(c);
     if (c->state == 2) {
         if (c->bt_cur) {
@@ -1165,7 +1173,7 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
     /* Detached by txn_free(): the transaction ended, so this cursor is dead.
      * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
-    if (!c->txn) return YQ_ERR_CURSOR;
+    if (!cur_alive(c)) return YQ_ERR_CURSOR;
 
     /* Position the tree cursor at the first key >= target (binary descent). */
     int tree_found = 0;
@@ -1195,7 +1203,7 @@ int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
     /* Detached by txn_free(): the transaction ended, so this cursor is dead.
      * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
-    if (!c->txn) return YQ_ERR_CURSOR;
+    if (!cur_alive(c)) return YQ_ERR_CURSOR;
 
     /*
      * Reuse yq_cur_seek() to perform the full merge-order positioning at the
@@ -1254,7 +1262,7 @@ int yq_cur_seek_le(yq_cur *c, yq_slice key) {
 }
 
 int yq_cur_valid(const yq_cur *c) {
-    if (!c || !c->txn) return 0;
+    if (!cur_alive(c)) return 0;
     return c->state && !c->at_end;
 }
 
