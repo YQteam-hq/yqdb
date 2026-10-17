@@ -103,9 +103,14 @@ static void test_empty_key_is_inval(void) {
     CHECK_RC(yq_put(txn, empty, val, YQ_PUT_NOOVERWRITE), YQ_ERR_INVAL);
     CHECK_RC(yq_del(txn, empty), YQ_ERR_INVAL);
 
-    /* A NULL data pointer is equally malformed, whatever the size says. */
+    /* A slice with no storage is malformed whatever the length field says, and
+     * it must be rejected before anything dereferences it. Both spellings are
+     * INVAL, and neither depends on which check fires first. */
     yq_slice null_zero = { NULL, 0 };
     CHECK_RC(yq_put(txn, null_zero, val, YQ_PUT_UPSERT), YQ_ERR_INVAL);
+    yq_slice null_sized = { NULL, 5 };
+    CHECK_RC(yq_put(txn, null_sized, val, YQ_PUT_UPSERT), YQ_ERR_INVAL);
+    CHECK_RC(yq_del(txn, null_sized), YQ_ERR_INVAL);
 
     CHECK_RC(yq_txn_commit(txn), YQ_OK);
     CHECK(count_keys(db) == 0); /* nothing was written */
@@ -256,6 +261,18 @@ static void test_batch_contract_unchanged(void) {
     /* Nothing applied, including the valid entry. */
     yq_slice got = { 0 };
     CHECK_RC(yq_get(txn, ok_key, &got), YQ_ERR_NOTFOUND);
+
+    /* A batch entry whose key has no storage is rejected the same way, and the
+     * counters still add up. */
+    yq_batch_entry null_entry;
+    memset(&null_entry, 0, sizeof null_entry);
+    null_entry.key.data = NULL;
+    null_entry.key.size = 3;
+    null_entry.val = ok_val;
+    memset(&res, 0, sizeof res);
+    res.struct_size = sizeof res;
+    CHECK_RC(yq_batch_put(txn, &null_entry, 1, &res), YQ_ERR_INVAL);
+    CHECK(res.entries_total == 1 && res.entries_ok == 0 && res.entries_failed == 1);
 
     yq_slice keys[1] = { { buf, 1025 } };
     memset(&res, 0, sizeof res);
