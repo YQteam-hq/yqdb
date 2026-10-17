@@ -128,8 +128,8 @@ use-after-free and UB that the warning-only build misses:
 CC=clang ./scripts/run_sanitizers.sh # clang
 ```
 
-Leak detection is off by default (the suite keeps a few test-only allocations
-alive past teardown; library leaks are already policed by `yq_test_lifecycle`).
+Leak detection is on by default: the suite is leak-clean, so a leak report means
+a regression. `DETECT_LEAKS=0` disables it.
 
 ---
 

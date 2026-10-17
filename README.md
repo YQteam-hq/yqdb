@@ -291,12 +291,12 @@ use-after-free and undefined behaviour that the warning-only build misses:
 ```sh
 ./scripts/run_sanitizers.sh          # gcc, build dir = build-san
 CC=clang ./scripts/run_sanitizers.sh # use clang instead
-DETECT_LEAKS=1 ./scripts/run_sanitizers.sh  # also run LeakSanitizer
+DETECT_LEAKS=0 ./scripts/run_sanitizers.sh  # skip LeakSanitizer
 ```
 
-Leak detection is disabled by default: the suite intentionally keeps a few
-test-only allocations alive past teardown, and library-level leaks are already
-guarded by `yq_test_lifecycle`.
+Leak detection is on by default: the whole suite is leak-clean, so any leak
+report is a regression rather than harness noise. `DETECT_LEAKS=0` turns it off
+when you are chasing a non-leak defect and want less output.
 
 ## Current Scope & Limitations
 
