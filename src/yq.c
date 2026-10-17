@@ -751,6 +751,27 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     *out = NULL;
     if (db->closed) return YQ_ERR_CORRUPT;
 
+    /*
+     * flags is a closed enum: exactly one of YQ_TXN_READWRITE / YQ_TXN_READONLY.
+     *
+     * It used to be interpreted as "read-write if the READWRITE bit is set,
+     * read-only otherwise", which quietly turned flags == 0 into a read-only
+     * transaction. That reads like "no flags, i.e. the default" to a caller,
+     * and the only symptom is that every later yq_put() fails with
+     * YQ_ERR_READONLY -- a long way from the line that caused it. Unknown bits
+     * (a future flag, a wrong constant) are rejected for the same reason.
+     *
+     * Tightening this also makes the three read-only predicates in the engine
+     * agree: yq_put()/yq_del() test `!(flags & YQ_TXN_READWRITE)` while
+     * yq_batch_put()/yq_batch_del() test `flags & YQ_TXN_READONLY`. Those two
+     * disagree for flags == 0 -- only the fact that the batch path delegates to
+     * yq_put() per entry kept a write from slipping through. Once only the two
+     * documented values exist, all of them are exact.
+     */
+    const uint32_t known = YQ_TXN_READWRITE | YQ_TXN_READONLY;
+    if (flags == 0 || (flags & ~known) != 0) return YQ_ERR_INVAL;
+    if ((flags & YQ_TXN_READWRITE) && (flags & YQ_TXN_READONLY)) return YQ_ERR_INVAL;
+
     /* A handle opened with YQ_OPEN_READONLY must not hand out write
      * transactions: yq_put()/yq_del() guard on the transaction flag, but
      * nothing stopped yq_txn_begin(YQ_TXN_READWRITE) on such a handle, and
@@ -767,10 +788,12 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
     txn->first_write = (flags & YQ_TXN_READWRITE) ? 1 : 0;
 
     /*
-     * YQ_TXN_READONLY is 0, so `flags & YQ_TXN_READONLY` is always false and
-     * cannot be used to select this branch -- read-write must be tested for
-     * and read-only treated as the fallback. Getting this wrong silently
-     * skipped snapshot registration for every read-only transaction, i.e. the
+     * The read-only branch is selected by *absence* of the read-write bit, not
+     * by `flags & YQ_TXN_READONLY`. The two constants are 0x0001 / 0x0002, so
+     * either test would work today; absence is the safer one, because the
+     * original bug (in 1.0, when YQ_TXN_READONLY was 0) was exactly a test on a
+     * constant whose value made the predicate always false -- and that silently
+     * skipped snapshot registration for every read-only transaction, so the
      * reader table never learned about them and MVCC had nothing to protect.
      */
     if (!(flags & YQ_TXN_READWRITE)) {
@@ -936,7 +959,8 @@ int yq_txn_abort(yq_txn *txn) {
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    /* yq_txn_begin() only hands out the two documented flag values, so the
+     * read-write bit is the exact writability test here. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
@@ -969,7 +993,8 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
 int yq_del(yq_txn *txn, yq_slice key) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
-    /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
+    /* yq_txn_begin() only hands out the two documented flag values, so the
+     * read-write bit is the exact writability test here. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
     if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
 
