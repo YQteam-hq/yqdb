@@ -172,7 +172,7 @@ static const char *g_err_msgs[] = {
     "resource busy",
     "read-only",
     "invalid argument",
-    "value too big",
+    "key or value too big",
     "transaction closed",
     "transaction broken",
     "invalid cursor",
@@ -933,12 +933,42 @@ int yq_txn_abort(yq_txn *txn) {
     return YQ_OK;
 }
 
+#define YQ_MAX_KEY_BYTES 1024u
+
+/*
+ * Key validation shared by every write entry point, so they cannot drift apart.
+ *
+ * ERRORS.md draws the line at the limit itself: a key of 1025 bytes is over the
+ * documented maximum and reports YQ_ERR_TOOBIG, while a zero-length key is not
+ * "too big" by any reading of the word -- it is simply not a key, so it reports
+ * YQ_ERR_INVAL like any other bad argument.
+ *
+ * Before this was factored out, the five call sites disagreed: yq_put() reported
+ * TOOBIG for an empty key, yq_del() reported INVAL for an over-long one, and the
+ * batch paths reported INVAL for both. Callers could not write a correct
+ * classification without knowing which entry point they were talking to.
+ */
+static int check_key(yq_slice key) {
+    if (key.size == 0) return YQ_ERR_INVAL;
+    if (key.size > YQ_MAX_KEY_BYTES) return YQ_ERR_TOOBIG;
+    if (!key.data) return YQ_ERR_INVAL;
+    return YQ_OK;
+}
+
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
+    /* mode is a closed enum: only the two documented values are writes. Before
+     * this check any unknown bit pattern was silently treated as UPSERT, so a
+     * caller that passed a typo'd constant or a future flag would overwrite
+     * data while believing it had asked for something else. */
+    if (mode != YQ_PUT_UPSERT && mode != YQ_PUT_NOOVERWRITE) return YQ_ERR_INVAL;
+
+    int krc = check_key(key);
+    if (krc != YQ_OK) return krc;
+    if (val.size != 0 && !val.data) return YQ_ERR_INVAL;
     if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
 
     yq_db *db = txn->db;
@@ -971,7 +1001,8 @@ int yq_del(yq_txn *txn, yq_slice key) {
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
+    int krc = check_key(key);
+    if (krc != YQ_OK) return krc;
 
     yq_db *db = txn->db;
     yq_slice empty;
