@@ -9,10 +9,12 @@
 # heap buffer overflows, use-after-free and undefined behaviour are caught
 # locally before they ever reach CI.
 #
-# Leak detection is left OFF on purpose: the suite keeps a handful of
-# test-only heap allocations alive past teardown, and library-level leaks are
-# already policed by yq_test_lifecycle. Turn it on once the remaining
-# test-harness leak is closed by exporting DETECT_LEAKS=1.
+# Leak detection is ON: the suite is leak-clean, so a leak report on a branch
+# is a real regression rather than harness noise. The last harness leak (the
+# yq_btree handles yq_test_seek never closed) was fixed in #113; if a new test
+# legitimately keeps an allocation alive past teardown, close it instead of
+# turning this off. DETECT_LEAKS=0 is the escape hatch for chasing a specific
+# non-leak defect without the extra noise.
 #
 # Usage:
 #   ./scripts/run_sanitizers.sh [build-dir]
@@ -27,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 CC="${CC:-gcc}"
-DETECT_LEAKS="${DETECT_LEAKS:-0}"
+DETECT_LEAKS="${DETECT_LEAKS:-1}"
 
 echo "==> Configuring (CC=$CC, build=$BUILD_DIR)"
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
