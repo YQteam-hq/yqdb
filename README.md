@@ -53,7 +53,7 @@ correctness-first design.
 | Area | Support |
 |------|---------|
 | Copy-on-write B+Tree | Slotted pages, leaf/internal node types, configurable page size |
-| MVCC snapshot reads | Read-only transactions take a `(txn_id, root_page)` snapshot without blocking writers |
+| MVCC readers | Read-only transactions register a `(txn_id, root_page)` snapshot and a reader slot without taking the write lock; reads are **read committed** (a commit made by another transaction after yours began can become visible), and `yq_get` is read-your-writes while cursors only show committed data |
 | Write-ahead logging | Commit-first WAL, CRC32C on header and payload, torn-write tolerant |
 | Transactions | Single-writer / multi-reader, atomic and durable commits |
 | Staged writes | Writes buffer in a private queue and apply atomically on commit |

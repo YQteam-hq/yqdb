@@ -139,15 +139,38 @@ struct yq_txn {
     size_t pending_index_cap;      /* power of two; 0 when unallocated */
     int pending_index_off;         /* set once indexing is abandoned */
     int uses_pool;                 /* this txn owns db->pend_pool */
+    struct yq_cur *cursors;        /* open cursors bound to this txn */
 };
 
 struct yq_cur {
-    yq_txn *txn;
+    yq_txn *txn;                   /* NULL once the transaction has ended */
+    struct yq_cur *next;           /* next cursor in txn->cursors */
     yq_btree_cursor *bt_cur;
     yq_memtable_iter *mt_iter;
     int state;
     int at_end;
 };
+
+/*
+ * Free a transaction and invalidate every cursor still bound to it.
+ *
+ * The header promises that an open cursor dies with its transaction
+ * ("事务结束时未关闭的游标会自动失效"), but nothing enforced it: the cursor kept
+ * its `txn` pointer across yq_txn_commit()/yq_txn_abort(), which free the
+ * transaction, and yq_cur_valid() went on reporting a positioned cursor while
+ * the transaction no longer existed. Detaching here makes the pointer honest
+ * and turns every later access into YQ_ERR_CURSOR instead of a read of freed
+ * memory waiting to happen.
+ */
+static void txn_free(yq_txn *txn) {
+    for (yq_cur *c = txn->cursors; c; c = c->next) {
+        c->txn = NULL;
+        c->state = 0;
+        c->at_end = 1;
+    }
+    txn->cursors = NULL;
+    free(txn);
+}
 
 #define YQ_TXN_STATE_ACTIVE    0
 #define YQ_TXN_STATE_COMMITTED 1
@@ -777,16 +800,16 @@ int yq_txn_begin(yq_db *db, uint32_t flags, yq_txn **out) {
         uint64_t txn_id = 0, root = 0;
         yq_mvcc_meta_read(db->mvcc, &txn_id, &root, NULL, NULL, NULL);
         int rc = yq_mvcc_acquire_snapshot(db->mvcc, txn_id, root, &txn->snapshot_txn, &txn->snapshot_root, &txn->slot_idx);
-        if (rc != YQ_OK) { free(txn); return rc; }
+        if (rc != YQ_OK) { txn_free(txn); return rc; }
     } else {
         int got = 0;
         int rc = yq_mvcc_elect_writer(db->mvcc, (int)db->opts.lock_timeout_ms, &got);
-        if (rc != YQ_OK) { free(txn); return rc; }
-        if (!got) { free(txn); return YQ_ERR_BUSY; }
+        if (rc != YQ_OK) { txn_free(txn); return rc; }
+        if (!got) { txn_free(txn); return YQ_ERR_BUSY; }
         uint64_t txn_id = 0, root = 0;
         yq_mvcc_meta_read(db->mvcc, &txn_id, &root, NULL, NULL, NULL);
         rc = yq_mvcc_acquire_snapshot(db->mvcc, txn_id, root, &txn->snapshot_txn, &txn->snapshot_root, &txn->slot_idx);
-        if (rc != YQ_OK) { yq_mvcc_release_writer(db->mvcc); free(txn); return rc; }
+        if (rc != YQ_OK) { yq_mvcc_release_writer(db->mvcc); txn_free(txn); return rc; }
     }
 
     *out = txn;
@@ -861,7 +884,7 @@ int yq_txn_commit(yq_txn *txn) {
             pending_free(txn);
             yq_mvcc_release_writer(db->mvcc);
             if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
-            free(txn);
+            txn_free(txn);
             return rc;
         }
         yq_wal_flush(db->wal);
@@ -873,13 +896,13 @@ int yq_txn_commit(yq_txn *txn) {
             txn->state = YQ_TXN_STATE_ABORTED;
             yq_mvcc_release_writer(db->mvcc);
             if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
-            free(txn);
+            txn_free(txn);
             return rc_apply;
         }
 
         uint64_t new_txn_id = 0;
         int rc2 = yq_mvcc_increment_txn_id(db->mvcc, &new_txn_id);
-        if (rc2 != YQ_OK) { txn->state = YQ_TXN_STATE_ABORTED; yq_mvcc_release_writer(db->mvcc); if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx); free(txn); return rc2; }
+        if (rc2 != YQ_OK) { txn->state = YQ_TXN_STATE_ABORTED; yq_mvcc_release_writer(db->mvcc); if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx); txn_free(txn); return rc2; }
 
         uint64_t cur_txn = 0, cur_root = 0, cur_free = 0, cur_npages = 0, cur_ckpt = 0;
         yq_mvcc_meta_read(db->mvcc, &cur_txn, &cur_root, &cur_free, &cur_npages, &cur_ckpt);
@@ -914,7 +937,7 @@ int yq_txn_commit(yq_txn *txn) {
 
     txn->state = YQ_TXN_STATE_COMMITTED;
     if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
-    free(txn);
+    txn_free(txn);
     return YQ_OK;
 }
 
@@ -929,7 +952,7 @@ int yq_txn_abort(yq_txn *txn) {
     pending_free(txn);
     txn->state = YQ_TXN_STATE_ABORTED;
     if (txn->slot_idx >= 0) yq_mvcc_release_snapshot(db->mvcc, txn->slot_idx);
-    free(txn);
+    txn_free(txn);
     return YQ_OK;
 }
 
@@ -1026,6 +1049,10 @@ int yq_cur_open(yq_txn *txn, yq_cur **out) {
     c->txn = txn;
     c->state = 0;
     c->at_end = 0;
+    /* Registered so yq_txn_commit()/yq_txn_abort() can detach it. The cursor is
+     * not reference counted; it only borrows the transaction. */
+    c->next = txn->cursors;
+    txn->cursors = c;
 
     yq_db *db = txn->db;
 
@@ -1043,6 +1070,9 @@ int yq_cur_open(yq_txn *txn, yq_cur **out) {
 
 int yq_cur_first(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    /* Detached by txn_free(): the transaction ended, so this cursor is dead.
+     * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
+    if (!c->txn) return YQ_ERR_CURSOR;
     c->at_end = 0; c->state = 0;
     if (c->mt_iter) {
         int rc = yq_memtable_iter_first(c->mt_iter);
@@ -1057,6 +1087,9 @@ int yq_cur_first(yq_cur *c) {
 
 int yq_cur_last(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    /* Detached by txn_free(): the transaction ended, so this cursor is dead.
+     * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
+    if (!c->txn) return YQ_ERR_CURSOR;
     c->at_end = 0; c->state = 0;
     if (c->bt_cur) {
         int rc = yq_btree_cursor_last(c->bt_cur);
@@ -1071,6 +1104,9 @@ int yq_cur_last(yq_cur *c) {
 
 int yq_cur_next(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    /* Detached by txn_free(): the transaction ended, so this cursor is dead.
+     * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
+    if (!c->txn) return YQ_ERR_CURSOR;
     if (c->at_end) return YQ_ERR_NOTFOUND;
     if (c->state == 1) {
         /*
@@ -1100,6 +1136,9 @@ int yq_cur_next(yq_cur *c) {
 
 int yq_cur_prev(yq_cur *c) {
     if (!c) return YQ_ERR_INVAL;
+    /* Detached by txn_free(): the transaction ended, so this cursor is dead.
+     * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
+    if (!c->txn) return YQ_ERR_CURSOR;
     if (c->at_end) return yq_cur_last(c);
     if (c->state == 2) {
         if (c->bt_cur) {
@@ -1124,6 +1163,9 @@ int yq_cur_prev(yq_cur *c) {
 
 int yq_cur_seek(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
+    /* Detached by txn_free(): the transaction ended, so this cursor is dead.
+     * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
+    if (!c->txn) return YQ_ERR_CURSOR;
 
     /* Position the tree cursor at the first key >= target (binary descent). */
     int tree_found = 0;
@@ -1151,6 +1193,9 @@ int yq_cur_seek(yq_cur *c, yq_slice key) {
 
 int yq_cur_seek_exact(yq_cur *c, yq_slice key) {
     if (!c) return YQ_ERR_INVAL;
+    /* Detached by txn_free(): the transaction ended, so this cursor is dead.
+     * ERRORS.md documents YQ_ERR_CURSOR for "游标所属事务已结束". */
+    if (!c->txn) return YQ_ERR_CURSOR;
 
     /*
      * Reuse yq_cur_seek() to perform the full merge-order positioning at the
@@ -1209,7 +1254,7 @@ int yq_cur_seek_le(yq_cur *c, yq_slice key) {
 }
 
 int yq_cur_valid(const yq_cur *c) {
-    if (!c) return 0;
+    if (!c || !c->txn) return 0;
     return c->state && !c->at_end;
 }
 
@@ -1231,6 +1276,14 @@ int yq_cur_val(const yq_cur *c, yq_slice *out) {
 
 int yq_cur_close(yq_cur *c) {
     if (!c) return YQ_OK;
+    if (c->txn) {
+        /* Still bound: unlink from the transaction's list so a later
+         * commit/abort never walks a freed cursor. */
+        yq_cur **link = &c->txn->cursors;
+        while (*link && *link != c) link = &(*link)->next;
+        if (*link == c) *link = c->next;
+        c->txn = NULL;
+    }
     if (c->mt_iter) yq_memtable_iter_close(c->mt_iter);
     if (c->bt_cur) yq_btree_cursor_close(c->bt_cur);
     free(c);
