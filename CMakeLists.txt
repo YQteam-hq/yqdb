@@ -104,3 +104,7 @@ add_test(NAME pending_test COMMAND yq_test_pending)
 add_executable(yq_test_page src/yq_test_page.c)
 target_link_libraries(yq_test_page yqdb)
 add_test(NAME page_store_test COMMAND yq_test_page)
+
+add_executable(yq_test_apis src/yq_test_apis.c)
+target_link_libraries(yq_test_apis yqdb)
+add_test(NAME apis_contract_test COMMAND yq_test_apis)
