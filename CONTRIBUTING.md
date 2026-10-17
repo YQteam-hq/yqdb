@@ -14,8 +14,9 @@ small and dependency-free, and prove behaviour with tests before merging.
 ### Prerequisites
 
 - A C11 compiler: `gcc` or `clang`.
-- [CMake](https://cmake.org/) ≥ 3.10 (optional — a direct `gcc` build also
-  works).
+- [CMake](https://cmake.org/) at least the version in
+  `cmake_minimum_required()` at the top of `CMakeLists.txt` (3.10 today). A
+  direct `gcc` build also works if you cannot install CMake.
 
 ### Build with CMake
 
@@ -24,14 +25,39 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+This builds the `yqdb` static library plus every test executable under `build/`
+(e.g. `build/yq_test_basic`).
+
 ### Build directly with gcc
 
+The library is a plain static archive — there is nothing to install and no
+generated headers. Build the objects, then `ar` them into `libyqdb.a`:
+
 ```sh
-gcc -std=c11 -Wall -Wextra -Iinclude src/*.c -o yqdb.a -shared   # or link the objects
+mkdir -p build-manual && cd build-manual
+
+gcc -std=gnu11 -O2 -Wall -Wextra -I../include -c \
+    ../src/yq_enc.c ../src/yq_memblk.c ../src/yq_vfs.c ../src/yq_slice.c \
+    ../src/yq_page.c ../src/yq_btree.c ../src/yq_memtable.c ../src/yq_wal.c \
+    ../src/yq_mvcc.c ../src/yq_recover.c ../src/yq.c ../src/yq_mempool.c
+ar rcs libyqdb.a *.o
 ```
 
-The CMake build also builds every test executable under `build/` (e.g.
-`build/yq_test_basic`).
+`libyqdb.a` is the whole engine; link it into any program that includes
+`yq.h`:
+
+```sh
+gcc -std=gnu11 -I../include your_app.c libyqdb.a -o your_app
+```
+
+Two details worth knowing:
+
+- **List the library sources explicitly.** A `src/*.c` glob would also pull in
+  the `yq_test_*.c` files, each of which defines its own `main()`.
+- **Use `-std=gnu11`, not `-std=c11`.** The tests call POSIX
+  `clock_gettime()`/`CLOCK_MONOTONIC`, which strict ISO C11 hides. CMake does
+  the same (`C_EXTENSIONS` is on), so a `-std=c11` build of a test file fails
+  with *"CLOCK_MONOTONIC undeclared"*.
 
 ---
 
@@ -43,8 +69,53 @@ The suite is driven by CTest:
 ctest --test-dir build --output-on-failure
 ```
 
-All 15 test executables must pass. CI runs the same suite on Ubuntu (gcc and
-clang) and Windows (MSVC).
+**Every** test executable must pass — the suite grows over time, so rather than
+trusting a count in this document, read it from CTest:
+
+```sh
+ctest --test-dir build -N     # list the tests and the total
+```
+
+CI runs the same suite on Ubuntu (gcc and clang) and Windows (MSVC).
+
+### Running a single test
+
+`-R` takes a regex over the test names, which are stable and descriptive
+(`crc_test`, `wal_test`, `apis_contract_test`, …):
+
+```sh
+ctest --test-dir build -R crc --output-on-failure   # just crc_test
+ctest --test-dir build -R 'wal|mvcc' -V             # a subset, verbose
+```
+
+Or invoke the binary directly — each one is a standalone `main()` that prints
+its own `ok`/`FAIL` lines and returns non-zero on failure:
+
+```sh
+./build/yq_test_wal
+echo $?          # 0 = pass
+```
+
+### Debugging a failing test
+
+Configure a debug build with symbols (no `-O2`, no `NDEBUG`, so the
+`assert()`s inside the library stay live), then run the one test under `gdb`:
+
+```sh
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug -j
+gdb --args ./build-debug/yq_test_wal
+```
+
+`ctest --test-dir build-debug -R wal --output-on-failure` shows the test's own
+diagnostics; add `-V` when you also want the exact command line CTest used.
+If the failure looks like memory corruption, build the sanitizer tree once and
+then run just that test with LeakSanitizer on:
+
+```sh
+./scripts/run_sanitizers.sh build-san                # build; suite runs leak-off
+ASAN_OPTIONS=detect_leaks=1 ./build-san/yq_test_wal  # one test, leaks on
+```
 
 ### Memory safety / undefined behaviour
 
@@ -64,7 +135,9 @@ alive past teardown; library leaks are already policed by `yq_test_lifecycle`).
 
 ## Coding conventions
 
-- **Language:** C11, no extensions that break MSVC/clang/gcc portability.
+- **Language:** C11 (compiled as `gnu11`; MSVC uses `/std:c11`). Avoid GNU-
+  or POSIX-only extensions in code that must build everywhere — `clock_gettime`
+  in tests is the one accepted exception.
 - **Warnings are not optional:** the build uses `-Wall -Wextra` (and `/W4` on
   MSVC). New code should be warning-free.
 - **No external dependencies** in the core library. The whole point of yq-DB is
@@ -116,5 +189,17 @@ Open an issue with:
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the
-[Apache-2.0 License](LICENSE) that covers this project.
+yq-DB is released under the [Apache-2.0 License](LICENSE). Contributions are
+accepted under the same terms — **inbound = outbound**:
+
+- You keep the copyright to your work; you license it to the project under
+  Apache-2.0, which already grants the patent license and the redistribution
+  terms the project needs.
+- **No CLA and no copyright assignment** is required. Opening a pull request is
+  the sign-off.
+- Only contribute code you wrote or that is compatibly licensed. Do not paste in
+  GPL/AGPL code, and do not add third-party source to the core (see *Coding
+  conventions* above) — `bench/third_party/` is the only exception, and its
+  licences must be recorded there.
+- There are no per-file licence headers — a single top-level `LICENSE` covers
+  the tree — so new files need none.
