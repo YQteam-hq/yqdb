@@ -187,12 +187,17 @@ int yq_last_io_error(void);
  * 事务
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* txn_begin 的 flags */
+/* txn_begin 的 flags：闭合枚举，必须恰好是下列之一 */
 #define YQ_TXN_READONLY  0x0002u /* 只读事务，获取 MVCC 快照，绝不阻塞写者 */
 #define YQ_TXN_READWRITE 0x0001u /* 读写事务，需要写锁；拿不到返回 YQ_ERR_BUSY */
 
 /*
  * 开启事务。
+ *
+ * flags 必须恰好是 YQ_TXN_READWRITE 或 YQ_TXN_READONLY 之一。传 0、两个位同时
+ * 置位、或带任何未定义位都返回 YQ_ERR_INVAL：早期实现把"没置 READWRITE 位"一律
+ * 当只读，于是 flags = 0 会静默得到一个只读事务，之后每次写入都返回
+ * YQ_ERR_READONLY，很难定位到是这一行的问题。
  *
  * 只读事务：原子获取 (txn_id, root_page) 快照并登记读者槽位，无锁，极快。
  * 读写事务：先选举写者（单写者），再登记快照。
