@@ -229,14 +229,32 @@ static void test_truncation_is_a_prefix(void) {
         prev = n;
     }
 
-    /* Every committed prefix must be reachable, not just the two endpoints: an
-     * all-or-nothing recovery would pass the monotonicity check above. */
+    /*
+     * Every committed prefix must be reachable, not just the two endpoints: an
+     * all-or-nothing recovery would pass the monotonicity check above.
+     *
+     * This is a statement about the durability contract, not about the on-disk
+     * layout: each transaction commits independently (YQ_SYNC_FULL makes the
+     * COMMIT durable before the next transaction starts), so for every k there
+     * is some crash point that leaves exactly the first k commits intact.
+     * Truncating at that point must recover exactly k keys.
+     *
+     * If this ever fails, recovery is not prefix-consistent: some committed
+     * transaction became unrecoverable while a *later* one survived. That is a
+     * durability regression, not a test-fixture detail -- so the check is
+     * deliberately not weakened to "monotone + endpoints".
+     */
+    int gaps = 0;
     for (int k = 0; k <= N_TXN; k++) {
         if (!seen[k]) {
-            printf("\n        FAIL: no truncation point recovers exactly %d keys\n", k);
-            g_fail++;
-            break;
+            printf("\n        FAIL: no truncation point recovers exactly %d keys", k);
+            gaps++;
         }
+    }
+    if (gaps) {
+        printf(" (%d of %d prefixes unreachable -- recovery is not prefix-consistent)\n",
+               gaps, N_TXN + 1);
+        g_fail++;
     }
     CHECK(prev == N_TXN); /* the intact log recovers everything */
 
