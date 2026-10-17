@@ -354,7 +354,7 @@ static int case_single_leaf(int n_keys, uint32_t ps) {
 
     printf("leaf:   probes=%d seek_mismatch=%d seek_le_mismatch=%d\n", n_probes, fail_ge, fail_le);
     int bad = (fail_ge || fail_le || !sorted || !unique || n_seen != n_keys);
-    free(seen); free(keys); free(map);
+    free(seen); free(keys); yq_btree_close(bt); free(map);
     return bad ? 1 : 0;
 }
 
@@ -470,7 +470,7 @@ static int case_multi_leaf(uint32_t ps) {
         fail_ge++;
     }
 
-    free(map);
+    yq_btree_close(bt); free(map);
     return (fail_ge || fail_le) ? 1 : 0;
 }
 
@@ -517,7 +517,7 @@ static int case_rightmost_routing(uint32_t ps) {
     if (rm_read != 3) {
         printf("        ERROR: rightmost child reads back %llu, wrote 3\n",
                (unsigned long long)rm_read);
-        free(map);
+        yq_btree_close(bt); free(map);
         return 1;
     }
 
@@ -575,7 +575,7 @@ static int case_rightmost_routing(uint32_t ps) {
         fail_ge++;
     }
 
-    free(map);
+    yq_btree_close(bt); free(map);
     return (fail_ge || fail_le) ? 1 : 0;
 }
 
