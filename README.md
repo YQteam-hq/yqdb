@@ -282,6 +282,22 @@ gcc -std=c11 -Iinclude src/yq_test_integration.c src/*.o -o yq_test_integration
 23 integration test cases currently pass (plus dedicated lifecycle, MVCC,
 read-only, WAL, opts, and seek test suites).
 
+### Sanitizers
+
+`scripts/run_sanitizers.sh` builds the library and every test binary with
+`-fsanitize=address,undefined` and runs the suite, catching buffer overflows,
+use-after-free and undefined behaviour that the warning-only build misses:
+
+```sh
+./scripts/run_sanitizers.sh          # gcc, build dir = build-san
+CC=clang ./scripts/run_sanitizers.sh # use clang instead
+DETECT_LEAKS=1 ./scripts/run_sanitizers.sh  # also run LeakSanitizer
+```
+
+Leak detection is disabled by default: the suite intentionally keeps a few
+test-only allocations alive past teardown, and library-level leaks are already
+guarded by `yq_test_lifecycle`.
+
 ## Current Scope & Limitations
 
 Current release is **1.1.0**. Please note the following boundaries:
