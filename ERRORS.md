@@ -20,7 +20,7 @@
 | 7 | `YQ_ERR_EXISTS` | 目标已存在 | `YQ_PUT_NOOVERWRITE` 遇已有键；`YQ_OPEN_EXCL` 遇已有文件 | 否 | 否 |
 | 8 | `YQ_ERR_BUSY` | 写锁被其他进程持有 | 另一进程持写锁且 `lock_timeout_ms == 0` | 是（稍后重试） | 否 |
 | 9 | `YQ_ERR_READONLY` | 只读句柄或只读事务尝试写入 | 只读打开调用 `yq_put`；`YQ_TXN_READONLY` 内调用 `yq_del` | 否 | 否 |
-| 10 | `YQ_ERR_INVAL` | 参数非法 | `struct_size` 不匹配；`page_size` 非 2 的幂；`path` 为 NULL；`data==NULL && size>0` | 否 | 否 |
+| 10 | `YQ_ERR_INVAL` | 参数非法 | `struct_size` 不匹配；`page_size` 非 2 的幂；`path` 为 NULL；`data==NULL && size>0`；`yq_txn_begin` 的 `flags` 不是单一的 `YQ_TXN_*` | 否 | 否 |
 | 11 | `YQ_ERR_TOOBIG` | 键或值超出上限 | `key.size > 1024`；`val.size > 1 GiB` | 否 | 否 |
 | 12 | `YQ_ERR_TXN_CLOSED` | 事务已提交或回滚 | 复用已结束的事务句柄 | 否 | 否 |
 | 13 | `YQ_ERR_TXN_BROKEN` | 事务作废，需重试 | 写者身份丢失（锁文件被删）、内部不变量告警 | 是（重开事务） | 否 |
