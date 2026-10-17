@@ -224,8 +224,13 @@ int yq_txn_abort(yq_txn *txn);
 #define YQ_PUT_NOOVERWRITE 1u /* 已存在则返回 YQ_ERR_EXISTS */
 
 /*
- * 写入。约束：key.size <= 1024，val.size <= 1 GiB（见 FORMAT.md 附录 C）。
+ * 写入。约束：1 <= key.size <= 1024，val.size <= 1 GiB（见 FORMAT.md 附录 C）。
  * 只读事务调用返回 YQ_ERR_READONLY。
+ *
+ * 参数校验：key.size 为 0（或 key.data 为 NULL）返回 YQ_ERR_INVAL——空键不是
+ * "太大"，而是根本不是一个键；key.size 超过 1024 返回 YQ_ERR_TOOBIG。
+ * mode 只接受 YQ_PUT_UPSERT 与 YQ_PUT_NOOVERWRITE，其他取值返回
+ * YQ_ERR_INVAL，不会被当作 UPSERT 静默放行。
  *
  * 变更先进入内存表，提交时才可能落盘。
  */
@@ -233,6 +238,8 @@ int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode);
 
 /*
  * 删除。键不存在返回 YQ_OK（幂等），不返回 YQ_ERR_NOTFOUND。
+ * key 的约束与 yq_put 相同：空键返回 YQ_ERR_INVAL，超过 1024 字节返回
+ * YQ_ERR_TOOBIG。
  */
 int yq_del(yq_txn *txn, yq_slice key);
 

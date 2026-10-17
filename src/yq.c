@@ -172,7 +172,7 @@ static const char *g_err_msgs[] = {
     "resource busy",
     "read-only",
     "invalid argument",
-    "value too big",
+    "key or value too big",
     "transaction closed",
     "transaction broken",
     "invalid cursor",
@@ -933,13 +933,59 @@ int yq_txn_abort(yq_txn *txn) {
     return YQ_OK;
 }
 
+#define YQ_MAX_KEY_BYTES 1024u
+
+/*
+ * Key validation shared by every write entry point, so they cannot drift apart.
+ *
+ * ERRORS.md draws the line at the limit itself: a key of 1025 bytes is over the
+ * documented maximum and reports YQ_ERR_TOOBIG, while a zero-length key is not
+ * "too big" by any reading of the word -- it is simply not a key, so it reports
+ * YQ_ERR_INVAL like any other bad argument.
+ *
+ * Before this was factored out, the five call sites disagreed: yq_put() reported
+ * TOOBIG for an empty key, yq_del() reported INVAL for an over-long one, and the
+ * batch paths reported INVAL for both. Callers could not write a correct
+ * classification without knowing which entry point they were talking to.
+ */
+static int check_key(yq_slice key) {
+    /* Pointer first: a slice with no storage is malformed whatever its length
+     * field says, and the header states that data == NULL requires size == 0. */
+    if (!key.data) return YQ_ERR_INVAL;
+    if (key.size == 0) return YQ_ERR_INVAL;
+    if (key.size > YQ_MAX_KEY_BYTES) return YQ_ERR_TOOBIG;
+    return YQ_OK;
+}
+
+#define YQ_MAX_VAL_BYTES (1ULL * 1024 * 1024 * 1024) /* 1 GiB, FORMAT.md appendix C */
+
+/*
+ * Value validation, the mirror of check_key(). Kept separate rather than folded
+ * into one function because a value is not a key: an empty value is legal and
+ * stores a zero-length payload, while an empty key is not a key at all.
+ */
+static int check_val(yq_slice val) {
+    if (val.size == 0) return YQ_OK;          /* empty value is allowed */
+    if (!val.data) return YQ_ERR_INVAL;        /* size != 0 needs storage */
+    if (val.size > YQ_MAX_VAL_BYTES) return YQ_ERR_TOOBIG;
+    return YQ_OK;
+}
+
 int yq_put(yq_txn *txn, yq_slice key, yq_slice val, uint32_t mode) {
     if (!txn) return YQ_ERR_INVAL;
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_TOOBIG;
-    if (val.size > (1ULL * 1024 * 1024 * 1024)) return YQ_ERR_TOOBIG;
+    /* mode is a closed enum: only the two documented values are writes. Before
+     * this check any unknown bit pattern was silently treated as UPSERT, so a
+     * caller that passed a typo'd constant or a future flag would overwrite
+     * data while believing it had asked for something else. */
+    if (mode != YQ_PUT_UPSERT && mode != YQ_PUT_NOOVERWRITE) return YQ_ERR_INVAL;
+
+    int krc = check_key(key);
+    if (krc != YQ_OK) return krc;
+    int vrc = check_val(val);
+    if (vrc != YQ_OK) return vrc;
 
     yq_db *db = txn->db;
 
@@ -971,7 +1017,8 @@ int yq_del(yq_txn *txn, yq_slice key) {
     if (txn->state != YQ_TXN_STATE_ACTIVE) return YQ_ERR_TXN_CLOSED;
     /* YQ_TXN_READONLY is 0, so test for the read-write bit instead. */
     if (!(txn->flags & YQ_TXN_READWRITE)) return YQ_ERR_READONLY;
-    if (key.size == 0 || key.size > 1024) return YQ_ERR_INVAL;
+    int krc = check_key(key);
+    if (krc != YQ_OK) return krc;
 
     yq_db *db = txn->db;
     yq_slice empty;
@@ -1505,16 +1552,17 @@ int yq_batch_put(yq_txn *txn, const yq_batch_entry *entries, size_t count,
     uint32_t total = (uint32_t)count;
     yq_batch_result_init(result, total, YQ_OK);
 
-    /* 第一遍：先校验全部 entry，避免半批写入 */
+    /* 第一遍：先校验全部 entry，避免半批写入。用与单条写入相同的 check_key /
+     * check_val，但整批判定仍然只有一个结论：只要有一条非法就返回 YQ_ERR_INVAL
+     * （头文件承诺 "if any entry is invalid ... the return value is
+     * YQ_ERR_INVAL"），所以这里只关心"是否合法"，不区分具体码。 */
     int bad = 0;
     for (size_t i = 0; i < count; i++) {
         const yq_batch_entry *e = &entries[i];
         int entry_bad = 0;
-        if (e->key.data == NULL || e->key.size == 0 || e->key.size > 1024) {
+        if (check_key(e->key) != YQ_OK) {
             entry_bad = 1;
-        } else if (e->op == 0 && e->val.data == NULL && e->val.size != 0) {
-            entry_bad = 1;
-        } else if (e->op == 0 && e->val.size > (1ULL << 30)) {
+        } else if (e->op == 0 && check_val(e->val) != YQ_OK) {
             entry_bad = 1;
         }
         if (entry_bad) bad = 1;
@@ -1587,8 +1635,7 @@ int yq_batch_del(yq_txn *txn, const yq_slice *keys, size_t count,
      */
     int bad = 0;
     for (size_t i = 0; i < count; i++) {
-        const yq_slice *k = &keys[i];
-        if (k->data == NULL || k->size == 0 || k->size > 1024) bad = 1;
+        if (check_key(keys[i]) != YQ_OK) bad = 1; /* same rules as yq_del() */
     }
 
     if (bad) {

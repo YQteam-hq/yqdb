@@ -108,3 +108,7 @@ add_test(NAME page_store_test COMMAND yq_test_page)
 add_executable(yq_test_apis src/yq_test_apis.c)
 target_link_libraries(yq_test_apis yqdb)
 add_test(NAME apis_contract_test COMMAND yq_test_apis)
+
+add_executable(yq_test_putargs src/yq_test_putargs.c)
+target_link_libraries(yq_test_putargs yqdb)
+add_test(NAME put_args_test COMMAND yq_test_putargs)
