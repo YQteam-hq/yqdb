@@ -1,4 +1,3 @@
------BEGIN FILE-----
 /**	@file midl.h
  *	@brief LMDB ID List header file.
  *
@@ -187,4 +186,3 @@ int mdb_mid2l_append( MDB_ID2L ids, MDB_ID2 *id );
 }
 #endif
 #endif	/* _MDB_MIDL_H_ */
------END FILE-----
